@@ -14,7 +14,12 @@
 
 Tokspur runs Qwen3.8 Flash-Next locally on a Mac. It uses a native Metal worker and serves an OpenAI-compatible chat API.
 
-Requires an M5 Max with a 40-core GPU, 128 GB of unified memory and macOS 27 or later. Follow the [setup guide](https://tokspur.com/get-started/) to install and connect a client.
+Tokspur needs an Apple M5 Max with a 40-core GPU, 128 GB of unified memory and macOS 27 or later. Run the installer in Terminal, then follow the [setup guide](https://tokspur.com/get-started/) to verify the installation and connect a client.
+
+```sh
+curl -fsSL https://tokspur.com/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+```
 
 ## Add the model
 
