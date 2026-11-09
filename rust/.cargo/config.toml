@@ -1,0 +1,7 @@
+[build]
+# Relative to rust/, so outputs land in the repository's ignored build/.
+target-dir = "../build/rust-target"
+
+[net]
+# Cargo.lock pins crate versions and checksums. Cargo uses its local cache in offline mode.
+offline = true

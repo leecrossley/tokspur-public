@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "model_asset_manifest_sha256": "c1d1163ddf50f667e73054d34314acd073c5062f1461e59f5f71a7cef8aa65d8",
+  "scope": "existing derived tokenizer/template metadata; not additional model weights or engine code",
+  "tokenizer": {
+    "name": "tokenizer.json",
+    "sha256": "8e852142d8ab38bb7678f650bd504ba28c29d9c6357e6ed762bebdbd474689eb",
+    "vocabulary_size": 248320,
+    "merge_count": 247587,
+    "added_tokens": 33,
+    "normalization_semantics": "NFC, Unicode 9.0.0; verified against pinned development oracle",
+    "gguf_binding": "Native check compares every vocabulary spelling and merge rank against the original GGUF arrays"
+  },
+  "chat_template": {
+    "name": "chat_template.jinja",
+    "sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce",
+    "owned_rendering_qualified": true,
+    "qualification_scope": "pinned text formatter/token IDs on the recorded M5/macOS build; not inference or API tool integrity",
+    "late_system_messages": "reject by default as in pinned template; explicit stable hoist policy is separately normalized and counted"
+  },
+  "tokenizer_config": {
+    "name": "tokenizer_config.json",
+    "sha256": "9297c58b33b1b8dedf41759e805d174b4b7bb83b396066e1013ce58a864af03f"
+  },
+  "unicode_data": {
+    "version": "9.0.0",
+    "source": "https://www.unicode.org/Public/zipped/9.0.0/UCD.zip",
+    "archive_sha256": "df9e028425816fd5117eaea7173704056f88f7cd030681e457c6f3827f9390ec",
+    "unicode_data_sha256": "68dfc414d28257b9b5d6ddbb8b466c768c00ebdf6cbf7784364a9b6cad55ee8f",
+    "normalization_properties_sha256": "02d8e12cea7c61a9f3cc5fbf8eaceadf8da23fe83d60c64cf647088830b810cc",
+    "normalization_tests_sha256": "2d48d848656b3cf889df59980ab13551988950c4ca8c5190a17c691a17f8b9bb",
+    "contents": "standards data only, not a copied tokenizer/runtime implementation"
+  }
+}

@@ -1,0 +1,572 @@
+{
+  "schema": 1,
+  "reviewed_date": "2026-11-07",
+  "scope": "Source credits, licence notices and hashes for the distributed runtime.",
+  "projects": [
+    {
+      "id": "llama.cpp",
+      "repository": "https://github.com/ggml-org/llama.cpp",
+      "revision": "6050b467c07a95c7b87debd4ddac2f8ba8d9b807",
+      "pin_kind": "recorded-source",
+      "licence": "MIT",
+      "licence_file": "native/third_party/llama-cpp/LICENSE",
+      "licence_sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+      "files": [
+        {
+          "path": "LICENSE",
+          "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+          "bytes": 1078,
+          "lines": 21
+        },
+        {
+          "path": "ggml/src/ggml-metal/kernels/gated_delta_net.metal",
+          "sha256": "2d6b4c1e580918f07ad53cd9fec4400f58d92239c7c40f36f747a9fbf469056b",
+          "bytes": 9402,
+          "lines": 264
+        },
+        {
+          "path": "ggml/src/ggml-metal/kernels/mul_mm.metal",
+          "sha256": "5a0453b743bfc1a81b212d2136b6d2af55c9b5f0d8efb3e1d702199cc0ed5051",
+          "bytes": 58538,
+          "lines": 1017
+        },
+        {
+          "path": "ggml/src/ggml-metal/kernels/mul_mv.metal",
+          "sha256": "3b6250aa1ec74091bbadedbae35355c2d6ea5d566c2033f91d9aecd896c69059",
+          "bytes": 133398,
+          "lines": 3408
+        },
+        {
+          "path": "src/models/delta-net-base.cpp",
+          "sha256": "757ffa2fabd995bebe2b916412a387949dcc71f1263577f9a8a88bfd20214189",
+          "bytes": 23599,
+          "lines": 603
+        }
+      ]
+    },
+    {
+      "id": "omlx",
+      "repository": "https://github.com/jundot/omlx",
+      "revision": "09d7e2d9c074e7900025dcf20c46d26c8a6bf9d6",
+      "pin_kind": "comparison-only",
+      "licence": "Apache-2.0",
+      "licence_file": "native/third_party/omlx/LICENSE",
+      "licence_sha256": "de69b4352c9952cd5f0f4b8cb4584782a07f02c9ba82aeb5d496aa2b7fe5457d",
+      "files": [
+        {
+          "path": "LICENSE",
+          "sha256": "de69b4352c9952cd5f0f4b8cb4584782a07f02c9ba82aeb5d496aa2b7fe5457d",
+          "bytes": 10768,
+          "lines": 190
+        },
+        {
+          "path": "omlx/custom_kernels/qwen35_prefill/gdn.py",
+          "sha256": "ed383cc5e680e6e9b3d1e6f4b63a21ccc96e626558eef206252ded04f3862a6c",
+          "bytes": 35862,
+          "lines": 934
+        },
+        {
+          "path": "omlx/patches/qwen35_gdn_verify_fused.py",
+          "sha256": "981bb79878b1c879e485aee494d074c0fce86cb3dc7f5e49d4cb9047585666f6",
+          "bytes": 20083,
+          "lines": 562
+        },
+        {
+          "path": "omlx/patches/qwen35_moe_router.py",
+          "sha256": "7ae83d75dc08dffb2874cfa22beff3b61ebc71a4ddf7760b26cae8ed1edf9d72",
+          "bytes": 28309,
+          "lines": 805
+        },
+        {
+          "path": "omlx/patches/qwen35_moe_weighted_sum.py",
+          "sha256": "3f5b959d5795e31833f4c21f09b7cb0ef6a3c17aca6b0c3f9b3ee728d5ef015f",
+          "bytes": 8043,
+          "lines": 232
+        }
+      ]
+    },
+    {
+      "id": "mlx-vlm",
+      "repository": "https://github.com/Blaizzy/mlx-vlm",
+      "revision": "1ecf1ecdd28af102eded679be0daa5c76ab2a068",
+      "pin_kind": "recorded-source",
+      "licence": "MIT",
+      "licence_file": "native/third_party/mlx-vlm/LICENSE",
+      "licence_sha256": "f74c448746be3376e27dee43e2be9ec9d55f4820cd7466c603a6c7d1fd2d25b8",
+      "files": [
+        {
+          "path": "LICENSE",
+          "sha256": "f74c448746be3376e27dee43e2be9ec9d55f4820cd7466c603a6c7d1fd2d25b8",
+          "bytes": 1069,
+          "lines": 21
+        },
+        {
+          "path": "mlx_vlm/models/gated_delta.py",
+          "sha256": "7cac81d20827d0db32fcd8dc2a57a4be21a158b88d826bb1f0da803cf54bafbc",
+          "bytes": 11693,
+          "lines": 402
+        },
+        {
+          "path": "mlx_vlm/models/qwen3_5/gated_delta.py",
+          "sha256": "c3eca0ae56026626a3302a08b8ce8a69f7fe7fdb08b41d94f27ad012d6c3270c",
+          "bytes": 21389,
+          "lines": 652
+        },
+        {
+          "path": "mlx_vlm/models/qwen4_exp/qsa_kernel.py",
+          "sha256": "f53095f69702b3ad99b64edcb11f9385a7f258f868711a8a3d6640a784d2d008",
+          "bytes": 12805,
+          "lines": 396
+        }
+      ],
+      "tag": "v0.7.1"
+    },
+    {
+      "id": "Splash",
+      "repository": "https://github.com/incoai/splash",
+      "revision": "1482f6bbc2abf12375332725302019594150b6cb",
+      "pin_kind": "recorded-source",
+      "licence": "Apache-2.0",
+      "licence_file": "native/third_party/splash/LICENSE",
+      "licence_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "files": [
+        {
+          "path": "LICENSE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "bytes": 11358,
+          "lines": 202
+        },
+        {
+          "path": "THIRD_PARTY_NOTICES",
+          "sha256": "2fedf1277bf732f8435c3e3be2798f52f25f7e2bd4155865cb366da55b88e50b",
+          "bytes": 12049,
+          "lines": 238
+        },
+        {
+          "path": "runtime/metal/kernels/common/paged_attention_tile.h",
+          "sha256": "1421835a3b91b48c384e11c52adaa0081002d83f489a778a2740f36068053564",
+          "bytes": 19046,
+          "lines": 388
+        },
+        {
+          "path": "runtime/metal/kernels/common/split_reduce.h",
+          "sha256": "c0d08d399022edba686509d7d96df4fde2e3065dd9cae5f2219de1eee85f7f89",
+          "bytes": 2013,
+          "lines": 45
+        },
+        {
+          "path": "runtime/metal/kernels/decode/draft.metal",
+          "sha256": "380a9252f62b13eae324f7126ce618813c8fcc78d6315e0ceff0a401047a00a1",
+          "bytes": 27661,
+          "lines": 579
+        },
+        {
+          "path": "runtime/metal/kernels/decode/sampling.metal",
+          "sha256": "bbf94de6e0fd4441bed810bfbaa4c5d05b2108137551d0dc402b04cb0e95ff0a",
+          "bytes": 72275,
+          "lines": 1703
+        },
+        {
+          "path": "runtime/metal/kernels/prefill/draft_context.metal",
+          "sha256": "bb73df916b7e478f415ad352049aba8ae26576f161c2f02e94d073d83555d57b",
+          "bytes": 5203,
+          "lines": 106
+        },
+        {
+          "path": "runtime/model/VerifyBudget.cpp",
+          "sha256": "d0cbc313ae9b0adb3e5ac1b3dd43dba3c83c5b3da54b201b94e3624d63bafb63",
+          "bytes": 10347,
+          "lines": 247
+        },
+        {
+          "path": "runtime/model/VerifyBudget.hpp",
+          "sha256": "1db8b8a461d7dd8e3e9b097e7dbbaeaf135e9a13fe18f93f37a898a45dfe349b",
+          "bytes": 5955,
+          "lines": 130
+        },
+        {
+          "path": "runtime/metal/kernels/shared/gguf_float.metal",
+          "sha256": "449f1759e5baa5e8a745bd31538f682de3f6361732d5986b40dfd9ce66dd0870",
+          "bytes": 17289,
+          "lines": 288
+        }
+      ],
+      "tag": "1.4.0"
+    },
+    {
+      "id": "m5-max-kernels",
+      "repository": "https://github.com/9Tempest/m5-max-kernels",
+      "revision": "a6d92a3bdd7c784fde2e3e86b303d533354f4603",
+      "pin_kind": "comparison-only",
+      "licence": "MIT",
+      "licence_file": "native/third_party/m5-max-kernels/LICENSE",
+      "licence_sha256": "c38444751c5236f608ae5993815ea4294cd8048bd98f80a6935285c576295db3",
+      "files": [
+        {
+          "path": "LICENSE",
+          "sha256": "c38444751c5236f608ae5993815ea4294cd8048bd98f80a6935285c576295db3",
+          "bytes": 1084,
+          "lines": 21
+        },
+        {
+          "path": "src/m5kernels/shaders/gemm.metal",
+          "sha256": "d90aca7841e8ffb281085bc520590d9a9349e403a46235124c50fd9911ddcef9",
+          "bytes": 782,
+          "lines": 18
+        }
+      ]
+    }
+  ],
+  "native_files": [
+    {
+      "path": "native/kernels/grouped_mm.metal",
+      "sha256": "711708f38271d6044689149324ef7844fa7274e838ad6369a5c752562b110117",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "kernel_mul_mm_id tile and quantisation adaptation"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 371
+    },
+    {
+      "path": "native/kernels/grouped_mm_f32.metal",
+      "sha256": "89b3b95e1f1a48cffea1c4ccc459ceb0aaa2aded9e3e9ec97fe076f48e8f7887",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "kernel_mul_mm_id tile and quantisation adaptation",
+        "component-only compact and compensated tiles retain the credited decoder and swizzle"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 446
+    },
+    {
+      "path": "native/kernels/grouped_mpp.metal",
+      "sha256": "0e0520950cca1d648339701fdbf0ecd3838a46af5a509667e6697d676199c287",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "kernel_mul_mm_id tile and quantisation adaptation"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 222
+    },
+    {
+      "path": "native/kernels/dense_q8_staged_f32.metal",
+      "sha256": "638030b1076d8bc5eb7af57ebdbb79afcc00c4fdd1c52dc50bcb00ddb96a8bb0",
+      "sources": [
+        "llama.cpp",
+        "m5-max-kernels"
+      ],
+      "routines": [
+        "kernel_mul_mm_id tile and quantisation adaptation"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 256
+    },
+    {
+      "path": "native/kernels/moe_router_f32_batch.metal",
+      "sha256": "101f893d018c84a1ae93143be654cddd07411b15ad16631a5793b9c775dd0065",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "kernel_mul_mm_id tile and quantisation adaptation"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 50
+    },
+    {
+      "path": "native/kernels/qsa_prefill.metal",
+      "sha256": "25112377d77b05846a31f45fe5e7f16194e6f4938af10e363a366c68511ef163",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "kernel_mul_mm_id tile and quantisation adaptation"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 391
+    },
+    {
+      "path": "native/kernels/nax_prefill.metal",
+      "sha256": "40bb9073a157c4bb80f6e08aec565f8464eef60a7078c48f12e2654f941e539d",
+      "sources": [
+        "llama.cpp",
+        "Splash"
+      ],
+      "routines": [
+        "kernel_mul_mm_id tile and quantisation adaptation",
+        "common/split_reduce.h arrival and reduction",
+        "shared/gguf_float.metal three-part BF16 weight split and plane matmul"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 7594
+    },
+    {
+      "path": "native/kernels/raw_decode.metal",
+      "sha256": "8bddb1482cf17078a6f0db74adc0fa9947ddfe7bca62fba8671d36ccb314b2ff",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "Q4_K and Q5_1 packed matrix-vector routines"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 150
+    },
+    {
+      "path": "native/src/raw_decode_component.cpp",
+      "sha256": "57916ac509bc7dd8e508b1da45d443cde413a7064d3d7f1faaaee02587f29f99",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "Q4_K and Q5_1 packed matrix-vector routines"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 206
+    },
+    {
+      "path": "native/kernels/gdn_chunk.metal",
+      "sha256": "c621c8c4b813b9704635ba98dca4ff2ab4e4ad0e78328c57f384728d345e7008",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "CS64 delta-net algebra from src/models/delta-net-base.cpp"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 398
+    },
+    {
+      "path": "native/src/gdn_chunk_math.cpp",
+      "sha256": "41b67442b0b2a608076d89723473124afd220df4466174898d93e0f498bb8e1b",
+      "sources": [
+        "llama.cpp"
+      ],
+      "routines": [
+        "CPU reference for the CS64 graph algebra in src/models/delta-net-base.cpp"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 146
+    },
+    {
+      "path": "native/kernels/qsa_sparse_attention.metal",
+      "sha256": "8f37ba7b16f1fce2e9362e24c3fa60dc4382b3c3af2281bd0e947f74c6f914a9",
+      "sources": [
+        "mlx-vlm"
+      ],
+      "routines": [
+        "qsa_attention, qsa_sparse and verification variants"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 441
+    },
+    {
+      "path": "native/kernels/dflash2.metal",
+      "sha256": "a5347e8eea099850f121cc605bfd434d72020e6c515240da7d2693b4c332a236",
+      "sources": [
+        "Splash"
+      ],
+      "routines": [
+        "draft convolution, ring attention, candidate selection"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 1446
+    },
+    {
+      "path": "native/src/dflash2_drafter.cpp",
+      "sha256": "8eb7ca64d73c1bfde36b4e4dd638b2b5f700198d626e934f462dc2f8f12091a7",
+      "sources": [
+        "Splash"
+      ],
+      "routines": [
+        "DFlash2VerifyBudget"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 1184
+    },
+    {
+      "path": "native/include/tokspur/dflash2_drafter.hpp",
+      "sha256": "5b19fe4a88008797b334cf6e9058b0202900a31bb3ec2a43169b38ed4973fdf6",
+      "sources": [
+        "Splash"
+      ],
+      "routines": [
+        "DFlash2VerifyBudget"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 256
+    },
+    {
+      "path": "native/kernels/gemv.metal",
+      "sha256": "9941dc3127b4a72ae1c2d2453964784a52b50ff3c68bf2e7a2de8e60527ba4dd",
+      "sources": [],
+      "routines": [
+        "Matrix-vector kernels"
+      ],
+      "status": "reviewed-baseline",
+      "lines": 486
+    },
+    {
+      "path": "native/kernels/expert_lanes.metal",
+      "sha256": "8419bb5c1b14a355bb278c1dffbd6e8de0cb94470fec35085a324f7eb62bbee6",
+      "sources": [],
+      "routines": [
+        "Expert lane kernels"
+      ],
+      "status": "reviewed-baseline",
+      "lines": 602
+    },
+    {
+      "path": "native/kernels/q8_three_rows.metal",
+      "sha256": "88973e85a417db2e1e5e57adaa9709220845cd0d090de58980ed19b1be9ce38d",
+      "sources": [],
+      "routines": [
+        "Three-row Q8 verification"
+      ],
+      "status": "reviewed-baseline",
+      "lines": 153
+    },
+    {
+      "path": "native/kernels/logit_topk.metal",
+      "sha256": "a8e420b494b72832195926d5be34aba06ca840e622b6d0d91311b48316a9fb71",
+      "sources": [
+        "Splash"
+      ],
+      "routines": [
+        "top_insert, top_pop, SIMD selection and two-stage top-64"
+      ],
+      "status": "recorded-adaptation",
+      "lines": 314
+    }
+  ],
+  "unresolved": [],
+  "model_licence": {
+    "file": "third_party/model-licences/Qwen3.8-Flash-Next/LICENSE",
+    "sha256": "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08",
+    "source": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/raw/34567a4712bc9766c4449e2e98e4468bfa24d915/LICENSE",
+    "asset_manifest_sha256": "c1d1163ddf50f667e73054d34314acd073c5062f1461e59f5f71a7cef8aa65d8",
+    "review_status": "runtime-only",
+    "distribution_scope": {
+      "weights": false,
+      "derived_packs": false,
+      "derived_text": false,
+      "commercial_model_authorisation": false,
+      "review": "Code and notices only. The runtime grants no model rights. Model use is a separate licence decision for the person using it."
+    }
+  },
+  "rust_standard_library": {
+    "toolchain": "1.99.1",
+    "rustc_commit": "58cf8f9c35b355199727627d07ae34a4e2846d67",
+    "host": "aarch64-apple-darwin",
+    "file": "third_party/rust/COPYRIGHT-library.html",
+    "sha256": "5647be074c8edf7339fd863055923a8fc80bc5610a8d4661ec3b767b9d392c27",
+    "bytes": 1499465,
+    "origin": "Library-specific copyright document from the installed pinned rustup distribution. The compiler is not redistributed.",
+    "licensing_source": "https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/COPYRIGHT",
+    "distribution_xz_url": "https://static.rust-lang.org/dist/2026-10-15/rust-docs-1.99.1-aarch64-apple-darwin.tar.xz",
+    "distribution_xz_hash": "71f08bf7c2ce153038d334991a70c9364486b9802cff9e49fa93229f614783ee",
+    "installed_path": "share/doc/rust/COPYRIGHT-library.html"
+  },
+  "retired_sources": [
+    {
+      "id": "S01",
+      "control_revision": "f8b33a9d621b1a5053871a1d91f0b616b92784b2",
+      "reason": "unverified source",
+      "removed_files": [
+        "native/kernels/gdn_ported.metal",
+        "native/kernels/moe_router_window.metal"
+      ],
+      "control_files": [
+        {
+          "path": "native/kernels/gdn_ported.metal",
+          "sha256": "016702411931f794edce99462c6fffdf34ef4bf5e4349ebf2b33ca229c05ad01"
+        },
+        {
+          "path": "native/kernels/moe_router_window.metal",
+          "sha256": "d431f3c463016d1ef5bb6c1229397b5a2845cb0d15ce05a72112934b01a3dcae"
+        }
+      ],
+      "resolution": "excluded"
+    },
+    {
+      "id": "S02",
+      "control_revision": "f8b33a9d621b1a5053871a1d91f0b616b92784b2",
+      "reason": "unverified source",
+      "removed_files": [
+        "native/kernels/moe_three_union.metal"
+      ],
+      "control_files": [
+        {
+          "path": "native/kernels/gemv.metal",
+          "sha256": "08b2827d2d0d750c24ee90d4bf5b9f19519d2e928e3c015bbd977e0b42d24a91"
+        },
+        {
+          "path": "native/kernels/expert_lanes.metal",
+          "sha256": "d3e04d3b6feb8454cd70cbe207b9362457ac88d6cf782d048a9f991685101c04"
+        },
+        {
+          "path": "native/kernels/q8_three_rows.metal",
+          "sha256": "5f02121f62d564e65e9edb65aa96f02d64e313a6ad7ea83b86fbf0e12b30dc02"
+        },
+        {
+          "path": "native/kernels/moe_three_union.metal",
+          "sha256": "ce8b9c5bebb4f02aa4aa8a64606fb3cddc18642a4501ce77d4f7cc805479ae27"
+        }
+      ],
+      "resolution": "excluded"
+    },
+    {
+      "id": "S05",
+      "control_revision": "f8b33a9d621b1a5053871a1d91f0b616b92784b2",
+      "reason": "unverified source",
+      "removed_files": [],
+      "control_files": [
+        {
+          "path": "native/kernels/dense_q8_staged_f32.metal",
+          "sha256": "fbd81f183210f1f7b5aba6c2ab6f82248eaf8bc2f42bb947753a02394e0ff53a"
+        }
+      ],
+      "resolution": "excluded"
+    }
+  ],
+  "retired_shader_symbols": [
+    "dense_lanes_q8_rg4",
+    "gdn_blocked_seq_tb16",
+    "gdn_norm_gate",
+    "gdn_pipelined_tb12",
+    "gdn_prepare_rows",
+    "gdn_verify_main",
+    "gdn_verify_main_db16",
+    "gdn_verify_main_db8",
+    "gdn_verify_main_replay",
+    "gdn_verify_replay",
+    "gdn_verify_replay_db16",
+    "gdn_verify_replay_db8",
+    "graph_dense_q8_multiseg2_f32",
+    "graph_dense_q8_multiseg2_f32_m64",
+    "graph_dense_q8_multiseg3_f32",
+    "graph_dense_q8_multiseg3_f32_m64",
+    "graph_lanes_q8_three_rows_msg",
+    "graph_moe_mixture_rows",
+    "graph_moe_route_rows",
+    "graph_moe_router_f32_m8",
+    "graph_moe_router_f32_window",
+    "graph_moe_shared_router_rows",
+    "graph_q8_gemv_rg4",
+    "graph_q8_three_rows_msg",
+    "moe_three_build_union",
+    "moe_three_down",
+    "moe_three_gate_up_swiglu",
+    "moe_three_mixture",
+    "moe_three_route",
+    "moe_three_router",
+    "moe_three_shared_router"
+  ]
+}

@@ -1,0 +1,61 @@
+name: Component checks (no weights)
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: ['lee/publication-*']
+  workflow_dispatch:
+    inputs:
+      native:
+        description: Also run the macOS CPU component and sanitizer checks
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  control-plane:
+    runs-on: ubuntu-24.04
+    # The lifecycle tests spawn real child processes, so bound their run time.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          submodules: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: constraints.txt
+      - run: python -m pip install -c constraints.txt -e . psutil pytest ruff
+      - run: ruff check src tests scripts
+      - run: ruff format --check src tests scripts
+      - run: pytest tests -q
+      - run: python scripts/generate_text_pins.py --check
+      - run: python scripts/check_sources.py
+      # This inexpensive required check runs once per PR update, including docs
+      # changes, so branch protection never waits on a path-filtered workflow.
+
+  native-components:
+    if: github.event_name == 'pull_request' || github.event_name == 'push' || inputs.native
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          submodules: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Consolidated native reference, tests, and component contracts (CPU only)
+        run: make -C native -j4 all test sanitize ci-components BUILD=../build/ci-cpu SANITIZE_BUILD=../build/ci-owned-sanitize CI_SANITIZE_BUILD=../build/ci-sanitize ENABLE_METAL=0
+      - run: python scripts/check_owned_target_protocol.py
+      # These model-free checks do not download weights or execute Metal.

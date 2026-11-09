@@ -1,0 +1,29 @@
+[package]
+name = "tokspur-wire"
+description = "Worker wire admission and the owned worker, ported one to one from native/src"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Mirror the C++ build macros; each implies the previous, as the .mk files do.
+verify8 = []                       # TOKSPUR_PRIVATE_HTTP_VERIFY8
+branch8 = ["verify8"]              # + TOKSPUR_PRIVATE_HTTP_BRANCH8
+qsa-stage-v8 = ["branch8"]         # + TOKSPUR_PRIVATE_HTTP_QSA_STAGE_V8
+fast-math = ["qsa-stage-v8"]       # + TOKSPUR_PRIVATE_HTTP_FAST_MATH
+
+[dependencies]
+tokspur-json.workspace = true
+tokspur-sys.workspace = true
+
+[dev-dependencies]
+tokspur-testkit.workspace = true
+
+[[test]]
+name = "owned_worker"
+harness = false
+
+[lints]
+workspace = true

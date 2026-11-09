@@ -1,0 +1,35 @@
+name: Native word-load build (no weights or GPU execution)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compile-component:
+    # Metal 4 shaders need the macOS 27 SDK in GitHub's Xcode 27 image.
+    runs-on: xcode-27
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          submodules: false
+      - name: Prepare Apple's Metal compiler
+        run: |
+          if ! xcrun metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcodebuild -version
+          xcrun metal --version
+      - name: Compile the component and shader with Apple's toolchain
+        run: |
+          tokspur_sdk="$(xcrun --sdk macosx --show-sdk-path)"
+          tokspur_cxx="$(xcrun --find clang++)"
+          SDKROOT="$tokspur_sdk" make -C native -j4 all native-plain-loads-component CXX="$tokspur_cxx"
+      # This lane builds the generated test executable but does not execute it or start a model.

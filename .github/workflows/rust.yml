@@ -1,0 +1,208 @@
+# Rust control-plane, protocol, pack and dependency checks.
+name: Rust port (no weights)
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: ['lee/publication-*']
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Checks to run
+        type: choice
+        options: [checks, supply-chain, all]
+        default: checks
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: 3
+  CARGO_TARGET_DIR: ${{ github.workspace }}/build/rust-target
+  # Keep CI independent of compiler wrappers configured for a developer's external volume.
+  RUSTC_WRAPPER: ""
+  RUSTC_WORKSPACE_WRAPPER: ""
+
+jobs:
+  hygiene:
+    name: Rust format and supply chain (Linux)
+    if: github.event_name == 'pull_request' || github.event_name == 'push' || inputs.suite == 'supply-chain' || inputs.suite == 'all'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Set this runner's Cargo home
+        run: |
+          cargo_home="$RUNNER_TOOL_CACHE/cargo"
+          mkdir -p "$cargo_home/bin"
+          echo "CARGO_HOME=$cargo_home" >> "$GITHUB_ENV"
+          echo "$cargo_home/bin" >> "$GITHUB_PATH"
+
+      - name: Read the pinned Rust toolchain
+        id: rust-pin
+        run: |
+          python - <<'PYTHON'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          pin = tomllib.loads(Path("rust/rust-toolchain.toml").read_text())["toolchain"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print("channel=" + pin["channel"], file=output)
+              print("components=" + ",".join(pin["components"]), file=output)
+          PYTHON
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: ${{ steps.rust-pin.outputs.channel }}
+          components: ${{ steps.rust-pin.outputs.components }}
+
+      - name: Activate the toolchain pinned by rust/rust-toolchain.toml
+        working-directory: rust
+        run: rustup show
+
+      - name: Select the installed pinned Rust toolchain
+        run: bash .github/scripts/select-rust-toolchain.sh
+
+      - name: Check formatting
+        working-directory: rust
+        run: cargo fmt --all -- --check
+
+      # rust/.cargo/config.toml keeps net.offline = true; this one step may download the crates Cargo.lock pins, so every later step stays frozen.
+      - name: Fetch the pinned crates
+        working-directory: rust
+        env:
+          CARGO_NET_OFFLINE: "false"
+        run: cargo fetch --locked
+
+      - name: Cache supply-chain tools
+        id: cache-tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.CARGO_HOME }}/bin/cargo-audit
+            ${{ env.CARGO_HOME }}/bin/cargo-deny
+            ${{ env.CARGO_HOME }}/bin/cargo-vet
+          key: rust-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust/rust-toolchain.toml') }}-audit-0.22.0-deny-0.20.2-vet-0.10.2
+
+      - name: Install supply-chain tools
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        working-directory: rust
+        env:
+          CARGO_NET_OFFLINE: "false"
+        run: |
+          cargo install cargo-audit --version 0.22.0 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-vet --version 0.10.2 --locked
+
+      - name: RustSec audit
+        working-directory: rust
+        run: cargo audit --db "$CARGO_HOME/advisory-db"
+
+      - name: cargo-deny (advisories, bans, sources)
+        working-directory: rust
+        run: |
+          cargo deny fetch db
+          cargo deny --frozen check advisories bans sources
+
+      - name: cargo-vet
+        working-directory: rust
+        run: cargo vet --cache-dir "$CARGO_HOME/vet-cache" --locked
+
+      - name: Create the Python test environment
+        run: |
+          python -m venv .venv
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Test the OSV advisory check
+        run: python -m unittest tests/test_check_rust_advisories.py
+
+      # RustSec misses advisories filed only with GitHub, so the lockfile is also checked against OSV.
+      - name: Check rust/Cargo.lock against OSV
+        run: python scripts/check_rust_advisories.py
+
+  macos:
+    name: Rust clippy and tests (macOS arm64)
+    # tokspur-sys targets aarch64-apple-darwin.
+    if: github.event_name == 'pull_request' || github.event_name == 'push' || inputs.suite == 'checks' || inputs.suite == 'all'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Set this runner's Cargo home
+        run: |
+          cargo_home="$RUNNER_TOOL_CACHE/cargo"
+          mkdir -p "$cargo_home/bin"
+          echo "CARGO_HOME=$cargo_home" >> "$GITHUB_ENV"
+          echo "$cargo_home/bin" >> "$GITHUB_PATH"
+
+      - name: Read the pinned Rust toolchain
+        id: rust-pin
+        run: |
+          python - <<'PYTHON'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          pin = tomllib.loads(Path("rust/rust-toolchain.toml").read_text())["toolchain"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print("channel=" + pin["channel"], file=output)
+              print("components=" + ",".join(pin["components"]), file=output)
+          PYTHON
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: ${{ steps.rust-pin.outputs.channel }}
+          components: ${{ steps.rust-pin.outputs.components }}
+
+      - name: Activate the toolchain pinned by rust/rust-toolchain.toml
+        working-directory: rust
+        run: rustup show
+
+      - name: Select the installed pinned Rust toolchain
+        run: bash .github/scripts/select-rust-toolchain.sh
+
+      - name: Fetch the pinned crates
+        working-directory: rust
+        env:
+          CARGO_NET_OFFLINE: "false"
+        run: cargo fetch --locked
+
+      - name: Cache Rust build outputs
+        # Keep build outputs inside this checkout and separate runner architectures.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/rust-target
+          key: rust-target-${{ runner.os }}-${{ runner.arch }}-v1-${{ hashFiles('rust/rust-toolchain.toml', 'rust/Cargo.lock', 'rust/**/Cargo.toml', 'rust/.cargo/config.toml', 'native/rust.mk') }}
+
+      # Check fmt, clippy -D warnings and tests at every feature level, all --frozen. Keep the optional C++ differential oracle in the separate native validation because its floating-point parser needs a matching libc++ toolchain.
+      - name: Clippy and tests at every feature level
+        run: make -C native -f rust.mk rust-check CPP_ORACLE=0
+
+      - name: Build release tokspur-server and tokspur CLI
+        run: make -C native -f rust.mk rust-release

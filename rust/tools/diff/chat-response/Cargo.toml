@@ -1,0 +1,27 @@
+# Differential runner for the tokspur-text chat/response port against the C++ in native/src. A separate workspace: it is not a phase A member, is never built by native/Makefile, and leaves rust/Cargo.lock untouched. Use run.sh.
+[package]
+name = "tokspur-text-diff"
+description = "Compares tokspur-text's chat/response port with the C++ byte for byte"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+tokspur-json = { path = "../../../crates/tokspur-json" }
+tokspur-text = { path = "../../../crates/tokspur-text" }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+let_underscore_must_use = "deny"

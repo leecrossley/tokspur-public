@@ -1,0 +1,115 @@
+[package]
+name = "tokspur-fuzz"
+description = "libFuzzer targets for the Rust port, including differential targets against the unchanged C++ parsers (development tooling, never shipped)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Mirror the C++ build macros, as tokspur-wire and tokspur-server do. Only the `wire` target depends on them; `native/rust.mk rust-fuzz` builds it once per level.
+[features]
+verify8 = ["tokspur-wire/verify8", "tokspur-server/verify8"]
+branch8 = ["verify8", "tokspur-wire/branch8", "tokspur-server/branch8"]
+qsa-stage-v8 = ["branch8", "tokspur-wire/qsa-stage-v8", "tokspur-server/qsa-stage-v8"]
+fast-math = ["qsa-stage-v8", "tokspur-wire/fast-math", "tokspur-server/fast-math"]
+# The differential targets link the unchanged C++ parsers, which need a libc++ with floating-point std::from_chars (the local Apple clang 21 toolchain). Without this feature nothing C++ is compiled, so the other targets also build on older toolchains such as CI's hosted macOS image.
+cpp-oracle = []
+
+[dependencies]
+libfuzzer-sys.workspace = true
+arbitrary.workspace = true
+tokspur-json.workspace = true
+tokspur-text.workspace = true
+tokspur-gguf.workspace = true
+tokspur-wire.workspace = true
+tokspur-server.workspace = true
+# Its safe socket helpers only (the HTTP target's nonblocking peek); no new `unsafe` for that target.
+tokspur-sys.workspace = true
+
+# Compiles the narrow C++ oracle shim (cpp/oracle.cpp) with the unchanged native/src parsers it calls.
+[build-dependencies]
+cc.workspace = true
+
+# Every fuzz target is a `#![no_main]` libFuzzer binary. None has a test harness, docs or benchmarks, so `cargo test --workspace` and clippy build them like any binary without fuzzing flags; only `native/rust.mk rust-fuzz` instruments and runs them.
+[[bin]]
+name = "json"
+path = "src/bin/json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_diff"
+path = "src/bin/json_diff.rs"
+test = false
+doc = false
+bench = false
+required-features = ["cpp-oracle"]
+
+[[bin]]
+name = "http"
+path = "src/bin/http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gguf"
+path = "src/bin/gguf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gguf_diff"
+path = "src/bin/gguf_diff.rs"
+test = false
+doc = false
+bench = false
+required-features = ["cpp-oracle"]
+
+[[bin]]
+name = "response"
+path = "src/bin/response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "response_diff"
+path = "src/bin/response_diff.rs"
+test = false
+doc = false
+bench = false
+required-features = ["cpp-oracle"]
+
+[[bin]]
+name = "bpe"
+path = "src/bin/bpe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire"
+path = "src/bin/wire.rs"
+test = false
+doc = false
+bench = false
+required-features = ["verify8"]
+
+# The workspace lint levels, restated rather than inherited (`workspace = true`) so that this crate's one exception is visible here: the C++ oracle FFI in src/oracle.rs is the only module allowed `unsafe` (its own `#![allow(unsafe_code)]`, which the `deny` below permits and a crate-wide `forbid` would not). Every other module and every fuzz target declares `#![forbid(unsafe_code)]`. Calling the unchanged C++ parsers in-process is what makes the differential targets byte-exact and fast enough to fuzz; this is development tooling and never part of a shipped binary. Keep these levels identical to rust/Cargo.toml.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+let_underscore_must_use = "deny"
+undocumented_unsafe_blocks = "deny"

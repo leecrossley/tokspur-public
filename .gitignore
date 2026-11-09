@@ -1,0 +1,64 @@
+# Local credentials and secrets
+.env
+.env.*
+!.env.example
+credentials/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Models and model caches
+models/
+weights/
+.hf/
+.huggingface/
+.cache/
+.tokspur/
+*.egg-info/
+*.safetensors
+*.gguf
+*.ggml
+*.pt
+*.pth
+*.onnx
+*.mlmodel
+*.mlpackage/
+
+# Local inference state and raw experiment output
+state/
+runs/
+outputs/
+artifacts/
+logs/
+*.log
+
+# Agent configuration stays local
+.claude/
+.agents/
+.codex/
+.cursor/
+
+# Build and environment output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+target/
+build/
+dist/
+node_modules/
+*.metallib
+*.dylib
+*.so
+.DS_Store
+
+# Private diagnostic captures
+*.trace.jsonl
+*.exchange.jsonl
+*.identity.json
+*.receipt.json
+*.prefix-trace.jsonl
+correctness-capture.bin
+rows.json

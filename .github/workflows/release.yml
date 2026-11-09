@@ -1,0 +1,162 @@
+name: Release (signed macOS arm64 package)
+
+# Manual only. Keep this workflow disabled in repository settings until the
+# protected release environment and signing/notary secrets are configured.
+# Builds and notarises on the configured xcode-27 runner and creates a draft release.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build (vX.Y.Z)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: xcode-27
+    timeout-minutes: 120
+    environment: release
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag }}
+      PYTHON: python
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+          submodules: false
+          fetch-depth: 0
+
+      - name: Require a tag from reviewed main
+        run: git merge-base --is-ancestor HEAD "$GITHUB_SHA"
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Prepare Apple's Metal compiler
+        run: |
+          if ! xcrun metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcodebuild -version
+          xcrun metal --version
+
+      - name: Set job paths and this runner's Cargo home
+        run: |
+          cargo_home="$RUNNER_TOOL_CACHE/cargo"
+          mkdir -p "$cargo_home/bin"
+          {
+            echo "CARGO_HOME=$cargo_home"
+            echo "KEYCHAIN=$RUNNER_TEMP/tokspur-signing.keychain-db"
+            echo "DIST=$RUNNER_TEMP/tokspur-dist"
+          } >> "$GITHUB_ENV"
+          echo "$cargo_home/bin" >> "$GITHUB_PATH"
+
+      - name: Read the pinned Rust toolchain
+        id: rust-pin
+        run: |
+          "$PYTHON" - <<'PYTHON'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          pin = tomllib.loads(Path("rust/rust-toolchain.toml").read_text())["toolchain"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print("channel=" + pin["channel"], file=output)
+              print("components=" + ",".join(pin["components"]), file=output)
+          PYTHON
+
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: ${{ steps.rust-pin.outputs.channel }}
+          components: ${{ steps.rust-pin.outputs.components }}
+
+      - name: Select the installed pinned Rust toolchain
+        run: bash .github/scripts/select-rust-toolchain.sh
+
+      - name: Check the tag against the project version
+        run: |
+          "$PYTHON" - <<'PYTHON'
+          import os, sys
+          sys.path.insert(0, "scripts")
+          import release
+          release.check_tag(os.environ["TAG"])
+          PYTHON
+
+      - name: Check publication sources
+        run: '"$PYTHON" scripts/check_sources.py --publication'
+
+      - name: Load the signing certificate into a temporary keychain
+        env:
+          CERTIFICATE: ${{ secrets.TOKSPUR_SIGNING_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.TOKSPUR_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          umask 077
+          keychain_password="$(openssl rand -hex 24)"
+          certificate="$RUNNER_TEMP/tokspur-signing.p12"
+          trap 'rm -f "$certificate"' EXIT
+          printf '%s' "$CERTIFICATE" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$KEYCHAIN"
+          security set-keychain-settings -lut 7200 "$KEYCHAIN"
+          security unlock-keychain -p "$keychain_password" "$KEYCHAIN"
+          security import "$certificate" -k "$KEYCHAIN" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$KEYCHAIN" > /dev/null
+
+      - name: Build and sign
+        env:
+          IDENTITY: ${{ secrets.TOKSPUR_SIGNING_IDENTITY }}
+        run: |
+          "$PYTHON" scripts/bootstrap.py --install-venv --codesign-identity "$IDENTITY" --codesign-keychain "$KEYCHAIN"
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Package
+        env:
+          IDENTITY: ${{ secrets.TOKSPUR_SIGNING_IDENTITY }}
+        run: |
+          rm -rf "$DIST"
+          TOKSPUR_CODESIGN_KEYCHAIN="$KEYCHAIN" "$PYTHON" scripts/release.py package --tag "$TAG" --output "$DIST" --signing-identity "$IDENTITY"
+
+      - name: Notarise
+        env:
+          NOTARY_KEY: ${{ secrets.TOKSPUR_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.TOKSPUR_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.TOKSPUR_NOTARY_ISSUER }}
+        run: |
+          umask 077
+          key="$RUNNER_TEMP/tokspur-notary.p8"
+          submission="$RUNNER_TEMP/tokspur-notarise.zip"
+          trap 'rm -f "$key" "$submission"' EXIT
+          printf '%s' "$NOTARY_KEY" | base64 --decode > "$key"
+          ditto -c -k --keepParent "$DIST/tokspur-$TAG" "$submission"
+          xcrun notarytool submit "$submission" --key "$key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" --wait --output-format json > "$RUNNER_TEMP/notary.json"
+          cat "$RUNNER_TEMP/notary.json"
+          "$PYTHON" -c 'import json, sys; sys.exit(json.load(open(sys.argv[1])).get("status") != "Accepted")' "$RUNNER_TEMP/notary.json"
+
+      - name: Verify Apple tickets
+        env:
+          IDENTITY: ${{ secrets.TOKSPUR_SIGNING_IDENTITY }}
+        run: '"$PYTHON" scripts/release.py verify-notarisation --tag "$TAG" --dir "$DIST" --signing-identity "$IDENTITY"'
+
+      - name: Publish a draft release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: '"$PYTHON" scripts/release.py publish --tag "$TAG" --dir "$DIST"'
+
+      - name: Remove the temporary keychain
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN:-}" ] && [ -e "$KEYCHAIN" ]; then
+            security delete-keychain "$KEYCHAIN"
+          fi

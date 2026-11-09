@@ -1,0 +1,145 @@
+
+# cargo-vet config file
+
+[cargo-vet]
+version = "0.10"
+
+[imports.bytecode-alliance]
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-chain/audits.toml"
+
+[imports.google]
+url = "https://raw.githubusercontent.com/google/supply-chain/main/audits.toml"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[policy.tokspur-fuzz]
+criteria = "safe-to-run"
+
+[[exemptions.assoc]]
+version = "0.1.3"
+criteria = "safe-to-run"
+
+[[exemptions.bitvec]]
+version = "1.1.1"
+criteria = "safe-to-run"
+
+[[exemptions.cc]]
+version = "1.2.41"
+criteria = "safe-to-run"
+
+[[exemptions.cfg-if]]
+version = "1.0.5"
+criteria = "safe-to-run"
+
+[[exemptions.find-msvc-tools]]
+version = "0.1.14"
+criteria = "safe-to-run"
+
+[[exemptions.funty]]
+version = "2.0.0"
+criteria = "safe-to-run"
+
+[[exemptions.generator]]
+version = "0.8.10"
+criteria = "safe-to-run"
+
+[[exemptions.getrandom]]
+version = "0.4.3"
+criteria = "safe-to-run"
+
+[[exemptions.jobserver]]
+version = "0.1.35"
+criteria = "safe-to-run"
+
+[[exemptions.libc]]
+version = "0.2.191"
+criteria = "safe-to-run"
+
+[[exemptions.libfuzzer-sys]]
+version = "0.4.13"
+criteria = "safe-to-run"
+
+[[exemptions.log]]
+version = "0.4.34"
+criteria = "safe-to-run"
+
+[[exemptions.once_cell]]
+version = "1.21.4"
+criteria = "safe-to-run"
+
+[[exemptions.owo-colors]]
+version = "3.5.0"
+criteria = "safe-to-run"
+
+[[exemptions.pin-project-lite]]
+version = "0.2.17"
+criteria = "safe-to-run"
+
+[[exemptions.proc-macro2]]
+version = "1.0.107"
+criteria = "safe-to-run"
+
+[[exemptions.r-efi]]
+version = "6.0.0"
+criteria = "safe-to-run"
+
+[[exemptions.radium]]
+version = "0.7.0"
+criteria = "safe-to-run"
+
+[[exemptions.rand]]
+version = "0.8.8"
+criteria = "safe-to-run"
+
+[[exemptions.rustversion]]
+version = "1.0.23"
+criteria = "safe-to-run"
+
+[[exemptions.shuttle]]
+version = "0.8.1"
+criteria = "safe-to-run"
+
+[[exemptions.smallvec]]
+version = "1.16.3"
+criteria = "safe-to-run"
+
+[[exemptions.syn]]
+version = "2.0.119"
+criteria = "safe-to-run"
+
+[[exemptions.tap]]
+version = "1.0.1"
+criteria = "safe-to-run"
+
+[[exemptions.tracing]]
+version = "0.1.44"
+criteria = "safe-to-run"
+
+[[exemptions.unicode-ident]]
+version = "1.0.27"
+criteria = "safe-to-run"
+
+[[exemptions.wasi]]
+version = "0.11.1+wasi-snapshot-preview1"
+criteria = "safe-to-run"
+
+[[exemptions.windows-link]]
+version = "0.2.1"
+criteria = "safe-to-run"
+
+[[exemptions.windows-result]]
+version = "0.4.1"
+criteria = "safe-to-run"
+
+[[exemptions.wyz]]
+version = "0.5.1"
+criteria = "safe-to-run"
+
+[[exemptions.zerocopy]]
+version = "0.8.63"
+criteria = "safe-to-run"
+
+[[exemptions.zerocopy-derive]]
+version = "0.8.63"
+criteria = "safe-to-run"

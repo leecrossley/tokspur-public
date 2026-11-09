@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokspur"
+version = "0.1.0"
+description = "Local coding inference for Apple Silicon"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = ["psutil"]
+
+[project.scripts]
+tokspur = "tokspur.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

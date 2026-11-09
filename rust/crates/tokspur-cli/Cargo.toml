@@ -1,0 +1,21 @@
+[package]
+name = "tokspur-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "tokspur"
+path = "src/main.rs"
+
+[dependencies]
+tokspur-gguf.workspace = true
+tokspur-json.workspace = true
+tokspur-pack.workspace = true
+tokspur-sys.workspace = true
+tokspur-text.workspace = true
+
+[lints]
+workspace = true

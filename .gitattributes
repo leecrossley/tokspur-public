@@ -1,0 +1,5 @@
+# Preserve the upstream licence bytes, including CRLF and existing trailing space.
+third_party/model-licences/Qwen3.8-Flash-Next/LICENSE -text whitespace=-blank-at-eol,cr-at-eol
+
+# Keep the generated upstream library notices byte for byte.
+third_party/rust/COPYRIGHT-library.html -text whitespace=-blank-at-eol linguist-generated

@@ -1,0 +1,4 @@
+# cargo-audit configuration (layout as in the over-show app's .cargo/audit.toml). List here any advisory reviewed and accepted, with the reason and review date. scripts/check_rust_advisories.py shares this ignore list.
+
+[advisories]
+ignore = []

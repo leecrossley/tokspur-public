@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "name": "m5-max-128-baseline",
+  "hardware": {"chip": "Apple M5 Max", "gpu_cores": 40, "unified_memory_gib": 128},
+  "context_tokens": 65536,
+  "native_memory_gib": 96,
+  "api_memory_ceiling_gib": 108,
+  "kv_format": "bf16",
+  "state_format": "fp32",
+  "verify_rows": "all",
+  "ple_memory_mib": 512,
+  "resident_experts": true,
+  "ane_prefill": false,
+  "temporary_ssd_cache_gib": 0,
+  "persistent_cache": false,
+  "text_only": true,
+  "queue_size": 1,
+  "serialize_requests": true,
+  "host": "127.0.0.1",
+  "port": 18081,
+  "public_model": "tokspur"
+}

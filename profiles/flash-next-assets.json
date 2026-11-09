@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "target": {
+    "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+    "revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+    "variant": "UD-Q4_K_XL",
+    "files": [
+      {"name": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf", "size": 10946624, "sha256": "4448186216b3af4cc558bbce2c3213f01608f8f8b2e5267a9767971dd3ec8082"},
+      {"name": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf", "size": 49859583136, "sha256": "3f342f1c1580473f1ee94ddd5b28206e8c07a70fa1a366f59d1d6c922919a6c9"},
+      {"name": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf", "size": 49376141504, "sha256": "56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3"},
+      {"name": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf", "size": 12087983520, "sha256": "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a"}
+    ]
+  },
+  "draft": {
+    "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+    "revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+    "files": [
+      {"name": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf", "size": 2786568256, "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"}
+    ]
+  },
+  "legacy_dflash2_draft": {
+    "repo": "incoai/Qwen3.8-Flash-Next-DFlash2",
+    "revision": "a22a1744e85c17364dcc54a6a420af7135d4c7f6",
+    "files": [
+      {"name": "config.json", "size": 1236, "sha256": "2409575986f9ea24d455343eb469c0e6940def5edab1d1be503bb8eb4cc3b1b9"},
+      {"name": "model.safetensors", "size": 1206140008, "sha256": "d6723f2a359eaf33ec0c95f22ae8edda896774020c552296a85e1913b4d3186f"}
+    ]
+  }
+}

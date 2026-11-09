@@ -1,0 +1,20 @@
+tokspur
+Copyright 2026 tokspur contributors
+
+tokspur is licensed under the Apache License 2.0. See LICENSE.
+
+No model weights are distributed here. Model-use and redistribution conditions, including the pinned Qwen Community License 1.0, are recorded in MODEL_LICENCES.md.
+
+Some Metal kernels and host routines in native/ adapt code from other open-source projects. Each adapted file keeps its original copyright and licence header.
+
+- llama.cpp, commit 6050b467c07a95c7b87debd4ddac2f8ba8d9b807, Copyright (c) 2023-2026 The ggml authors, MIT licence. Tile, dequantisation and matrix-vector patterns in native/kernels/ (grouped_mm, grouped_mm_f32, grouped_mpp, dense_q8_staged_f32, moe_router_f32_batch, qsa_prefill, nax_prefill, gdn_chunk and raw_decode) and native/src/raw_decode_component.cpp. The licence text is in native/third_party/llama-cpp/LICENSE.
+- ggml, Copyright (c) 2023-2026 The ggml authors, MIT licence. native/src/gdn_chunk_math.cpp follows the CS64 graph algebra at llama.cpp 6050b467c07a95c7b87debd4ddac2f8ba8d9b807. The licence text is in its header and native/third_party/llama-cpp/LICENSE.
+- mlx-vlm 0.7.1, commit 1ecf1ecdd28af102eded679be0daa5c76ab2a068, Copyright (c) 2025 Prince Canuma, MIT licence. The sparse attention kernel in native/kernels/qsa_sparse_attention.metal. The licence text is in its header and native/third_party/mlx-vlm/LICENSE.
+- Splash 1.4.0, commit 1482f6bbc2abf12375332725302019594150b6cb, Apache License 2.0. Convolution, ring attention and candidate selection in native/kernels/dflash2.metal, the register top-k helpers in native/kernels/logit_topk.metal, the three-part BF16 weight split, plane matmul and split reduction in native/kernels/nax_prefill.metal, and DFlash2VerifyBudget in native/src/dflash2_drafter.cpp and native/include/tokspur/dflash2_drafter.hpp. The licence and upstream third-party notices are in native/third_party/splash/.
+- m5-max-kernels, Copyright (c) 2026 m5-max-kernels contributors, MIT licence. The grid band ordering in native/kernels/dense_q8_staged_f32.metal follows the GEMM pattern at a6d92a3bdd7c784fde2e3e86b303d533354f4603. The licence is in native/third_party/m5-max-kernels/LICENSE.
+
+native/third_party/sources.json records source paths, revisions and hashes. Signed release archives include the source manifest and bundled licences.
+
+The Rust standard library is compiled into the Rust host binaries. The library-specific copyright and dependency licences from the pinned Rust 1.99.1 distribution are retained in third_party/rust/COPYRIGHT-library.html and distributed with staged packages and release archives. The document covers library sources and dependencies across supported platforms, including components beyond this Mac binary. It is retained as supplied. The Rust compiler is not redistributed.
+
+The native tokenizer includes normalisation data derived from the Unicode 9.0.0 Character Database. Copyright 1991-2016 Unicode, Inc. The Unicode data licence is in native/data/UNICODE-LICENSE.txt.

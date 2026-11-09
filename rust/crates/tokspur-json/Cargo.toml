@@ -1,0 +1,16 @@
+[package]
+name = "tokspur-json"
+description = "Owned JSON, ported one to one from native/src/json.cpp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+tokspur-testkit.workspace = true
+
+[lints]
+workspace = true

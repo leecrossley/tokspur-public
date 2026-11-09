@@ -1,0 +1,57 @@
+# Rust control-plane, protocol and pack workspace for Tokspur.
+[workspace]
+resolver = "3"
+members = [
+    "crates/tokspur-json",
+    "crates/tokspur-text",
+    "crates/tokspur-gguf",
+    "crates/tokspur-sys",
+    "crates/tokspur-pack",
+    "crates/tokspur-cli",
+    "crates/tokspur-wire",
+    "crates/tokspur-server",
+    "crates/tokspur-testkit",
+    "crates/tokspur-dispatch-graph",
+    "crates/tokspur-fuzz",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+tokspur-json = { path = "crates/tokspur-json" }
+tokspur-text = { path = "crates/tokspur-text" }
+tokspur-gguf = { path = "crates/tokspur-gguf" }
+tokspur-sys = { path = "crates/tokspur-sys" }
+tokspur-pack = { path = "crates/tokspur-pack" }
+tokspur-cli = { path = "crates/tokspur-cli" }
+tokspur-wire = { path = "crates/tokspur-wire" }
+tokspur-testkit = { path = "crates/tokspur-testkit" }
+tokspur-server = { path = "crates/tokspur-server" }
+# Dev-only third-party crates pinned by Cargo.lock.
+shuttle = "=0.8.1"
+libfuzzer-sys = "=0.4.13"
+arbitrary = "=1.4.2"
+cc = "=1.2.41"
+
+[workspace.lints.rust]
+# Every crate except tokspur-sys also declares #![forbid(unsafe_code)].
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+let_underscore_must_use = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+debug = 1

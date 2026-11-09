@@ -1,0 +1,66 @@
+[package]
+name = "tokspur-server"
+description = "Owned HTTP/SSE serving layer and server CLI, ported one to one from native/src"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Mirror the C++ build macros, as tokspur-wire does.
+verify8 = ["tokspur-wire/verify8"]
+branch8 = ["verify8", "tokspur-wire/branch8"]
+qsa-stage-v8 = ["branch8", "tokspur-wire/qsa-stage-v8"]
+fast-math = ["qsa-stage-v8", "tokspur-wire/fast-math"]
+
+[dependencies]
+tokspur-json.workspace = true
+tokspur-text.workspace = true
+tokspur-gguf.workspace = true
+tokspur-sys.workspace = true
+tokspur-wire.workspace = true
+
+[dev-dependencies]
+tokspur-cli.workspace = true
+tokspur-testkit.workspace = true
+# Dev-only: the Shuttle model of leases, epochs, cancellation and resync.
+shuttle.workspace = true
+
+[[test]]
+name = "http"
+harness = false
+
+[[test]]
+name = "serve_protocol"
+harness = false
+
+# Private HTTP suites, one per C++ test binary; each needs its build macro.
+[[test]]
+name = "http_verify8"
+harness = false
+required-features = ["verify8"]
+
+[[test]]
+name = "http_branch8"
+harness = false
+required-features = ["branch8"]
+
+[[test]]
+name = "http_fast_math"
+harness = false
+required-features = ["fast-math"]
+
+# The Shuttle model of leases, epochs, cancellation and resync. The plain broker runs at every level; the branch8 scenarios are compiled in by cfg from `branch8` up.
+[[test]]
+name = "shuttle_model"
+
+[[test]]
+name = "challenger_stress"
+
+[[bin]]
+name = "tokspur-server"
+path = "src/main.rs"
+
+[lints]
+workspace = true

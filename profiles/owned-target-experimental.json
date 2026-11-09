@@ -1,0 +1,13 @@
+{
+  "router": "softmax",
+  "normalize_selected": true,
+  "query_scale": "inverse-sqrt-key-width",
+  "l2_epsilon": 0.000001,
+  "l2_mode": "add",
+  "query_packing": "head",
+  "rotary_pairs": "split",
+  "hash_order": "newest",
+  "boundary": "literal",
+  "image_as_eos": true,
+  "dilation": 3
+}

@@ -1,0 +1,17 @@
+[package]
+name = "tokspur-gguf"
+description = "The GGUF reader the server needs, ported one to one from native/src/gguf.cpp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# native/src/gguf.cpp includes no JSON, so neither does this port.
+[dependencies]
+
+[dev-dependencies]
+tokspur-testkit.workspace = true
+
+[lints]
+workspace = true
