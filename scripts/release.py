@@ -355,17 +355,28 @@ def github_request(
 
 def release_body(tag: str, repository: str, digest: str) -> str:
     """Install instructions that GitHub places above the generated release notes."""
+    if repository.casefold() == "san-digital/tokspur":
+        version = "the latest signed release"
+        command = "curl -fsSL https://tokspur.com/install.sh | sh"
+        guide = "https://tokspur.com/get-started/"
+    else:
+        version = f"the signed {tag} release"
+        command = (
+            f"curl -fsSL https://github.com/{repository}/releases/download/{tag}/install.sh"
+            f" | TOKSPUR_VERSION={tag} sh"
+        )
+        guide = f"https://github.com/{repository}#add-the-model"
+
     return (
-        "Install on an Apple M5 Max with 128 GB of unified memory and macOS 27 "
-        "or later:\n\n"
+        f"Install {version} on an Apple M5 Max with a 40-core GPU, 128 GB of unified memory and macOS 27 or later.\n\n"
         "```sh\n"
-        f"curl -fsSL https://github.com/{repository}/releases/download/{tag}/install.sh"
-        f" | TOKSPUR_VERSION={tag} sh\n"
+        f"{command}\n"
+        'export PATH="$HOME/.local/bin:$PATH"\n'
+        "tokspur verify-build\n"
         "```\n\n"
-        "The installer checks the archive against its SHA-256, "
-        f"`{digest}`, requires the pinned Apple Developer ID signing team and authenticates every released file before verifying the package. Then add the model and "
-        f"start the server as the [README](https://github.com/{repository}#add-the-model) "
-        "describes.\n"
+        f"The installer verifies the archive checksum, checks the pinned Apple Developer ID signing team and authenticates every packaged file. The SHA-256 of the {tag} archive is `{digest}`.\n\n"
+        "Add `~/.local/bin` to your shell's `PATH` for future sessions. Automatic updates are on by default. When you run tokspur, it checks for a new release in the background at most once a day. "
+        f"Run `tokspur update` to update now or `tokspur update --off` to turn off automatic updates. Follow the [setup guide]({guide}) to add the model and start the server.\n"
     )
 
 
