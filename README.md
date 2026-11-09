@@ -1,4 +1,16 @@
-# Tokspur
+<p align="center">
+  <a href="https://tokspur.com/#gh-light-mode-only"><img src="https://tokspur.com/assets/brand/tokspur-wordmark-960.png" width="320" alt="tokspur"></a>
+  <a href="https://tokspur.com/#gh-dark-mode-only"><img src="https://tokspur.com/assets/brand/tokspur-wordmark-reversed-960.png" width="320" alt="tokspur"></a>
+</p>
+
+<p align="center"><strong>Private chat and code on your Mac.</strong></p>
+
+<p align="center">
+  <a href="https://tokspur.com/">Website</a> |
+  <a href="https://tokspur.com/get-started/">Get started</a> |
+  <a href="https://tokspur.com/docs/">Docs</a> |
+  <a href="https://tokspur.com/engine/">Engine</a>
+</p>
 
 Tokspur runs Qwen3.8 Flash-Next locally on a Mac. It uses a native Metal worker and serves an OpenAI-compatible chat API.
 
