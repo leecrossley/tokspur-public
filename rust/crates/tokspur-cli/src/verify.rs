@@ -1094,18 +1094,30 @@ fn verify_staged_package(staged: &StagedLayout, targets: &LaunchTargets) -> Resu
 /// Runs `verify-build` against the active `RuntimeLayout` and exact launch targets.
 pub fn verify_build(layout: &RuntimeLayout) -> Result<LaunchTargets, CliError> {
     let targets = layout.resolve_launch_targets()?;
+    verify_targets(layout, &targets)?;
+    Ok(targets)
+}
+
+/// Pack construction uses the utility executable even when serving uses the
+/// scalar worker. Verify that exact executable and the adoption profile.
+pub(crate) fn verify_pack_tool(layout: &RuntimeLayout) -> Result<PathBuf, CliError> {
+    let mut targets = layout.resolve_launch_targets()?;
+    targets.worker_bin.set_file_name("tokspur-native");
+    targets.policy = layout.assets_profile_path();
+    verify_targets(layout, &targets)?;
+    Ok(targets.worker_bin)
+}
+
+fn verify_targets(layout: &RuntimeLayout, targets: &LaunchTargets) -> Result<(), CliError> {
     match layout {
         RuntimeLayout::Checkout(c) => {
             let receipt_path = layout
                 .checkout_receipt_path()
                 .ok_or_else(|| CliError::Validation("missing build-manifest path".to_owned()))?;
-            verify_checkout_build(c, &receipt_path, &targets)?;
+            verify_checkout_build(c, &receipt_path, targets)
         }
-        RuntimeLayout::Staged(s) => {
-            verify_staged_package(s, &targets)?;
-        }
+        RuntimeLayout::Staged(s) => verify_staged_package(s, targets),
     }
-    Ok(targets)
 }
 
 #[cfg(test)]

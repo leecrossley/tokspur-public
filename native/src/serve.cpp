@@ -35,6 +35,20 @@ std::atomic<bool> stopping{false};
 static_assert(std::atomic<bool>::is_always_lock_free, "shutdown flag must be signal-safe lock-free storage");
 void stop_signal(int) { stopping.store(true, std::memory_order_relaxed); }
 void require(bool value, const char* why) { if (!value) throw FormatError(why); }
+std::string_view pack_startup_message(const Json& ready, bool requested_pack) {
+    const auto* schema = ready.find("derived_pack_schema");
+    const auto* recipe = ready.find("derived_pack_recipe");
+    if (!requested_pack && !schema && !recipe) return "tokspur: loaded raw GGUF weights\n";
+    if (requested_pack && schema && schema->kind() == Json::Kind::number &&
+        recipe && recipe->kind() == Json::Kind::string) {
+        if (schema->number_lexeme() == "2" && recipe->string() == "tokspur-pack-v2")
+            return "tokspur: loaded Pack v2 (tokspur-pack-v2)\n";
+        if (schema->number_lexeme() == "3" && recipe->string() == "tokspur-pack-v3")
+            return "tokspur: loaded Pack v3 (tokspur-pack-v3)\n";
+    }
+    return "tokspur: weight pack identity unavailable\n";
+}
+
 bool json_content_type(std::string_view input) {
     const auto trim = [](std::string_view value) {
         const auto first = value.find_first_not_of(" \t\r\n"), last = value.find_last_not_of(" \t\r\n");
@@ -674,6 +688,7 @@ int server_cli(int argc, char** argv) {
     require(!stopping.load(), "startup cancelled before model launch");
     OwnedWorker worker(config.worker);
     validate_worker_ready(worker.ready(), config.worker.stack_execution, config.worker.checkpoint_slots, config.worker.checkpoint_budget_bytes);
+    std::cerr << pack_startup_message(worker.ready(), !config.worker.derived_pack.empty());
     ServeSession session({[&](const Json& input) { return renderer.render(input); }, [&](const RenderedChat& input) { return tokenizer.encode(input.prompt, input.literal_ranges); },
         [&](std::span<const uint32_t> ids) { return tokenizer.decode_bytes(ids); }, admission}, config.alias, config.worker.stack_execution,
         config.worker.checkpoint_slots ? worker.ready() : Json()

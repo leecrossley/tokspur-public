@@ -277,6 +277,7 @@ fn decode(ids: &[u32]) -> Vec<u8> {
 
 fn codec() -> ServeCodec {
     ServeCodec {
+        control_ids: Vec::new(),
         render: Box::new(|request: &Json| {
             let messages = request.find("messages").unwrap().unwrap().array().unwrap();
             let prompt = messages
@@ -1813,6 +1814,38 @@ fn executor_enum_contract() {
 /// Execute the production session and response parser in a child process with a generated target, without HTTP, model weights or GPU execution.
 fn response_failure_trace_cases() {
     use tokspur_text::response::{ResponseLimits, ResponseParser, ResponseStatus};
+    // Nonstreaming still cross-checks incremental text against the final decode.
+    let mut inconsistent = codec();
+    inconsistent.decode = Box::new(|ids| {
+        let mut bytes = decode(ids);
+        if ids.len() > 1 {
+            bytes[0] = b'x';
+        }
+        Ok(bytes)
+    });
+    let mut session_under_test =
+        ServeSession::new(inconsistent, SessionOptions::default()).unwrap();
+    let mut target = Fake::new();
+    target.reply("ok<|im_end|>");
+    let error = session_under_test
+        .complete(
+            &plain("A"),
+            b"final-prefix-check",
+            &mut |job, event| target.call(job, event),
+            &mut ServeSink {
+                chunk: None,
+                cancelled: &mut || false,
+                new_seed: &mut || 44,
+                prefix_trace: None,
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "final response disagrees with streamed prefix"
+    );
+    assert_eq!(session_under_test.committed_tokens(), 0);
+
     for (raw, phase, detail, public_error) in [
         (
             "private-failure-canary\0tail<|im_end|>",

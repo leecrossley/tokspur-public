@@ -4,12 +4,42 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#ifndef TOKSPUR_PRIVATE_Q8_TILE64_CACHE
+#define TOKSPUR_PRIVATE_Q8_TILE64_CACHE 1
+#endif
+#if TOKSPUR_PRIVATE_Q8_TILE64_CACHE != 0 && TOKSPUR_PRIVATE_Q8_TILE64_CACHE != 1
+#error "TOKSPUR_PRIVATE_Q8_TILE64_CACHE must be 0 or 1"
+#endif
+
 namespace tokspur {
+inline constexpr bool q8_tile64_cache_enabled = TOKSPUR_PRIVATE_Q8_TILE64_CACHE != 0;
+// Snapshot inputs: candidate sums describe registrations, not unique source pages.
+// Aliases refer to a live owner slot; only distinct owners contribute allocation bytes.
+struct Q8Tile64CacheCandidate {
+    uint64_t source_bytes = 0, repack_logical_bytes = 0;
+    std::optional<size_t> cached_allocation_slot;
+};
+struct Q8Tile64CacheAllocation {
+    size_t slot = 0;
+    uint64_t logical_bytes = 0, charged_bytes = 0;
+    bool live = false, alias = false;
+};
+struct Q8Tile64CacheStats {
+    bool enabled = true;
+    uint64_t registered_candidates = 0, registered_source_bytes = 0, candidate_repack_logical_bytes = 0;
+    uint64_t covered_candidates = 0, omitted_candidates = 0, omitted_repack_logical_bytes = 0;
+    uint64_t owning_allocations = 0, owned_logical_bytes = 0, owned_charged_bytes = 0, aliases = 0;
+};
+[[nodiscard]] uint64_t q8_tile64_repack_bytes(uint64_t columns, uint64_t rows);
+[[nodiscard]] Q8Tile64CacheStats summarize_q8_tile64_cache(bool enabled,
+    std::span<const Q8Tile64CacheCandidate> candidates, std::span<const Q8Tile64CacheAllocation> entries);
+
 enum class HashOrder : uint32_t { newest_first, oldest_first };
 enum class NgramBoundary : uint32_t { literal, reset_before, reset_after };
 struct NgramPolicy { HashOrder order; NgramBoundary boundary; bool image_as_eos; };

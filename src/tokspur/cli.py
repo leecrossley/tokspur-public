@@ -46,6 +46,22 @@ def adopt(target: Path, draft: Path) -> None:
     print("Existing weights verified in place. No model files copied or downloaded.")
 
 
+def valid_api_key(path: Path) -> bool:
+    """Whether `path` holds a key the server admits: 64 hex digits and a newline."""
+    try:
+        status = path.lstat()
+        text = path.read_bytes()
+    except FileNotFoundError:
+        return False
+    return (
+        (status.st_mode & 0o170777) == 0o100600
+        and status.st_nlink == 1
+        and len(text) == 65
+        and text.endswith(b"\n")
+        and all(c in b"0123456789abcdef" for c in text[:64])
+    )
+
+
 def configure(port: int) -> None:
     if type(port) is not int or not 1024 <= port <= 65535:
         raise ValueError("Use an unprivileged local port")
@@ -62,24 +78,29 @@ def configure(port: int) -> None:
         raise ValueError("Unknown state owner")
     write_json(state / "owner.json", {"project": "tokspur", "schema": 1})
 
-    # Prepare private API key if not present (64 hex characters + newline)
+    # Keep a key only if the server would admit it (64 hex characters + newline,
+    # 0600, one link); replace anything else atomically so an interrupted write
+    # cannot leave an empty key behind.
     key_file = state / "api-key"
-    if not key_file.is_symlink() and not key_file.exists():
+    if key_file.is_symlink():
+        raise ValueError("state/api-key must not be a symlink")
+    if not valid_api_key(key_file):
+        temporary = state / f".api-key.{os.getpid()}.tmp"
         fd = os.open(
-            key_file,
+            temporary,
             os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY | os.O_CLOEXEC,
             0o600,
         )
-        with os.fdopen(fd, "w") as stream:
-            stream.write(secrets.token_hex(32) + "\n")
-            stream.flush()
-            os.fchmod(stream.fileno(), 0o600)
-            os.fsync(stream.fileno())
-
-    key_json = state / "api-key.json"
-    if not key_json.is_symlink() and not key_json.exists():
-        write_json(key_json, {"api_key": secrets.token_urlsafe(36)})
-        os.chmod(key_json, 0o600)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                stream.write(secrets.token_hex(32) + "\n")
+                stream.flush()
+                os.fchmod(stream.fileno(), 0o600)
+                os.fsync(stream.fileno())
+            os.replace(temporary, key_file)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
 
     target_dir = Path(data["target"]["directory"])
     if target_dir.is_dir():
@@ -411,14 +432,8 @@ def serve(
             [sys.executable, str(ROOT / "scripts/bootstrap.py"), "--verify-only"],
             check=True,
         )
+        # The server reads and checks state/api-key itself.
         env = isolated_environment()
-        api_key_path = state / "api-key"
-        if api_key_path.is_file():
-            env["TOKSPUR_API_KEY"] = api_key_path.read_text().strip()
-        elif (state / "api-key.json").is_file():
-            env["TOKSPUR_API_KEY"] = read_json(state / "api-key.json").get(
-                "api_key", ""
-            )
 
         server_bin = None
         for candidate in (
@@ -856,7 +871,7 @@ def main() -> None:
             "tokspur: invalid TOKSPUR_CLI_IMPL (expected rust or python)\n"
         )
         raise SystemExit(2)
-    if mode == "rust":
+    if mode == "rust" or sys.argv[1:2] == ["check-model-config"]:
         rust_bin = ROOT / "build/rust-fast-math/release/tokspur"
         if not rust_bin.is_file():
             sys.stderr.write(
@@ -869,6 +884,10 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor", help="Read-only readiness summary; never loads a model")
+    sub.add_parser(
+        "check-model-config",
+        help="Compare a local config.json with the Flash-Next text profile",
+    )
     a = sub.add_parser("adopt", help="Fully hash existing weights without copying them")
     a.add_argument("--target", type=Path, required=False, default=None)
     a.add_argument("--draft", type=Path, required=False, default=None)

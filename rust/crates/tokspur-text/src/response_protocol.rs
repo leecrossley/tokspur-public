@@ -196,6 +196,17 @@ pub fn parse_native_response<E>(
     decode: Option<&ResponseDecoder<'_, E>>,
     maximum_ids: usize,
 ) -> Result<Json, ResponseProtocolError<E>> {
+    parse_native_response_with_controls(data, admission, decode, maximum_ids, &[])
+}
+
+/// [`parse_native_response`] that feeds each ID separately and treats `control_ids` (the added tokens of [`crate::response::CONTROL_MARKERS`]) as the only frame markers, as [`ResponseParser::with_control_tokens`] describes. An empty `control_ids` is exactly [`parse_native_response`].
+pub fn parse_native_response_with_controls<E>(
+    data: &Json,
+    admission: ResponseAdmission,
+    decode: Option<&ResponseDecoder<'_, E>>,
+    maximum_ids: usize,
+    control_ids: &[u32],
+) -> Result<Json, ResponseProtocolError<E>> {
     let access = ResponseProtocolError::Access;
     require(
         admission.vocabulary != 0
@@ -286,6 +297,9 @@ pub fn parse_native_response<E>(
     )
     .map_err(ResponseProtocolError::Configure)?
     .with_token_framing();
+    if !control_ids.is_empty() {
+        parser = parser.with_control_tokens();
+    }
     if finish == b"error" {
         return Ok(native_response_error(
             "target reported an error; response is not executable",
@@ -311,10 +325,41 @@ pub fn parse_native_response<E>(
         )?;
         bytes.truncate(bytes.len() - marker.len());
     }
-    require(
-        parser.feed(&bytes) != ResponseStatus::Error,
-        "invalid response bytes or frames",
-    )?;
+    if control_ids.is_empty() {
+        require(
+            parser.feed(&bytes) != ResponseStatus::Error,
+            "invalid response bytes or frames",
+        )?;
+    } else {
+        // Control markers are known only per ID, so decode and feed each body ID; together they must be exactly the bytes admitted above.
+        let body = if stopped {
+            &ids[..ids.len() - 1]
+        } else {
+            &ids[..]
+        };
+        let mut pieces = Vec::with_capacity(body.len());
+        let mut joined = Vec::with_capacity(bytes.len());
+        for &id in body {
+            let piece = decode(&[id]).map_err(ResponseProtocolError::Decode)?;
+            joined.extend_from_slice(&piece);
+            pieces.push((id, piece));
+        }
+        require(
+            joined == bytes,
+            "response decoder/terminal identity mismatch",
+        )?;
+        for (id, piece) in &pieces {
+            let status = if control_ids.contains(id) {
+                parser.feed_control(piece)
+            } else {
+                parser.feed(piece)
+            };
+            require(
+                status != ResponseStatus::Error,
+                "invalid response bytes or frames",
+            )?;
+        }
+    }
     if stopped {
         require(
             parser.finish() == ResponseStatus::Complete,

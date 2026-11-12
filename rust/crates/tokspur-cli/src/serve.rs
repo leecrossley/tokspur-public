@@ -1267,30 +1267,8 @@ pub fn serve_foreground(layout: &RuntimeLayout, opts: &ServeOptions) -> Result<i
     // Verify source/build/package provenance and exact launch targets before touching weights.
     let targets = verify_build(layout)?;
 
-    let mut env = isolated_environment(&tokspur_base)?;
-    let api_key_file = state.join("api-key");
-    let api_key_json = state.join("api-key.json");
-    if api_key_file.is_file() {
-        let key = fs::read_to_string(&api_key_file)
-            .map_err(|source| CliError::Io {
-                context: "cannot read state/api-key".to_owned(),
-                source,
-            })?
-            .trim()
-            .to_owned();
-        env.insert("TOKSPUR_API_KEY".to_owned(), key);
-    } else if api_key_json.is_file() {
-        let key_doc = read_json_file(&api_key_json)?;
-        if let Some(raw_key) = key_doc
-            .find("api_key")
-            .ok()
-            .flatten()
-            .and_then(|v| v.string().ok())
-            .and_then(|b| std::str::from_utf8(b).ok())
-        {
-            env.insert("TOKSPUR_API_KEY".to_owned(), raw_key.to_owned());
-        }
-    }
+    // The server reads and checks state/api-key itself, so the key never enters its environment.
+    let env = isolated_environment(&tokspur_base)?;
 
     let target_obj = adoption
         .find("target")

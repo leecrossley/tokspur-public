@@ -60,6 +60,22 @@ bool verify_fused_gdn_gates_supported(const MetalGraph& g, const GdnWeights& wei
         g.prefill_weight_layout(weights.alpha.view) == PrefillWeightLayout::gguf &&
         g.prefill_weight_layout(weights.beta.view) == PrefillWeightLayout::gguf;
 }
+
+bool verify_fused_expert_gate_supported(const MetalGraph& g, const MoeWeights& weights, MoeShape shape) {
+    return g.verify_hc_gdn_fused_enabled() &&
+        shape.channels >= 32 && shape.channels <= 65536 && shape.channels % 32 == 0 &&
+        shape.experts >= 65 && shape.experts <= 4096 &&
+        weights.router.encoding == 0 &&
+        g.prefill_weight_layout(weights.router.view) == PrefillWeightLayout::gguf &&
+        g.gemv_dispatches(0, shape.channels, shape.experts) == 1;
+}
+
+bool verify_fused_shared_logit_supported(const MetalGraph& g, const MoeWeights& weights, MoeShape shape) {
+    return g.verify_hc_gdn_fused_enabled() &&
+        shape.channels >= 32 && shape.channels <= 65536 && shape.channels % 32 == 0 &&
+        weights.shared_router.encoding == 0 &&
+        g.prefill_weight_layout(weights.shared_router.view) == PrefillWeightLayout::gguf;
+}
 } // namespace
 
 bool verify_nax_dense_q8_supported(const MetalGraph& g, GpuMatrix matrix, uint32_t columns, uint32_t rows) {
@@ -175,6 +191,14 @@ uint64_t verify_nax_residual_after_rms_dispatches(const MetalGraph& g, const Res
 void encode_verify_nax_residual_after_rms(MetalGraph& g, const ResidualWeights& weights, const ResidualScratch& scratch,
     ResidualShape shape, uint32_t steps) {
     const uint32_t width = shape.branches * shape.channels;
+    const bool fused_inject = verify_fused_hc_inject_supported(g, weights, shape);
+    if (fused_inject) {
+        g.verify_fused_hc_inject_scales_rows(weights.inject.view,
+            g.slice(scratch.normalized, 0, uint64_t(steps) * width * 4),
+            g.slice(scratch.inject_logits, 0, uint64_t(steps) * shape.branches * 4),
+            g.slice(scratch.scales, 0, uint64_t(steps) * shape.branches * 4),
+            shape.branches, shape.channels, steps);
+    }
     if (verify_nax_dense_q8_supported(g, weights.down, width, shape.rank)) {
         g.verify_nax_dense_q8(weights.down.view, tight(g, scratch.normalized, steps, width),
             tight(g, scratch.bottleneck, steps, shape.rank), false, 1.0f / float(shape.branches));
@@ -187,14 +211,12 @@ void encode_verify_nax_residual_after_rms(MetalGraph& g, const ResidualWeights& 
         g.activate(active_bn, active_bn, Activation::silu, 1.0f / shape.branches);
     }
     encode_verify_nax_projection(g, weights.up, scratch.bottleneck, scratch.scores, shape.rank, width, steps);
-    if (verify_fused_hc_inject_supported(g, weights, shape)) {
-        const auto norm_rows = g.slice(scratch.normalized, 0, uint64_t(steps) * width * 4);
-        const auto score_rows = g.slice(scratch.scores, 0, uint64_t(steps) * width * 4);
-        const auto inject_rows = g.slice(scratch.inject_logits, 0, uint64_t(steps) * shape.branches * 4);
-        const auto scale_rows = g.slice(scratch.scales, 0, uint64_t(steps) * shape.branches * 4);
-        const auto out_rows = g.slice(scratch.input, 0, uint64_t(steps) * shape.channels * 4);
-        g.verify_fused_hc_inject_read_rows(weights.inject.view, norm_rows, score_rows, inject_rows,
-            out_rows, scale_rows, shape.branches, shape.channels, steps);
+    if (fused_inject) {
+        g.verify_fused_hc_read_rows(
+            g.slice(scratch.normalized, 0, uint64_t(steps) * width * 4),
+            g.slice(scratch.scores, 0, uint64_t(steps) * width * 4),
+            g.slice(scratch.input, 0, uint64_t(steps) * shape.channels * 4),
+            shape.branches, shape.channels, steps);
         TOKSPUR_OPERATOR_CHECKPOINT(g, "hc", "verify_nax_read", {steps, width, shape.rank, shape.branches});
         return;
     }
@@ -248,6 +270,12 @@ void encode_verify_nax_residual_read(MetalGraph& g, const ResidualWeights& weigh
     encode_verify_nax_residual_after_rms(g, weights, scratch, shape, steps);
 }
 
+void encode_verify_nax_residual_read_prenorm(MetalGraph& g, const ResidualWeights& weights, const ResidualScratch& scratch,
+    ResidualShape shape, uint32_t steps) {
+    need(g.verify_nax_active() && steps >= 2 && steps <= 8, "verify NAX residual read requires active 2..8-row verify scope");
+    encode_verify_nax_residual_after_rms(g, weights, scratch, shape, steps);
+}
+
 uint64_t verify_nax_residual_write_dispatches(const MetalGraph& g, ResidualShape shape, uint32_t steps) {
     return (verify_fused_hc_shape_supported(g, shape) || verify_nax_hc_rows_supported(g, shape)) ? 1ull : uint64_t(steps);
 }
@@ -282,14 +310,56 @@ void encode_verify_nax_residual_write(MetalGraph& g, GpuView streams, GpuView va
     TOKSPUR_OPERATOR_CHECKPOINT(g, "hc", "verify_nax_write", {steps, width, shape.channels, shape.branches});
 }
 
-bool verify_nax_hc_write_rms_supported(const MetalGraph& g, const ResidualWeights& next_read, ResidualShape shape) {
+bool verify_nax_hc_write_rms_gains_supported(const MetalGraph& g, GpuView gains, ResidualShape shape) {
     const uint64_t width_bytes = uint64_t(shape.branches) * shape.channels * 4;
     const uint64_t chan_bytes = uint64_t(shape.channels) * 4;
     if (verify_fused_hc_shape_supported(g, shape) &&
-        (next_read.gains.bytes == chan_bytes || next_read.gains.bytes == width_bytes)) {
+        (gains.bytes == chan_bytes || gains.bytes == width_bytes)) {
         return true;
     }
-    return verify_nax_hc_rows_supported(g, shape) && next_read.gains.bytes == width_bytes;
+    return verify_nax_hc_rows_supported(g, shape) && gains.bytes == width_bytes;
+}
+
+bool verify_nax_hc_write_rms_supported(const MetalGraph& g, const ResidualWeights& next_read, ResidualShape shape) {
+    return verify_nax_hc_write_rms_gains_supported(g, next_read.gains, shape);
+}
+
+void encode_verify_nax_residual_write_rms(MetalGraph& g, GpuView streams, GpuView values, GpuView scales, GpuView next_gains,
+    GpuView destination, GpuView next_normalized, ResidualShape shape, uint32_t steps, float next_epsilon) {
+    need(g.verify_nax_active() && steps >= 2 && steps <= 8 &&
+        verify_nax_hc_write_rms_gains_supported(g, next_gains, shape),
+        "verify NAX residual write+RMS requires active 2..8-row verify scope and supported gains");
+    const uint32_t width = shape.branches * shape.channels;
+    const uint64_t width_bytes = uint64_t(width) * 4;
+    const uint64_t chan_bytes = uint64_t(shape.channels) * 4;
+    if (verify_fused_hc_shape_supported(g, shape) &&
+        (next_gains.bytes == chan_bytes || next_gains.bytes == width_bytes)) {
+        g.verify_fused_hc_write_rms_rows(
+            g.slice(streams, 0, uint64_t(steps) * width * 4),
+            g.slice(values, 0, uint64_t(steps) * shape.channels * 4),
+            g.slice(scales, 0, uint64_t(steps) * shape.branches * 4),
+            next_gains,
+            g.slice(destination, 0, uint64_t(steps) * width * 4),
+            g.slice(next_normalized, 0, uint64_t(steps) * width * 4),
+            shape.branches, shape.channels, steps, next_epsilon, next_gains.bytes == chan_bytes);
+        TOKSPUR_OPERATOR_CHECKPOINT(g, "hc", "verify_nax_write", {steps, width, shape.channels, shape.branches});
+        return;
+    }
+#ifdef TOKSPUR_PRIVATE_HC_ROWS
+    if (verify_nax_hc_rows_supported(g, shape) && next_gains.bytes == width_bytes) {
+        g.hc_write_rms_rows(
+            g.slice(streams, 0, uint64_t(steps) * width * 4),
+            g.slice(values, 0, uint64_t(steps) * shape.channels * 4),
+            g.slice(scales, 0, uint64_t(steps) * shape.branches * 4),
+            next_gains,
+            g.slice(destination, 0, uint64_t(steps) * width * 4),
+            g.slice(next_normalized, 0, uint64_t(steps) * width * 4),
+            steps, next_epsilon);
+        TOKSPUR_OPERATOR_CHECKPOINT(g, "hc", "verify_nax_write", {steps, width, shape.channels, shape.branches});
+        return;
+    }
+#endif
+    throw FormatError("verify NAX residual write+RMS unsupported");
 }
 
 uint64_t verify_nax_residual_write_read_dispatches(const MetalGraph& g, const ResidualWeights& next_read, ResidualShape shape, uint32_t steps) {
@@ -339,8 +409,11 @@ void encode_verify_nax_residual_write_read(MetalGraph& g, const ResidualWeights&
 
 uint64_t verify_nax_moe_dispatches(const MetalGraph& g, const MoeWeights& weights, MoeShape shape, uint32_t steps) {
     const bool router_win = verify_nax_router_window_supported(g, weights, shape);
+    const uint64_t router_proj = verify_fused_expert_gate_supported(g, weights, shape)
+        ? 1ull
+        : uint64_t(steps) * g.gemv_dispatches(weights.router.encoding, shape.channels, shape.experts);
     const uint64_t router_part = router_win ? 2ull
-        : uint64_t(steps) * (g.gemv_dispatches(weights.router.encoding, shape.channels, shape.experts) + 1ull);
+        : router_proj + (verify_nax_batch_top10_supported(shape, steps) ? 1ull : uint64_t(steps));
     const uint64_t routed_part = verify_nax_grouped_moe_supported(weights, shape, steps) ? 3ull : uint64_t(steps) * 5ull;
     const bool fuse_shared = verify_nax_dense_q8_supported(g, weights.shared_gate, shape.channels, shape.hidden) &&
         verify_nax_dense_q8_supported(g, weights.shared_up, shape.channels, shape.hidden);
@@ -352,8 +425,11 @@ uint64_t verify_nax_moe_dispatches(const MetalGraph& g, const MoeWeights& weight
            verify_nax_projection_dispatches(g, weights.shared_up, shape.channels, shape.hidden, steps) +
            2ull +
            verify_nax_projection_dispatches(g, weights.shared_down, shape.hidden, shape.channels, steps));
+    const uint64_t shared_logit_proj = verify_fused_shared_logit_supported(g, weights, shape)
+        ? 1ull
+        : uint64_t(steps) * g.gemv_dispatches(weights.shared_router.encoding, shape.channels, 1);
     const uint64_t mix_part = router_win ? 2ull
-        : uint64_t(steps) * (g.gemv_dispatches(weights.shared_router.encoding, shape.channels, 1) + 1ull);
+        : shared_logit_proj + (verify_nax_batch_mixture_supported(shape, steps) ? 1ull : uint64_t(steps));
     return router_part + routed_part + shared_part + mix_part;
 }
 
@@ -373,12 +449,23 @@ void encode_verify_nax_moe(MetalGraph& g, const MoeWeights& weights, const MoeSc
     } else
 #endif
     {
-        for (uint32_t t = 0; t < steps; ++t) {
-            const auto log_t = row(g, scratch.logits, shape.experts, t);
-            g.gemv(weights.router.encoding, weights.router.view, row(g, input, shape.channels, t), log_t, shape.channels, shape.experts);
-            g.route(log_t, row(g, scratch.indices, shape.selected, t), row(g, scratch.weights, shape.selected, t),
+        // Rows are independent: every projection, then every top-k, so a concurrent batch needs one barrier here instead of one per row.
+        if (verify_fused_expert_gate_supported(g, weights, shape)) {
+            g.verify_fused_expert_gate_f32(weights.router.view, tight(g, input, steps, shape.channels), tight(g, scratch.logits, steps, shape.experts));
+        } else {
+            g.gemv_rows(weights.router.encoding, weights.router.view, tight(g, input, steps, shape.channels), tight(g, scratch.logits, steps, shape.experts));
+        }
+        const bool batched = verify_nax_batch_top10_supported(shape, steps);
+        if (batched) {
+            g.prefill_route_batch(g.slice(scratch.logits, 0, uint64_t(steps) * shape.experts * 4),
+                g.slice(scratch.indices, 0, uint64_t(steps) * shape.selected * 4),
+                g.slice(scratch.weights, 0, uint64_t(steps) * shape.selected * 4),
+                shape.experts, shape.selected, steps, mode, normalise);
+        } else for (uint32_t t = 0; t < steps; ++t) {
+            g.route(row(g, scratch.logits, shape.experts, t), row(g, scratch.indices, shape.selected, t), row(g, scratch.weights, shape.selected, t),
                 shape.selected, mode, normalise);
         }
+        g.record_verify_nax_moe_ops(steps, true, batched);
     }
     TOKSPUR_OPERATOR_CHECKPOINT(g, "moe", "verify_nax_router_topk", {steps, shape.channels, shape.experts, shape.selected});
 #ifdef TOKSPUR_PRIVATE_ROUTE_LOCK
@@ -468,12 +555,22 @@ void encode_verify_nax_moe(MetalGraph& g, const MoeWeights& weights, const MoeSc
     }
 #endif
     const uint64_t route_out = uint64_t(shape.channels) * shape.selected;
-    for (uint32_t t = 0; t < steps; ++t) {
-        const auto sl_t = row(g, scratch.shared_logit, 1, t);
-        g.gemv(weights.shared_router.encoding, weights.shared_router.view, row(g, input, shape.channels, t), sl_t, shape.channels, 1);
-        g.mixture(row(g, scratch.down, route_out, t), row(g, scratch.weights, shape.selected, t),
-            row(g, scratch.shared_down, shape.channels, t), sl_t, row(g, output, shape.channels, t));
+    if (verify_fused_shared_logit_supported(g, weights, shape)) {
+        g.verify_fused_shared_logit_f32(weights.shared_router.view, tight(g, input, steps, shape.channels), tight(g, scratch.shared_logit, steps, 1));
+    } else {
+        g.gemv_rows(weights.shared_router.encoding, weights.shared_router.view, tight(g, input, steps, shape.channels), tight(g, scratch.shared_logit, steps, 1));
     }
+    const bool batched = verify_nax_batch_mixture_supported(shape, steps);
+    if (batched) {
+        g.prefill_mixture_batch(g.slice(scratch.down, 0, uint64_t(steps) * route_out * 4),
+            g.slice(scratch.weights, 0, uint64_t(steps) * shape.selected * 4),
+            g.slice(scratch.shared_down, 0, uint64_t(steps) * shape.channels * 4),
+            g.slice(scratch.shared_logit, 0, uint64_t(steps) * 4), tight(g, output, steps, shape.channels), shape.selected);
+    } else for (uint32_t t = 0; t < steps; ++t) {
+        g.mixture(row(g, scratch.down, route_out, t), row(g, scratch.weights, shape.selected, t),
+            row(g, scratch.shared_down, shape.channels, t), row(g, scratch.shared_logit, 1, t), row(g, output, shape.channels, t));
+    }
+    g.record_verify_nax_moe_ops(steps, false, batched);
     TOKSPUR_OPERATOR_CHECKPOINT(g, "moe", "verify_nax_shared_router_mixture", {steps, shape.channels, shape.selected, 0});
 }
 
@@ -485,7 +582,9 @@ uint64_t verify_nax_gdn_core_dispatches(const MetalGraph& g, const GdnWeights& w
     const uint64_t gates_f32 = ((g.verify_nax_m8() && verify_nax_gdn_gates_supported(weights, shape)) ||
         verify_fused_gdn_gates_supported(g, weights, shape)) ? 1ull : 2ull;
     const uint64_t conv = 1ull;
-    const uint64_t core = ported ? 4ull : (gdn_core_batch_elementwise ? (4ull + 2ull * steps) : (1ull + 5ull * steps));
+    const bool batch_rows = verify_gdn_row_batch && steps >= 2 && steps <= 8;
+    const uint64_t core = ported ? 4ull : (gdn_core_batch_elementwise ?
+        (batch_rows ? 4ull : (4ull + 2ull * steps)) : (1ull + 5ull * steps));
     const uint64_t proj_out = verify_nax_projection_dispatches(g, weights.output, value, shape.channels, steps);
     return proj_in + gates_f32 + conv + core + proj_out;
 }
@@ -652,26 +751,28 @@ bool verify_nax_final_supported(const MetalGraph& g, const MixerWeights& mixer, 
 }
 
 uint64_t verify_nax_final_dispatches(const MetalGraph& g, const MixerWeights& mixer, GpuMatrix output,
-    const ResidualScratch& scratch, ResidualShape shape, uint32_t vocabulary, uint32_t steps) {
+    const ResidualScratch& scratch, ResidualShape shape, uint32_t vocabulary, uint32_t steps, bool input_prenormalized) {
     need(verify_nax_final_supported(g, mixer, output, scratch, shape, vocabulary), "verify NAX final head unsupported");
     const uint32_t width = shape.branches * shape.channels;
     const uint64_t down_and_act = (verify_nax_dense_q8_supported(g, mixer.down, width, shape.rank) ||
         verify_fused_hc_q8_supported(g, mixer.down, width, shape.rank))
         ? 1ull
         : (verify_nax_projection_dispatches(g, mixer.down, width, shape.rank, steps) + 1ull);
-    return 1ull + down_and_act +
+    return (input_prenormalized ? 0ull : 1ull) + down_and_act +
         verify_nax_projection_dispatches(g, mixer.up, shape.rank, width, steps) +
         1ull + 1ull;
 }
 
 void encode_verify_nax_final_logits(MetalGraph& g, const MixerWeights& mixer, GpuMatrix output,
     const ResidualScratch& scratch, GpuView streams, GpuView mixed, GpuView logits,
-    ResidualShape shape, uint32_t vocabulary, uint32_t steps, float epsilon) {
+    ResidualShape shape, uint32_t vocabulary, uint32_t steps, float epsilon, bool input_prenormalized) {
     need(g.verify_nax_active() && steps >= 2 && steps <= 8 &&
         verify_nax_final_supported(g, mixer, output, scratch, shape, vocabulary),
         "verify NAX final head requires active 2..8-row verify scope and supported geometry");
     const uint32_t width = shape.branches * shape.channels;
-    g.rms_rows(tight(g, streams, steps, width), mixer.gains, tight(g, scratch.normalized, steps, width), shape.channels, epsilon, mixer.gains.bytes == uint64_t(shape.channels) * 4);
+    if (!input_prenormalized) {
+        g.rms_rows(tight(g, streams, steps, width), mixer.gains, tight(g, scratch.normalized, steps, width), shape.channels, epsilon, mixer.gains.bytes == uint64_t(shape.channels) * 4);
+    }
     if (verify_nax_dense_q8_supported(g, mixer.down, width, shape.rank)) {
         g.verify_nax_dense_q8(mixer.down.view, tight(g, scratch.normalized, steps, width),
             tight(g, scratch.bottleneck, steps, shape.rank), false, 1.0f / float(shape.branches));

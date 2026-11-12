@@ -630,6 +630,15 @@ impl ByteBpe {
         Ok(replace_invalid_utf8(&self.decode_bytes(ids, skip_special)?))
     }
 
+    /// The ID of the added token whose content is exactly `content`, if there is one.
+    pub fn added_token(&self, content: &[u8]) -> Option<u32> {
+        let mut node = 0usize;
+        for c in content {
+            node = usize::try_from(*self.markers.get(node)?.next.get(c)?).ok()?;
+        }
+        self.markers.get(node)?.id
+    }
+
     pub fn vocabulary_size(&self) -> usize {
         self.vocabulary.len()
     }

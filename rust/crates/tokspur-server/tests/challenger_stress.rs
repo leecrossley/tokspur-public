@@ -158,6 +158,7 @@ fn decode_ids(ids: &[u32]) -> Vec<u8> {
 
 fn make_codec(custom_prompt_len: usize) -> ServeCodec {
     ServeCodec {
+        control_ids: Vec::new(),
         render: Box::new(|_| {
             Ok(RenderedChat {
                 prompt: b"test prompt".to_vec(),

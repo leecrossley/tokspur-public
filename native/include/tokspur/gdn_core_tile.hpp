@@ -13,6 +13,14 @@ inline constexpr bool gdn_core_batch_elementwise =
 constexpr uint64_t gdn_core_elementwise_saved_dispatches(uint32_t steps) {
     return gdn_core_batch_elementwise && steps ? uint64_t(steps - 1) * 3 : 0;
 }
+// Row batching retains the scalar-row preparation/gate arithmetic. Only the
+// NAX verifier selects this experiment; decode, prefill and replay stay scalar.
+inline constexpr bool verify_gdn_row_batch =
+#if defined(TOKSPUR_PRIVATE_VERIFY_GDN_ROW_BATCH)
+    true;
+#else
+    false;
+#endif
 // Ordered attention-core tile; residual/FFN composition lives in recurrent_tile.
 // Thirteen capacity-sized, token-major scratch views; key128/kernel4, Q8
 // QKV/gate/output and F32 alpha/beta. Projection input widths are multiples32.

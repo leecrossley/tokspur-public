@@ -3,17 +3,12 @@
 #include "tokspur/planar_pack_v3.hpp"
 
 #include <chrono>
-#include <cerrno>
-#include <cstdio>
-#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
-#include <sys/stat.h>
 #include <sys/statvfs.h>
-#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -34,42 +29,6 @@ uint64_t statvfs_avail(const std::filesystem::path& dir) {
     struct statvfs vfs{};
     require(::statvfs(dir.c_str(), &vfs) == 0, "statvfs failed on " + dir.string());
     return static_cast<uint64_t>(vfs.f_bavail) * static_cast<uint64_t>(vfs.f_frsize);
-}
-
-void publish_immutable_seal(const std::filesystem::path& seal_path, const std::string& sha256_hex) {
-    require(sha256_hex.size() == 64, "invalid manifest_sha256 length");
-    const auto dir = seal_path.parent_path();
-    const int dir_fd = ::open(dir.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY);
-    require(dir_fd >= 0, "cannot open derived directory for seal");
-    struct Guard {
-        int fd;
-        ~Guard() { if (fd >= 0) ::close(fd); }
-    } dir_guard{dir_fd};
-
-    const std::string tmp_name = ".tokspur-pack-v3-seal-" + std::to_string(::getpid()) + ".tmp";
-    ::unlinkat(dir_fd, tmp_name.c_str(), 0);
-    const int tmp_fd = ::openat(dir_fd, tmp_name.c_str(), O_CREAT | O_EXCL | O_NOFOLLOW | O_WRONLY | O_CLOEXEC, 0600);
-    require(tmp_fd >= 0, "cannot create temporary seal file");
-    bool published = false;
-    struct TmpGuard {
-        int dir_fd;
-        int fd;
-        std::string name;
-        bool* published;
-        ~TmpGuard() {
-            if (fd >= 0) ::close(fd);
-            if (!*published) ::unlinkat(dir_fd, name.c_str(), 0);
-        }
-    } tmp_guard{dir_fd, tmp_fd, tmp_name, &published};
-
-    const std::string payload = sha256_hex + "\n";
-    const ssize_t wrote = ::write(tmp_fd, payload.data(), payload.size());
-    require(wrote == static_cast<ssize_t>(payload.size()), "short write on seal temporary");
-    require(::fchmod(tmp_fd, 0444) == 0 && ::fsync(tmp_fd) == 0, "seal chmod/fsync failed");
-    require(::renameatx_np(dir_fd, tmp_name.c_str(), dir_fd, seal_path.filename().c_str(), RENAME_EXCL) == 0,
-            "exclusive seal renameatx_np failed");
-    published = true;
-    require(::fsync(dir_fd) == 0, "directory fsync after seal failed");
 }
 
 } // namespace
@@ -114,31 +73,28 @@ int main(int argc, char** argv) {
         auto source = std::make_shared<tokspur::ModelFiles>(target_shards);
         auto mtp = std::make_shared<tokspur::ModelFiles>(std::vector<std::filesystem::path>{draft_path});
 
+        auto planned = tokspur::planar_v3::plan_derived_pack_v3(*source, mtp.get());
+        tokspur::planar_v3::require_full_pack_v3_census(planned);
         const auto budget = tokspur::planar_v3::measure_pack_v3_budget(
-            *source, mtp.get(), output_path.parent_path(), pack_v2_path, experts_per_chunk);
+            planned, output_path.parent_path(), pack_v2_path, experts_per_chunk,
+            tokspur::derived_pack::default_reserve_bytes, chunk_bytes);
         std::cout << "[pack-v3] preflight avail_bytes=" << budget.filesystem_available_bytes
                   << " planned_file_bytes=" << budget.planned_pack_v3_file_bytes
                   << " free_after_bytes=" << budget.free_after_pack_v3_bytes
                   << " ring_buffer_bytes=" << budget.streaming_ring_buffer_bytes
                   << " reserve_ok=" << (budget.reserve_satisfied ? "true" : "false")
                   << " ram_ok=" << (budget.ram_ceiling_satisfied ? "true" : "false") << std::endl;
-        require(budget.reserve_satisfied, "50 GiB reserve check failed before pack v3 build");
         require(budget.ram_ceiling_satisfied, "streaming RAM ceiling check failed before pack v3 build");
 
         const auto t0 = std::chrono::steady_clock::now();
-        const auto plan = tokspur::planar_v3::build_derived_pack_v3(
-            source, mtp, output_path, experts_per_chunk,
+        const auto publication = tokspur::planar_v3::build_or_verify_pack_v3(
+            std::move(planned), source, mtp, output_path, experts_per_chunk,
             tokspur::derived_pack::default_reserve_bytes, chunk_bytes);
         const auto t1 = std::chrono::steady_clock::now();
-        const double build_s = std::chrono::duration<double>(t1 - t0).count();
-
-        tokspur::ModelFiles built_pack({output_path});
-        const std::string manifest_sha256 = tokspur::derived_pack::hash(
-            built_pack.shards()[0].string_value("tokspur_pack.manifest"));
-
-        const std::filesystem::path seal_path = output_path.parent_path() / (output_path.stem().string() + ".seal");
-        publish_immutable_seal(seal_path, manifest_sha256);
-
+        const double publish_s = std::chrono::duration<double>(t1 - t0).count();
+        const auto& plan = publication.verified.plan;
+        const auto& manifest_sha256 = publication.verified.manifest_sha256;
+        const auto seal_path = output_path.parent_path() / (output_path.stem().string() + ".seal");
         const auto t2 = std::chrono::steady_clock::now();
         const auto adopted_local = tokspur::planar_v3::adopt_derived_pack_v3(
             source, mtp, output_path, experts_per_chunk, chunk_bytes, 16,
@@ -170,7 +126,9 @@ int main(int argc, char** argv) {
             {"free_before_bytes", tokspur::Json::integer(budget.filesystem_available_bytes)},
             {"free_after_bytes", tokspur::Json::integer(free_after)},
             {"required_reserve_bytes", tokspur::Json::integer(budget.required_reserve_bytes)},
-            {"build_seconds", tokspur::Json::number(build_s)},
+            {"build_seconds", tokspur::Json::number(publication.build_seconds)},
+            {"status", tokspur::Json(publication.existed ? "verified-existing" : "built")},
+            {"build_or_verify_and_seal_seconds", tokspur::Json::number(publish_s)},
             {"local_seal_adopt_seconds", tokspur::Json::number(local_seal_s)},
         });
         {
@@ -180,7 +138,8 @@ int main(int argc, char** argv) {
         }
         std::cout << "[pack-v3] DONE file_bytes=" << plan.file_bytes
                   << " manifest_sha256=" << manifest_sha256
-                  << " build_s=" << build_s
+                  << " build_s=" << publication.build_seconds
+                  << " build_or_verify_and_seal_s=" << publish_s
                   << " local_seal_adopt_s=" << local_seal_s
                   << " free_after_bytes=" << free_after << std::endl;
         return 0;

@@ -817,10 +817,12 @@ impl Connection {
             }
         }
         event.push(b'\n');
-        let prefix = format!("{:x}\r\n", event.len());
-        self.write_all(prefix.as_bytes(), deadline)?;
-        self.write_all(&event, deadline)?;
-        self.write_all(b"\r\n", deadline)
+        // One write_all call per HTTP chunk; partial writes and retries remain inside write_all.
+        let mut frame = format!("{:x}\r\n", event.len()).into_bytes();
+        frame.reserve(event.len() + 2);
+        frame.extend_from_slice(&event);
+        frame.extend_from_slice(b"\r\n");
+        self.write_all(&frame, deadline)
     }
 
     /// Terminal HTTP zero chunk (not `[DONE]`).
@@ -926,12 +928,13 @@ impl Listener {
                     ));
                 }
             };
+            // A local client can bind any of the host's addresses before connecting to 127.0.0.1, so a non-loopback peer is refused by dropping its descriptor alone; it must not stop the listener.
             if peer.length != Ipv4Address::SOCKADDR_IN_BYTES
                 || peer.family != Ipv4Address::FAMILY_INET
                 || (peer.address >> 24) != 127
             {
                 drop(accepted);
-                return Err(HttpError::new(0, "Refused non-loopback HTTP peer", false));
+                continue;
             }
             match Connection::new(accepted, limits) {
                 Ok(connection) => return Ok(connection),

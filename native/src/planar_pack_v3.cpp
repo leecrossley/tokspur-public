@@ -13,6 +13,7 @@
 #include <atomic>
 #include <bit>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <exception>
@@ -20,6 +21,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <thread>
@@ -264,6 +266,81 @@ std::span<const std::byte> lookup_tensor_bytes(const ModelFiles& source, const M
     if (mtp_sidecar && mtp_sidecar->tensors().contains(name)) return mtp_sidecar->tensor_bytes(name);
     throw FormatError("tensor missing from source and MTP sidecar: " + std::string(name));
 }
+
+// Keep the original model mapping alive for CPU embeddings and identity checks.
+// The opt-in path mirrors v2 authentication: read only the original tensor
+// through an identity-checked nocache descriptor, then advise its clean pages
+// away after comparison/hash. The adopted pack is never an eviction source.
+class AuthenticationSource {
+public:
+    AuthenticationSource(const ModelFiles& source, const ModelFiles* mtp_sidecar,
+                         std::string_view name, bool present, uint64_t chunk_bytes)
+#if defined(TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM) && TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM
+        : name_(name), chunk_bytes_(chunk_bytes)
+#endif
+    {
+#if !defined(TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM) || !TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM
+        static_cast<void>(chunk_bytes);
+#endif
+        if (!present) return; // A trailing MTP tensor may exist only in the pack.
+        mapped_ = lookup_tensor_bytes(source, mtp_sidecar, name);
+#if defined(TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM) && TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM
+        owner_ = source.tensors().contains(name) ? &source : mtp_sidecar;
+        require(owner_ != nullptr && derived_pack::is_gpu_pack_tensor(name),
+                "missing GPU tensor authentication source");
+        backing_ = owner_->tensor_backing_file(name);
+        require(backing_ && backing_->bytes == mapped_.size(), "missing original tensor backing file");
+        reader_.emplace(::open(backing_->path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+        struct stat info{};
+        require(::fstat(reader_->value, &info) == 0 && S_ISREG(info.st_mode) && info.st_size > 0 &&
+                uint64_t(info.st_dev) == backing_->device && uint64_t(info.st_ino) == backing_->inode &&
+                checked_add(backing_->offset, backing_->bytes) <= uint64_t(info.st_size),
+                "original tensor backing file changed");
+        require(::fcntl(reader_->value, F_NOCACHE, 1) == 0,
+                "cannot disable original authentication read cache");
+#endif
+    }
+
+    std::span<const std::byte> read(uint64_t offset, size_t bytes) {
+        require(offset <= mapped_.size() && bytes <= mapped_.size() - offset,
+                "original authentication read exceeds tensor");
+#if defined(TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM) && TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM
+        require(reader_.has_value(), "missing original authentication reader");
+        if (offset < buffered_offset_ || offset - buffered_offset_ > buffer_.size() ||
+            bytes > buffer_.size() - (offset - buffered_offset_)) {
+            // Coalesce consecutive expert reads instead of issuing one syscall
+            // per small expert. A large expert uses its existing proof span as
+            // the bound; ordinary tensors use the configured streaming chunk.
+            const auto count = std::min(std::max(chunk_bytes_, uint64_t(bytes)), uint64_t(mapped_.size()) - offset);
+            buffer_.resize(static_cast<size_t>(count));
+            read_into(reader_->value, buffer_, checked_add(backing_->offset, offset));
+            buffered_offset_ = offset;
+        }
+        return std::span<const std::byte>(buffer_).subspan(static_cast<size_t>(offset - buffered_offset_), bytes);
+#else
+        return mapped_.subspan(static_cast<size_t>(offset), bytes);
+#endif
+    }
+
+    void evict(uint64_t offset = 0, uint64_t bytes = 0) const noexcept {
+#if defined(TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM) && TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM
+        if (owner_) owner_->evict_tensor_pages(name_, offset, bytes);
+#else
+        static_cast<void>(offset); static_cast<void>(bytes);
+#endif
+    }
+
+private:
+    std::span<const std::byte> mapped_;
+#if defined(TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM) && TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM
+    std::string_view name_;
+    uint64_t chunk_bytes_ = 0, buffered_offset_ = 0;
+    const ModelFiles* owner_ = nullptr;
+    std::optional<TensorBackingFile> backing_;
+    std::optional<Fd> reader_;
+    Bytes buffer_;
+#endif
+};
 
 bool coloc_eligible(const Tensor& gate, const Tensor& up) {
     if (gate.dimensions.size() != 3 || gate.dimensions != up.dimensions || gate.type != up.type) return false;
@@ -860,8 +937,18 @@ BudgetReportV3 measure_pack_v3_budget(
     uint32_t experts_per_chunk,
     uint64_t reserve_bytes
 ) {
+    return measure_pack_v3_budget(plan_derived_pack_v3(source, mtp_sidecar), output_directory,
+                                  existing_pack_v2_path, experts_per_chunk, reserve_bytes,
+                                  derived_pack::default_chunk_bytes);
+}
+
+BudgetReportV3 measure_pack_v3_budget(
+    const PackPlanV3& plan, const std::filesystem::path& output_directory,
+    const std::filesystem::path& existing_pack_v2_path, uint32_t experts_per_chunk,
+    uint64_t reserve_bytes, uint64_t chunk_bytes
+) {
     require(experts_per_chunk >= 1 && experts_per_chunk <= 64, "experts_per_chunk must be in 1..64");
-    const auto plan = plan_derived_pack_v3(source, mtp_sidecar);
+    require(chunk_bytes >= 32'768 && chunk_bytes <= 67'108'864, "invalid chunk_bytes bound");
     Fd dir_fd = open_dir_traverse(output_directory);
     const uint64_t avail = query_dir_avail_bytes(dir_fd.value);
 
@@ -882,7 +969,7 @@ BudgetReportV3 measure_pack_v3_budget(
     r.original_12b_scale_header_bytes = plan.original_12b_scale_header_bytes;
     r.expanded_16b_scale_header_bytes = plan.expanded_16b_scale_header_bytes;
 
-    uint64_t max_expert_pair_bytes = derived_pack::default_chunk_bytes * 2;
+    uint64_t max_expert_pair_bytes = chunk_bytes * 2;
     for (const auto& t : plan.tensors) {
         if (t.kind == PlanarKind::q4k_coloc_gate_v3 || t.kind == PlanarKind::q4k_coloc_up_v3) {
             r.q4k_planar_bytes = checked_add(r.q4k_planar_bytes, t.bytes);
@@ -919,7 +1006,8 @@ PackPlanV3 build_pack_v3_from_plan(
     const std::filesystem::path& output,
     uint32_t experts_per_chunk,
     uint64_t reserve_bytes,
-    uint64_t chunk_bytes
+    uint64_t chunk_bytes,
+    void (*check_cancelled)()
 ) {
     require(bool(source), "missing source model files for pack v3");
     require(experts_per_chunk >= 1 && experts_per_chunk <= 64, "experts_per_chunk must be in 1..64");
@@ -989,6 +1077,7 @@ PackPlanV3 build_pack_v3_from_plan(
                 const uint32_t e_begin = half * half_experts;
                 const uint32_t e_end = e_begin + half_experts;
                 for (uint32_t e = e_begin; e < e_end;) {
+                    if (check_cancelled) check_cancelled();
                     const uint32_t count = std::min(step_cap, e_end - e);
                     const size_t chunk_len = static_cast<size_t>(count * pair_bytes);
                     for (uint32_t k = 0; k < count; ++k) {
@@ -1056,6 +1145,7 @@ PackPlanV3 build_pack_v3_from_plan(
             Bytes restored_exp(static_cast<size_t>(spec.source_expert_bytes));
 
             for (uint32_t e = 0; e < experts;) {
+                if (check_cancelled) check_cancelled();
                 const uint32_t count = std::min(step_cap, experts - e);
                 const size_t chunk_len = static_cast<size_t>(count * spec.planar_expert_bytes);
                 for (uint32_t k = 0; k < count; ++k) {
@@ -1092,6 +1182,7 @@ PackPlanV3 build_pack_v3_from_plan(
             Bytes packed_buf(static_cast<size_t>(step));
             Bytes restored_buf(static_cast<size_t>(step));
             for (uint64_t at = 0; at < t.bytes;) {
+                if (check_cancelled) check_cancelled();
                 const size_t n = static_cast<size_t>(std::min(step, t.bytes - at));
                 const auto in_span = orig.subspan(static_cast<size_t>(at), n);
                 auto out_span = std::span(packed_buf).first(n);
@@ -1109,6 +1200,7 @@ PackPlanV3 build_pack_v3_from_plan(
         } else {
             Bytes restored_buf(static_cast<size_t>(chunk_bytes));
             for (uint64_t at = 0; at < t.bytes;) {
+                if (check_cancelled) check_cancelled();
                 const size_t n = static_cast<size_t>(std::min(chunk_bytes, t.bytes - at));
                 const auto in_span = orig.subspan(static_cast<size_t>(at), n);
                 auto rb_span = std::span(restored_buf).first(n);
@@ -1134,6 +1226,7 @@ PackPlanV3 build_pack_v3_from_plan(
 
     source->assert_unchanged();
     if (mtp_sidecar) mtp_sidecar->assert_unchanged();
+    if (check_cancelled) check_cancelled();
     check_absent(location);
     require(::renameatx_np(location.directory.value, temporary.name.c_str(),
                            location.directory.value, location.name.c_str(), RENAME_EXCL) == 0,
@@ -1181,7 +1274,8 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
     uint64_t chunk_bytes,
     uint32_t authentication_workers,
     derived_pack::TrustMode trust_mode,
-    bool require_full_census
+    bool require_full_census,
+    void (*check_cancelled)()
 ) {
     require(bool(source), "missing source model files");
     require(authentication_workers >= 1 && authentication_workers <= derived_pack::max_authentication_workers,
@@ -1283,11 +1377,7 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
             read_at(fd.value, canonical_header.size(), 0) == canonical_header,
             "noncanonical or corrupt pack v3 header");
 
-    if (require_full_census) {
-        require(plan.tensors.size() == derived_pack::expected_gpu_tensors &&
-                plan.payload_bytes == expected_pack_v3_payload_bytes,
-                "pack v3 full census verification failed");
-    }
+    if (require_full_census) require_full_pack_v3_census(plan);
 
     bool seal_valid = false;
     if (trust_mode == derived_pack::TrustMode::local_seal && require_full_census) {
@@ -1334,7 +1424,9 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
         }
     };
 
+    std::atomic<bool> source_read{false};
     const auto verify_unit = [&](size_t unit_idx) {
+        if (check_cancelled) check_cancelled();
         const size_t i = units[unit_idx];
         const auto& t = plan.tensors[i];
         const auto& packed_meta = model->tensor(t.name);
@@ -1354,20 +1446,23 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
                     "pack v3 co-located up tensor metadata mismatch");
 
             const bool pack_only_trailing_mtp = !mtp_sidecar && t.name.starts_with("blk.48.") && t_up.name.starts_with("blk.48.");
-            std::span<const std::byte> gate_orig;
-            std::span<const std::byte> up_orig;
-            if (!pack_only_trailing_mtp) {
-                gate_orig = lookup_tensor_bytes(*source, mtp_sidecar.get(), t.name);
-                up_orig = lookup_tensor_bytes(*source, mtp_sidecar.get(), t_up.name);
-            }
+            AuthenticationSource gate_orig(*source, mtp_sidecar.get(), t.name, !pack_only_trailing_mtp, chunk_bytes);
+            AuthenticationSource up_orig(*source, mtp_sidecar.get(), t_up.name, !pack_only_trailing_mtp, chunk_bytes);
             const auto lo_packed = model->tensor_bytes(t.name);
             const auto hi_packed = model->tensor_bytes(t_up.name);
 
+            // Manifest geometry is untrusted until it accounts for every packed byte, so check it before any expert is read.
+            require(t.source_dimensions.size() == 3 && t.source_dimensions[2] != 0 &&
+                    t.source_dimensions[0] <= UINT32_MAX && t.source_dimensions[1] <= UINT32_MAX && t.source_dimensions[2] <= UINT32_MAX,
+                    "pack v3 source dimensions mismatch");
             const auto spec = make_expert_spec(t.source_type,
                 static_cast<uint32_t>(t.source_dimensions[0]),
                 static_cast<uint32_t>(t.source_dimensions[1]));
             const uint32_t experts = static_cast<uint32_t>(t.source_dimensions[2]);
             const uint32_t half_experts = experts / 2;
+            require(checked_mul(uint64_t{2} * half_experts, spec.planar_expert_bytes) == lo_packed.size() &&
+                    checked_mul(uint64_t{2} * (experts - half_experts), spec.planar_expert_bytes) == hi_packed.size(),
+                    "pack v3 source dimensions mismatch");
 
             Sha256 gate_src_h, up_src_h, lo_pack_h, hi_pack_h;
             Bytes restored_gate(static_cast<size_t>(spec.source_expert_bytes));
@@ -1387,14 +1482,16 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
                 unpack_expert_planar_v3(spec, g_pk, restored_gate);
                 unpack_expert_planar_v3(spec, u_pk, restored_up);
                 if (!pack_only_trailing_mtp) {
-                    const auto g_in = gate_orig.subspan(static_cast<size_t>(e * spec.source_expert_bytes),
+                    const auto g_in = gate_orig.read(static_cast<size_t>(e * spec.source_expert_bytes),
                                                         static_cast<size_t>(spec.source_expert_bytes));
-                    const auto u_in = up_orig.subspan(static_cast<size_t>(e * spec.source_expert_bytes),
+                    const auto u_in = up_orig.read(static_cast<size_t>(e * spec.source_expert_bytes),
                                                       static_cast<size_t>(spec.source_expert_bytes));
                     require(std::ranges::equal(g_in, restored_gate) && std::ranges::equal(u_in, restored_up),
                             "pack v3 adoption co-located gate/up inverse byte proof failed");
                     gate_src_h.add(g_in);
                     up_src_h.add(u_in);
+                    gate_orig.evict(uint64_t(e) * spec.source_expert_bytes, spec.source_expert_bytes);
+                    up_orig.evict(uint64_t(e) * spec.source_expert_bytes, spec.source_expert_bytes);
                 }
                 if (e < half_experts) {
                     lo_pack_h.add(g_pk);
@@ -1409,24 +1506,31 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
                     lo_pack_h.finish() == t.packed_sha256 &&
                     hi_pack_h.finish() == t_up.packed_sha256,
                     "stale source or corrupt co-located tensor digest in pack v3");
+            gate_orig.evict();
+            up_orig.evict();
             check_padding_after(i);
             check_padding_after(i + 1);
+            if (!pack_only_trailing_mtp) source_read.store(true, std::memory_order_relaxed);
             return;
         }
 
         const bool pack_only_trailing_mtp = !mtp_sidecar && t.name.starts_with("blk.48.");
-        std::span<const std::byte> orig;
-        if (!pack_only_trailing_mtp) {
-            orig = lookup_tensor_bytes(*source, mtp_sidecar.get(), t.name);
-        }
+        AuthenticationSource orig(*source, mtp_sidecar.get(), t.name, !pack_only_trailing_mtp, chunk_bytes);
         const auto packed_bytes = model->tensor_bytes(t.name);
         Sha256 src_h, pack_h;
 
         if (t.kind == PlanarKind::q51_planar_v3 || t.kind == PlanarKind::q8_planar_v3) {
+            // Manifest geometry is untrusted until it accounts for every packed and source byte, so check it before any expert is read.
+            require(t.source_dimensions.size() == 3 && t.source_dimensions[2] != 0 &&
+                    t.source_dimensions[0] <= UINT32_MAX && t.source_dimensions[1] <= UINT32_MAX && t.source_dimensions[2] <= UINT32_MAX,
+                    "pack v3 source dimensions mismatch");
             const auto spec = make_expert_spec(t.source_type,
                 static_cast<uint32_t>(t.source_dimensions[0]),
                 static_cast<uint32_t>(t.source_dimensions[1]));
             const uint32_t experts = static_cast<uint32_t>(t.source_dimensions[2]);
+            require(checked_mul(uint64_t{experts}, spec.planar_expert_bytes) == packed_bytes.size() &&
+                    checked_mul(uint64_t{experts}, spec.source_expert_bytes) == t.source_bytes,
+                    "pack v3 source dimensions mismatch");
             Bytes restored(static_cast<size_t>(spec.source_expert_bytes));
             for (uint32_t e = 0; e < experts; ++e) {
                 source->assert_unchanged();
@@ -1436,16 +1540,18 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
                                                          static_cast<size_t>(spec.planar_expert_bytes));
                 unpack_expert_planar_v3(spec, exp_pk, restored);
                 if (!pack_only_trailing_mtp) {
-                    const auto exp_in = orig.subspan(static_cast<size_t>(e * spec.source_expert_bytes),
+                    const auto exp_in = orig.read(static_cast<size_t>(e * spec.source_expert_bytes),
                                                      static_cast<size_t>(spec.source_expert_bytes));
                     require(std::ranges::equal(exp_in, restored), "pack v3 adoption down inverse byte proof failed");
                     src_h.add(exp_in);
+                    orig.evict(uint64_t(e) * spec.source_expert_bytes, spec.source_expert_bytes);
                 }
                 pack_h.add(exp_pk);
             }
         } else if (t.kind == PlanarKind::q8_lanes_v1) {
             const auto layout = lanes::row_layout(t.source_type, static_cast<uint32_t>(t.source_dimensions[0]));
             const uint64_t step = (chunk_bytes / layout.row_bytes) * layout.row_bytes;
+            require(step > 0, "chunk_bytes smaller than single Q8 lane row");
             Bytes restored(static_cast<size_t>(step));
             for (uint64_t at = 0; at < t.bytes;) {
                 source->assert_unchanged();
@@ -1456,9 +1562,10 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
                 auto inv_chunk = std::span(restored).first(n);
                 lanes::unpack_rows(layout, pk_chunk, inv_chunk);
                 if (!pack_only_trailing_mtp) {
-                    const auto in_chunk = orig.subspan(static_cast<size_t>(at), n);
+                    const auto in_chunk = orig.read(static_cast<size_t>(at), n);
                     require(std::ranges::equal(in_chunk, inv_chunk), "pack v3 adoption q8_lanes_v1 inverse proof failed");
                     src_h.add(in_chunk);
+                    orig.evict(at, n);
                 }
                 pack_h.add(pk_chunk);
                 at += n;
@@ -1471,9 +1578,10 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
                 const size_t n = static_cast<size_t>(std::min(chunk_bytes, t.bytes - at));
                 const auto pk_chunk = packed_bytes.subspan(static_cast<size_t>(at), n);
                 if (!pack_only_trailing_mtp) {
-                    const auto in_chunk = orig.subspan(static_cast<size_t>(at), n);
+                    const auto in_chunk = orig.read(static_cast<size_t>(at), n);
                     require(std::ranges::equal(in_chunk, pk_chunk), "pack v3 adoption plain tensor byte proof failed");
                     src_h.add(in_chunk);
+                    orig.evict(at, n);
                 }
                 pack_h.add(pk_chunk);
                 at += n;
@@ -1482,7 +1590,9 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
 
         require((pack_only_trailing_mtp || src_h.finish() == t.source_sha256) && pack_h.finish() == t.packed_sha256,
                 "stale source or corrupt tensor digest in pack v3");
+        orig.evict();
         check_padding_after(i);
+        if (!pack_only_trailing_mtp) source_read.store(true, std::memory_order_relaxed);
     };
 
     uint32_t effective_workers = 1;
@@ -1523,7 +1633,107 @@ AdoptedPackV3 adopt_pack_v3_with_plan(
             "pack v3 file identity changed during adoption");
 
     const std::string manifest_sha256 = derived_pack::hash(file.string_value("tokspur_pack.manifest"));
-    return {std::move(model), std::move(plan), manifest_sha256, effective_workers};
+    const std::string_view source_read_mode = !source_read.load(std::memory_order_relaxed) ? "not_read" :
+#if defined(TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM) && TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM
+        "bounded_nocache";
+#else
+        "mapped";
+#endif
+    return {std::move(model), std::move(plan), manifest_sha256, effective_workers, source_read_mode};
+}
+
+void validate_pack_v3_output_name(const std::filesystem::path& output) {
+    std::string name = output.filename().string();
+    for (char& c : name) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    if (!name.ends_with(".gguf") || name == ".gguf" ||
+        name == "tokspur-pack-v2.asa.gguf" || name == "tokspur-pack-v2.gguf") {
+        throw FormatError("expected a .gguf output distinct from the reserved v2 pack paths");
+    }
+}
+
+void require_full_pack_v3_census(const PackPlanV3& plan) {
+    require(plan.recipe == pack_recipe_v3 && plan.tensors.size() == derived_pack::expected_gpu_tensors &&
+            plan.payload_bytes == expected_pack_v3_payload_bytes,
+            "pack v3 full census verification failed");
+}
+
+namespace {
+
+bool entry_exists(int directory, const std::string& name) {
+    struct stat st{};
+    if (::fstatat(directory, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0) return true;
+    require(errno == ENOENT, "cannot inspect pack v3 output");
+    return false;
+}
+
+void verify_seal(int directory, const std::string& name, const std::string& digest) {
+    Fd seal(::openat(directory, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+    struct stat st{};
+    require(::fstat(seal.value, &st) == 0 && S_ISREG(st.st_mode) && !(st.st_mode & 0222) &&
+            st.st_nlink == 1 && (st.st_size == 64 || st.st_size == 65), "invalid pack v3 seal");
+    std::string content(static_cast<size_t>(st.st_size), '\0');
+    read_into(seal.value, std::as_writable_bytes(std::span(content)), 0);
+    require(content == digest || content == digest + "\n", "existing pack v3 seal does not match");
+}
+
+void verify_published_name(const Location& location, const AdoptedPackV3& verified) {
+    verified.model->assert_unchanged();
+    const auto* mapping = verified.model->shards().front().backing_mapping();
+    struct stat st{};
+    require(mapping && ::fstatat(location.directory.value, location.name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+            static_cast<uint64_t>(st.st_dev) == mapping->device() &&
+            static_cast<uint64_t>(st.st_ino) == mapping->inode() && S_ISREG(st.st_mode) &&
+            !(st.st_mode & 0222) && st.st_nlink == 1, "authenticated pack v3 path changed");
+}
+
+} // namespace
+
+PublishedPackV3 build_or_verify_pack_v3(
+    PackPlanV3 plan, std::shared_ptr<const ModelFiles> source, std::shared_ptr<const ModelFiles> mtp_sidecar,
+    const std::filesystem::path& output, uint32_t experts_per_chunk, uint64_t reserve_bytes,
+    uint64_t chunk_bytes, void (*check_cancelled)()
+) {
+    validate_pack_v3_output_name(output);
+    require(source && mtp_sidecar, "verified pack v3 publication requires target and MTP sources");
+    const bool full_recipe = plan.recipe == pack_recipe_v3;
+    if (full_recipe) require_full_pack_v3_census(plan);
+    else require(plan.recipe.starts_with(block_recipe_prefix_v3), "invalid pack v3 recipe");
+
+    Location location(output);
+    const auto dir = location.directory.value;
+    require(::flock(dir, LOCK_EX | LOCK_NB) == 0, "pack v3 output directory is busy");
+    const auto seal_name = output.stem().string() + ".seal";
+    const bool existed = entry_exists(dir, location.name);
+    const bool seal_exists = entry_exists(dir, seal_name);
+    require(existed || !seal_exists, "orphan pack v3 seal exists without its pack");
+    double build_seconds = 0;
+    if (!existed) {
+        const auto start = std::chrono::steady_clock::now();
+        plan = build_pack_v3_from_plan(std::move(plan), source, mtp_sidecar, output, experts_per_chunk,
+                                       reserve_bytes, chunk_bytes, check_cancelled);
+        build_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    }
+
+    // An interrupted build may already have published the immutable pack. Both paths
+    // prove its complete payload against the sources before trusting or creating a seal.
+    auto verified = adopt_pack_v3_with_plan(std::move(plan), source, mtp_sidecar, output, experts_per_chunk,
+                                            chunk_bytes, 1, derived_pack::TrustMode::full, full_recipe,
+                                            check_cancelled);
+    verify_published_name(location, verified);
+    if (check_cancelled) check_cancelled();
+    if (!seal_exists) {
+        TemporaryFile temporary(dir);
+        const auto content = verified.manifest_sha256 + "\n";
+        write_at(temporary.fd, std::as_bytes(std::span(content)), 0);
+        require(::fchmod(temporary.fd, 0444) == 0 && ::fsync(temporary.fd) == 0, "pack v3 seal chmod/fsync failed");
+        require(::renameatx_np(dir, temporary.name.c_str(), dir, seal_name.c_str(), RENAME_EXCL) == 0,
+                "exclusive pack v3 seal publication refused");
+        temporary.published = true;
+    }
+    verify_seal(dir, seal_name, verified.manifest_sha256);
+    verify_published_name(location, verified);
+    require(::fsync(dir) == 0, "directory fsync after pack v3 seal failed");
+    return {std::move(verified), existed, build_seconds};
 }
 
 AdoptedPackV3 adopt_derived_pack_v3(

@@ -8,7 +8,9 @@
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <numeric>
+#include <type_traits>
 #include <utility>
 #if defined(TOKSPUR_PRIVATE_M5_CPU_CANDIDATES) && defined(__aarch64__)
 #include <arm_neon.h>
@@ -232,6 +234,46 @@ struct BuiltDistribution {
 }
 #endif
 
+// A finite logit's IEEE bits order like its value once the sign is folded in, so
+// an ascending unsigned key is a descending canonical logit. Negative zero takes
+// the key of zero, as it does in the ranking comparator.
+uint32_t descending_key(float value) noexcept {
+    const uint32_t bits = std::bit_cast<uint32_t>(value == 0.0f ? 0.0f : value);
+    return (bits & 0x80000000u) ? bits : bits ^ 0x7fffffffu;
+}
+
+float canonical_logit(uint32_t key) noexcept {
+    return std::bit_cast<float>((key & 0x80000000u) ? key : key ^ 0x7fffffffu);
+}
+
+// Every token as (key << 32 | id), in the ranking comparator's order: descending
+// canonical logit, then ascending token ID. That order is total, so any correct
+// sort yields it; the stable radix passes start from ascending IDs and
+// therefore keep the lowest-ID-first tie break. Callers validate the logits.
+std::unique_ptr<uint64_t[]> rank_all(std::span<const float> logits) {
+    const size_t count = logits.size();
+    auto ranked = std::make_unique_for_overwrite<uint64_t[]>(count);
+    auto scratch = std::make_unique_for_overwrite<uint64_t[]>(count);
+    constexpr std::array<uint32_t, 3> shifts{0, 11, 22};
+    std::array<std::array<uint32_t, 2048>, 3> offsets{};
+    for (size_t id = 0; id < count; ++id) {
+        const uint32_t key = descending_key(logits[id]);
+        ranked[id] = uint64_t(key) << 32 | id;
+        for (size_t pass = 0; pass < shifts.size(); ++pass) ++offsets[pass][(key >> shifts[pass]) & 2047u];
+    }
+    for (size_t pass = 0; pass < shifts.size(); ++pass) {
+        auto& bucket = offsets[pass];
+        const uint32_t shift = 32 + shifts[pass];
+        // A digit every key shares leaves the order unchanged.
+        if (bucket[(ranked[0] >> shift) & 2047u] == count) continue;
+        uint32_t next = 0;
+        for (auto& entry : bucket) next += std::exchange(entry, next);
+        for (size_t i = 0; i < count; ++i) scratch[bucket[(ranked[i] >> shift) & 2047u]++] = ranked[i];
+        ranked.swap(scratch);
+    }
+    return ranked;
+}
+
 template <typename T>
 BuiltDistribution build(std::span<const T> logits, const SamplingPolicy& policy, SamplingRowScan* scan = nullptr) {
     validate_policy(policy);
@@ -266,6 +308,48 @@ BuiltDistribution build(std::span<const T> logits, const SamplingPolicy& policy,
         return la > lb || (la == lb && a < b);
     };
     const size_t retained = policy.top_k ? std::min(size_t(policy.top_k), logits.size()) : logits.size();
+    if constexpr (std::is_same_v<T, float>) {
+        if (retained > 64) {
+            // An absent or wide top-k ranks the whole vocabulary, which is what a request without top_k asks for on every row. Rank it by radix and keep the weights beside the order; each weight, sum and quotient is the one the comparison sort below would produce, taken in the same order.
+            const auto ranked = rank_all(logits);
+            const double best = double(canonical_logit(uint32_t(ranked[0] >> 32)));
+            const auto weights = std::make_unique_for_overwrite<double[]>(retained);
+            Sum sum;
+            size_t positive = 0;
+            for (; positive < retained; ++positive) {
+                const double weight = relative_weight(double(canonical_logit(uint32_t(ranked[positive] >> 32))), best, policy.temperature);
+                if (weight == 0 || weight < policy.min_p) break;
+                weights[positive] = weight;
+                sum.add(weight);
+            }
+            if (positive == 0 || !std::isfinite(sum.value()) || sum.value() <= 0)
+                throw FormatError("sampling normalization is not representable");
+            if (policy.top_p < 1) {
+                const double threshold = policy.top_p * sum.value();
+                Sum cumulative;
+                size_t prefix = positive;
+                for (size_t i = 0; i < positive; ++i) {
+                    cumulative.add(weights[i]);
+                    if (cumulative.value() >= threshold) { prefix = i + 1; break; }
+                }
+                positive = prefix;
+                sum = Sum();
+                for (size_t i = 0; i < positive; ++i) sum.add(weights[i]);
+            }
+            const double denominator = sum.value();
+            out.support.reserve(positive);
+            out.support_probabilities.reserve(positive);
+            for (size_t i = 0; i < positive; ++i) {
+                const double probability = weights[i] / denominator;
+                if (!(probability > 0)) continue;
+                const uint32_t id = uint32_t(ranked[i]);
+                out.probabilities[id] = probability;
+                out.support.push_back(id);
+                out.support_probabilities.push_back(probability);
+            }
+            return out;
+        }
+    }
 #ifdef TOKSPUR_PRIVATE_BOUNDED_TOPK
     if (policy.top_k && policy.top_k <= 64) {
         // The same heap selection as partial_sort, without materialising a vocabulary-sized index vector. Validation and all mass arithmetic remain unchanged. The worst retained token is the heap root.
@@ -287,9 +371,10 @@ BuiltDistribution build(std::span<const T> logits, const SamplingPolicy& policy,
         out.support.resize(logits.size());
         std::iota(out.support.begin(), out.support.end(), 0);
         // The comparator totally orders distinct token IDs. When every token is
-        // retained, introsort gives the identical order without a full heap sort.
-        // Leave mass accumulation and normalization in that original order.
-        if (prepared_sampling() && retained == out.support.size())
+        // retained (no top_k, the OpenAI default), introsort gives the identical
+        // order without a full heap sort, so every mode takes it. Leave mass
+        // accumulation and normalization in that original order.
+        if (retained == out.support.size())
             std::sort(out.support.begin(), out.support.end(), rank);
         else
             std::partial_sort(out.support.begin(), out.support.begin() + ptrdiff_t(retained), out.support.end(), rank);

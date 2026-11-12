@@ -42,9 +42,10 @@ kernel void graph_gdn_convolution_tile(device const float* history [[buffer(0)]]
     next_history[channel] = h0; next_history[s.x + channel] = h1; next_history[2 * s.x + channel] = h2;
 }
 
-// Fixed key width 128; one thread per (head,value column), with coalesced value
-// lanes exactly as graph_delta. Private-array register residency is an INTENT,
-// not a hardware guarantee: compiler spills/occupancy need separate evidence.
+#if defined(TOKSPUR_PRIVATE_GDN_COOPERATIVE4) && TOKSPUR_PRIVATE_GDN_COOPERATIVE4
+// Four lanes own 32 keys apiece for
+// one value column. Broadcast operands, then retain the ascending scalar
+// accumulation and original expressions in every participating lane.
 kernel void graph_gdn_delta_tile(device const float* accepted [[buffer(0)]],
                                 device const float* query [[buffer(1)]],
                                 device const float* key [[buffer(2)]],
@@ -56,37 +57,148 @@ kernel void graph_gdn_delta_tile(device const float* accepted [[buffer(0)]],
                                 device float* output [[buffer(8)]],
                                 constant uint4& s [[buffer(9)]],
                                 constant uint& steps [[buffer(10)]],
-                                uint i [[thread_position_in_grid]]) {
-    // s={heads,value_width,capacity,128}; steps may be a strict prefix for replay.
-    if (!s.x || s.x > 48 || !s.y || s.y > 128 || s.w != 128 || !gdn_tile_count(s.z, steps)) {
+                                uint i [[thread_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]],
+                                uint simd_width [[threads_per_simdgroup]]) {
+    if (!s.x || s.x > 48 || !s.y || s.y > 128 || s.w != 128 ||
+        !gdn_tile_count(s.z, steps) || simd_width != 32) {
         if (!i) atomic_fetch_or_explicit(error, 2u, memory_order_relaxed); return;
     }
-    if (i >= s.x * s.y) return;
-    const uint head = i / s.y, column = i % s.y, base = head * 128 * s.y + column;
-    float state[128];
-    for (uint k = 0; k < 128; ++k) {
-        state[k] = accepted[base + k * s.y];
-        if (!isfinite(state[k])) { atomic_fetch_or_explicit(error, 1u, memory_order_relaxed); return; }
+    const uint columns_per_head = (s.y + 7) / 8;
+    const uint simd_index = i / 32;
+    const uint head = simd_index / columns_per_head;
+    if (head >= s.x) return; // Uniform for the complete SIMD group.
+    const uint column_lane = lane % 8, segment = lane / 8;
+    const uint column = (simd_index % columns_per_head) * 8 + column_lane;
+    const bool active = column < s.y;
+    const uint base = head * 128 * s.y + column;
+    const uint value_index = head * s.y + column;
+    float state[32]; bool invalid = false;
+    #pragma clang loop unroll(full)
+    for (uint j = 0; j < 32; ++j) {
+        state[j] = active ? accepted[base + (segment * 32 + j) * s.y] : 0.0f;
+        invalid = invalid || !isfinite(state[j]);
+    }
+    if (simd_any(invalid)) {
+        if (invalid) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+        return;
     }
     for (uint step = 0; step < steps; ++step) {
-        const uint gate = step * s.x + head, qbase = (step * s.x + head) * 128;
+        const uint gate = step * s.x + head, qbase = gate * 128;
         const float a = decay[gate], b = beta[gate];
         if (!isfinite(a) || !isfinite(b) || a < 0 || a > 1 || b < 0 || b > 1) {
             atomic_fetch_or_explicit(error, 2u, memory_order_relaxed); return;
         }
         float predicted = 0;
-        for (uint k = 0; k < 128; ++k) predicted += (a * state[k]) * key[qbase + k];
+        for (uint part = 0; part < 4; ++part) {
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < 32; ++j) {
+                const float prior = simd_shuffle(state[j], column_lane + part * 8);
+                predicted += (a * prior) * key[qbase + part * 32 + j];
+            }
+        }
+        const float delta = (active ? value[ulong(step) * s.x * s.y + value_index] : 0.0f) - predicted;
+        invalid = false;
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < 32; ++j) {
+            const uint k = segment * 32 + j;
+            const float updated = a * state[j] + b * key[qbase + k] * delta;
+            state[j] = updated; invalid = invalid || !isfinite(updated);
+        }
+        if (simd_any(invalid)) {
+            if (invalid) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+            return;
+        }
+        float result = 0;
+        for (uint part = 0; part < 4; ++part) {
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < 32; ++j) {
+                const float updated = simd_shuffle(state[j], column_lane + part * 8);
+                result += updated * query[qbase + part * 32 + j];
+            }
+        }
+        if (simd_any(!isfinite(result))) {
+            if (!isfinite(result)) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+            return;
+        }
+        if (active && segment == 0) output[ulong(step) * s.x * s.y + value_index] = result;
+    }
+    if (active) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < 32; ++j) candidate[base + (segment * 32 + j) * s.y] = state[j];
+    }
+}
+#else
+// Fixed key width 128; one thread per (head,value column), with coalesced value
+// lanes as graph_delta. Partition the 128-key state across 68 unrolled scalar
+// registers and 60 conflict-free threadgroup SRAM slots to avoid stack spills
+// while preserving the exact chronological 0..127 accumulation and update order.
+kernel void graph_gdn_delta_tile(device const float* accepted [[buffer(0)]],
+                                device const float* query [[buffer(1)]],
+                                device const float* key [[buffer(2)]],
+                                device const float* value [[buffer(3)]],
+                                device const float* decay [[buffer(4)]],
+                                device const float* beta [[buffer(5)]],
+                                device float* candidate [[buffer(6)]],
+                                device atomic_uint* error [[buffer(7)]],
+                                device float* output [[buffer(8)]],
+                                constant uint4& s [[buffer(9)]],
+                                constant uint& steps [[buffer(10)]],
+                                uint i [[thread_position_in_grid]],
+                                ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float state_hi[60][128];
+    // s={heads,value_width,capacity,128}; steps may be a strict prefix for replay.
+    if (!s.x || s.x > 48 || !s.y || s.y > 128 || s.w != 128 || !gdn_tile_count(s.z, steps) || tid >= 128u) {
+        if (!i) atomic_fetch_or_explicit(error, 2u, memory_order_relaxed); return;
+    }
+    if (i >= s.x * s.y) return;
+    const uint head = i / s.y, column = i % s.y, base = head * 128 * s.y + column;
+    float state_lo[68];
+    bool invalid = false;
+    #pragma clang loop unroll(full)
+    for (uint k = 0; k < 68; ++k) {
+        const float v = accepted[base + k * s.y];
+        state_lo[k] = v;
+        invalid = invalid || !isfinite(v);
+    }
+    #pragma clang loop unroll_count(4)
+    for (uint k = 0; k < 60; ++k) {
+        const float v = accepted[base + (68u + k) * s.y];
+        state_hi[k][tid] = v;
+        invalid = invalid || !isfinite(v);
+    }
+    if (invalid) { atomic_fetch_or_explicit(error, 1u, memory_order_relaxed); return; }
+    for (uint step = 0; step < steps; ++step) {
+        const uint gate = step * s.x + head, qbase = gate * 128;
+        const float a = decay[gate], b = beta[gate];
+        if (!isfinite(a) || !isfinite(b) || a < 0 || a > 1 || b < 0 || b > 1) {
+            atomic_fetch_or_explicit(error, 2u, memory_order_relaxed); return;
+        }
+        float predicted = 0;
+        #pragma clang loop unroll(full)
+        for (uint k = 0; k < 68; ++k) predicted += (a * state_lo[k]) * key[qbase + k];
+        #pragma clang loop unroll_count(4)
+        for (uint k = 0; k < 60; ++k) predicted += (a * state_hi[k][tid]) * key[qbase + 68u + k];
         const float delta = value[ulong(step) * s.x * s.y + i] - predicted;
         float result = 0;
-        for (uint k = 0; k < 128; ++k) {
-            // Keep the old expression and order. Pre-decaying state, FMA
-            // substitutions or a parallel key reduction are different tiers.
-            const float updated = a * state[k] + b * key[qbase + k] * delta;
-            state[k] = updated; result += updated * query[qbase + k];
-            if (!isfinite(updated)) { atomic_fetch_or_explicit(error, 1u, memory_order_relaxed); return; }
+        #pragma clang loop unroll(full)
+        for (uint k = 0; k < 68; ++k) {
+            const float updated = a * state_lo[k] + b * key[qbase + k] * delta;
+            state_lo[k] = updated;
+            result += updated * query[qbase + k];
+        }
+        #pragma clang loop unroll_count(4)
+        for (uint k = 0; k < 60; ++k) {
+            const float updated = a * state_hi[k][tid] + b * key[qbase + 68u + k] * delta;
+            state_hi[k][tid] = updated;
+            result += updated * query[qbase + 68u + k];
         }
         if (!isfinite(result)) { atomic_fetch_or_explicit(error, 1u, memory_order_relaxed); return; }
         output[ulong(step) * s.x * s.y + i] = result;
     }
-    for (uint k = 0; k < 128; ++k) candidate[base + k * s.y] = state[k];
+    #pragma clang loop unroll(full)
+    for (uint k = 0; k < 68; ++k) candidate[base + k * s.y] = state_lo[k];
+    #pragma clang loop unroll_count(4)
+    for (uint k = 0; k < 60; ++k) candidate[base + (68u + k) * s.y] = state_hi[k][tid];
 }
+#endif

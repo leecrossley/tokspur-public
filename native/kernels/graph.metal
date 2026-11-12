@@ -75,6 +75,148 @@ kernel void graph_gdn_gates(device const float* alpha [[buffer(0)]],
     checked_store(beta, h, sigmoid_value(beta_logits[h]), error);
 }
 
+// First-party row scheduling of the existing preparation and gate operations.
+// Each SIMD group keeps the scalar-row reduction order; recurrence is separate.
+kernel void graph_gdn_prepare_verify_rows(device const float* input [[buffer(0)]],
+                              device float* query [[buffer(1)]],
+                              device float* key [[buffer(2)]],
+                              device float* value [[buffer(3)]],
+                              constant uint4& s [[buffer(4)]],
+                              constant float2& p [[buffer(5)]],
+                              constant uint& mode [[buffer(6)]],
+                              device atomic_uint* error [[buffer(7)]],
+                              uint3 group [[threadgroup_position_in_grid]],
+                              ushort subgroup [[simdgroup_index_in_threadgroup]],
+                              ushort lane [[thread_index_in_simdgroup]]) {
+    const uint head = group.x * 4 + subgroup;
+    const uint row = group.y;
+    input += row * (2 * s.x * s.z + s.y * s.w);
+    query += row * s.y * s.z; key += row * s.y * s.z;
+    value += row * s.y * s.w;
+    if (head >= s.y) return;
+    const uint block = s.x * s.z, base = (head % s.x) * s.z;
+    float qs = 0, ks = 0;
+    for (uint i = lane; i < s.z; i += 32) {
+        qs += input[base + i] * input[base + i];
+        ks += input[block + base + i] * input[block + base + i];
+    }
+    qs = simd_sum(qs); ks = simd_sum(ks);
+    const float qd = mode ? max(qs, p.y) : qs + p.y;
+    const float kd = mode ? max(ks, p.y) : ks + p.y;
+    if (!isfinite(qs) || !isfinite(ks) || !isfinite(qd) || !isfinite(kd)) {
+        if (lane == 0) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+        return;
+    }
+    const float qi = rsqrt(qd), ki = rsqrt(kd);
+    for (uint i = lane; i < s.z; i += 32) {
+        checked_store(query, head * s.z + i, (input[base + i] * qi) * p.x, error);
+        checked_store(key, head * s.z + i, input[block + base + i] * ki, error);
+    }
+    for (uint i = lane; i < s.w; i += 32) checked_store(value, head * s.w + i, input[2 * block + head * s.w + i], error);
+}
+
+inline float silu_checked(float raw, thread uint& bad) {
+    if (!isfinite(raw)) { bad = 1u; return NAN; }
+    return raw * sigmoid_value(raw);
+}
+
+// Exact composition of graph_activate(silu, scale=1) and graph_gdn_prepare_verify_rows.
+kernel void graph_gdn_silu_prepare_verify_rows(device const float* input [[buffer(0)]],
+                              device float* query [[buffer(1)]],
+                              device float* key [[buffer(2)]],
+                              device float* value [[buffer(3)]],
+                              constant uint4& s [[buffer(4)]],
+                              constant float2& p [[buffer(5)]],
+                              constant uint& mode [[buffer(6)]],
+                              device atomic_uint* error [[buffer(7)]],
+                              uint3 group [[threadgroup_position_in_grid]],
+                              ushort subgroup [[simdgroup_index_in_threadgroup]],
+                              ushort lane [[thread_index_in_simdgroup]]) {
+    const uint head = group.x * 4 + subgroup;
+    const uint row = group.y;
+    input += row * (2 * s.x * s.z + s.y * s.w);
+    query += row * s.y * s.z; key += row * s.y * s.z;
+    value += row * s.y * s.w;
+    if (head >= s.y) return;
+    const uint block = s.x * s.z, base = (head % s.x) * s.z;
+    uint bad = 0u;
+    if (s.z == 128u) {
+        float qv[4], kv[4];
+        float qs = 0, ks = 0;
+        #pragma clang loop unroll(full)
+        for (uint k = 0; k < 4; ++k) {
+            const uint i = uint(lane) + k * 32u;
+            const float qx = silu_checked(input[base + i], bad);
+            const float kx = silu_checked(input[block + base + i], bad);
+            qv[k] = qx;
+            kv[k] = kx;
+            qs += qx * qx;
+            ks += kx * kx;
+        }
+        qs = simd_sum(qs); ks = simd_sum(ks);
+        const float qd = mode ? max(qs, p.y) : qs + p.y;
+        const float kd = mode ? max(ks, p.y) : ks + p.y;
+        if (bad || !isfinite(qs) || !isfinite(ks) || !isfinite(qd) || !isfinite(kd)) {
+            if (bad || lane == 0) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+            return;
+        }
+        const float qi = rsqrt(qd), ki = rsqrt(kd);
+        #pragma clang loop unroll(full)
+        for (uint k = 0; k < 4; ++k) {
+            const uint i = uint(lane) + k * 32u;
+            checked_store(query, head * 128u + i, (qv[k] * qi) * p.x, error);
+            checked_store(key, head * 128u + i, kv[k] * ki, error);
+        }
+    } else {
+        float qs = 0, ks = 0;
+        for (uint i = lane; i < s.z; i += 32) {
+            const float qx = silu_checked(input[base + i], bad);
+            const float kx = silu_checked(input[block + base + i], bad);
+            qs += qx * qx;
+            ks += kx * kx;
+        }
+        qs = simd_sum(qs); ks = simd_sum(ks);
+        const float qd = mode ? max(qs, p.y) : qs + p.y;
+        const float kd = mode ? max(ks, p.y) : ks + p.y;
+        if (bad || !isfinite(qs) || !isfinite(ks) || !isfinite(qd) || !isfinite(kd)) {
+            if (bad || lane == 0) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+            return;
+        }
+        const float qi = rsqrt(qd), ki = rsqrt(kd);
+        for (uint i = lane; i < s.z; i += 32) {
+            const float qx = silu_checked(input[base + i], bad);
+            const float kx = silu_checked(input[block + base + i], bad);
+            checked_store(query, head * s.z + i, (qx * qi) * p.x, error);
+            checked_store(key, head * s.z + i, kx * ki, error);
+        }
+    }
+    for (uint i = lane; i < s.w; i += 32) {
+        const float vx = silu_checked(input[2 * block + head * s.w + i], bad);
+        checked_store(value, head * s.w + i, vx, error);
+    }
+    if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+}
+
+kernel void graph_gdn_gates_verify_rows(device const float* alpha [[buffer(0)]],
+                            device const float* beta_logits [[buffer(1)]],
+                            device const float* rates [[buffer(2)]],
+                            device const float* bias [[buffer(3)]],
+                            device float* decay [[buffer(4)]],
+                            device float* beta [[buffer(5)]],
+                            constant uint2& shape [[buffer(6)]],
+                            device atomic_uint* error [[buffer(7)]],
+                            uint i [[thread_position_in_grid]]) {
+    if (i >= shape.x * shape.y) return;
+    const uint h = i % shape.x;
+    const float x = alpha[i] + bias[h];
+    if (!isfinite(alpha[i]) || !isfinite(bias[h]) || !isfinite(x) || !isfinite(beta_logits[i]) ||
+        !isfinite(rates[h]) || rates[h] > 0) { atomic_fetch_or_explicit(error, 2u, memory_order_relaxed); return; }
+    const float exponent = rates[h] * softplus_value(x);
+    if (!isfinite(exponent)) { atomic_fetch_or_explicit(error, 1u, memory_order_relaxed); return; }
+    checked_store(decay, i, exp(exponent), error);
+    checked_store(beta, i, sigmoid_value(beta_logits[i]), error);
+}
+
 // Four independent RMS groups per threadgroup. Weights may be shared across
 // groups or supplied per channel; checkpoint +1 transforms are NOT implicit.
 kernel void graph_rms(device const float* input [[buffer(0)]],
@@ -100,6 +242,40 @@ kernel void graph_rms(device const float* input [[buffer(0)]],
     const float inverse = rsqrt(denominator);
     for (uint i = lane; i < shape.y; i += 32) {
         checked_store(output, base + i, input[base + i] * inverse * gains[(shape.z ? 0 : base) + i], error);
+    }
+}
+
+// Exact composition of graph_rms and graph_multiply(sigmoid_gate=true).
+kernel void graph_rms_sigmoid_gate(device const float* input [[buffer(0)]],
+                                   device const float* gains [[buffer(1)]],
+                                   device const float* gate [[buffer(2)]],
+                                   device float* output [[buffer(3)]],
+                                   constant uint4& shape [[buffer(4)]],
+                                   constant float& epsilon [[buffer(5)]],
+                                   device atomic_uint* error [[buffer(7)]],
+                                   uint group [[threadgroup_position_in_grid]],
+                                   ushort subgroup [[simdgroup_index_in_threadgroup]],
+                                   ushort lane [[thread_index_in_simdgroup]]) {
+    const uint block = group * 4 + subgroup;
+    if (block >= shape.x / shape.y) return;
+    const uint base = block * shape.y;
+    float squared = 0;
+    for (uint i = lane; i < shape.y; i += 32) squared += input[base + i] * input[base + i];
+    const float total = simd_sum(squared);
+    const float denominator = total / float(shape.y) + epsilon;
+    if (!isfinite(total) || !isfinite(denominator)) {
+        if (lane == 0) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+        return;
+    }
+    const float inverse = rsqrt(denominator);
+    for (uint i = lane; i < shape.y; i += 32) {
+        const float norm_val = input[base + i] * inverse * gains[(shape.z ? 0 : base) + i];
+        const float g = gate[base + i];
+        if (!isfinite(norm_val) || !isfinite(g)) {
+            atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+            continue;
+        }
+        checked_store(output, base + i, norm_val * sigmoid_value(g), error);
     }
 }
 
@@ -366,3 +542,151 @@ kernel void graph_mixture(device const float* experts [[buffer(0)]],
     }
     checked_store(output, channel, value, error);
 }
+
+#if defined(TOKSPUR_PRIVATE_PREFILL_BATCH_TOP10) && TOKSPUR_PRIVATE_PREFILL_BATCH_TOP10
+// 2D token-row extension of scalar graph_route (up to 2,048 rows, up to 512 experts).
+// One 32-lane SIMD group owns each token row in registers with zero barriers,
+// preserving exact tie-break order (value > best || (value == best && i < expert)),
+// softmax/sigmoid mode handling, sequential normalization order, and sticky error flags.
+kernel void graph_route_batch(device const float* logits [[buffer(0)]],
+                              device uint* indices [[buffer(1)]],
+                              device float* weights [[buffer(2)]],
+                              constant uint4& shape [[buffer(3)]],
+                              constant uint& tokens [[buffer(4)]],
+                              device atomic_uint* error [[buffer(7)]],
+                              uint2 group [[threadgroup_position_in_grid]],
+                              ushort lane [[thread_index_in_simdgroup]]) {
+    const uint row = group.y;
+    if (row >= tokens) return;
+    device const float* row_logits = logits + ulong(row) * ulong(shape.x);
+    device uint* row_indices = indices + ulong(row) * ulong(shape.y);
+    device float* row_weights = weights + ulong(row) * ulong(shape.y);
+    float r_cand[16];
+    uint bad_in = 0u;
+    #pragma clang loop unroll(full)
+    for (uint k = 0; k < 16; ++k) {
+        const uint i = uint(lane) + k * 32u;
+        if (i < shape.x) {
+            const float value = row_logits[i];
+            if (!isfinite(value)) bad_in = 1u;
+            r_cand[k] = isfinite(value) ? value : -INFINITY;
+        } else {
+            r_cand[k] = -INFINITY;
+        }
+    }
+    if (bad_in) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+    float chosen_logit_0 = 0.0f;
+    float chosen_lo = 0.0f;
+    float chosen_hi = 0.0f;
+    for (uint selected = 0; selected < shape.y; ++selected) {
+        float best = -INFINITY;
+        uint expert = 0xffffffffu;
+        #pragma clang loop unroll(full)
+        for (uint k = 0; k < 16; ++k) {
+            const uint i = uint(lane) + k * 32u;
+            if (i < shape.x && (r_cand[k] > best || (r_cand[k] == best && i < expert))) {
+                best = r_cand[k];
+                expert = i;
+            }
+        }
+        const float score = simd_max(best);
+        uint chosen = simd_min(best == score ? expert : 0xffffffffu);
+        if (chosen >= shape.x) {
+            if (lane == 0) atomic_fetch_or_explicit(error, 4u, memory_order_relaxed);
+            chosen = 0;
+        }
+        if (lane == 0) row_indices[selected] = chosen;
+        const float chosen_val = isfinite(score) ? score : row_logits[chosen];
+        if (selected == 0u) chosen_logit_0 = chosen_val;
+        if (selected == uint(lane)) chosen_lo = chosen_val;
+        if (selected == uint(lane) + 32u) chosen_hi = chosen_val;
+        #pragma clang loop unroll(full)
+        for (uint k = 0; k < 16; ++k) {
+            if (chosen == uint(lane) + k * 32u) r_cand[k] = -INFINITY;
+        }
+    }
+    const float act_lo = (uint(lane) < shape.y)
+        ? route_activation(chosen_lo, chosen_logit_0, shape.z, shape.w)
+        : 0.0f;
+    const float act_hi = (uint(lane) + 32u < shape.y)
+        ? route_activation(chosen_hi, chosen_logit_0, shape.z, shape.w)
+        : 0.0f;
+    float sum = shape.z ? 1.0f : 0.0f;
+    if (shape.w) {
+        sum = 0.0f;
+        const uint n_lo = min(shape.y, 32u);
+        for (uint i = 0; i < n_lo; ++i) sum += simd_broadcast(act_lo, ushort(i));
+        for (uint i = 32u; i < shape.y; ++i) sum += simd_broadcast(act_hi, ushort(i - 32u));
+    } else if (!shape.z) {
+        for (uint base_i = 0; base_i < shape.x; base_i += 32u) {
+            const uint idx = base_i + uint(lane);
+            const float term = (idx < shape.x) ? exp(row_logits[idx] - chosen_logit_0) : 0.0f;
+            const uint chunk_n = min(shape.x - base_i, 32u);
+            for (uint l = 0; l < chunk_n; ++l) sum += simd_broadcast(term, ushort(l));
+        }
+    }
+    if (!isfinite(sum) || sum <= 0.0f) {
+        if (lane == 0) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+        sum = 1.0f;
+    }
+    if (uint(lane) < shape.y) {
+        checked_store(row_weights, uint(lane), act_lo / sum, error);
+    }
+    if (uint(lane) + 32u < shape.y) {
+        checked_store(row_weights, uint(lane) + 32u, act_hi / sum, error);
+    }
+}
+#endif
+
+#if defined(TOKSPUR_PRIVATE_PREFILL_BATCH_MIXTURE) && TOKSPUR_PRIVATE_PREFILL_BATCH_MIXTURE
+struct PrefillMixtureBatchArgs {
+    uint channels;
+    uint selected;
+    uint tokens;
+    uint reserved;
+    ulong input_stride_bytes;
+    ulong output_stride_bytes;
+};
+
+// 2D token-row extension of scalar graph_mixture (up to 2,048 rows).
+// Preserves exact accumulation order (shared[channel]*sigmoid(shared_logit) + sum_route weights[route]*experts[route*channels + channel]),
+// strided output row addressing without touching row padding, and sticky error flags.
+kernel void graph_mixture_batch(device const float* experts [[buffer(0)]],
+                                device const float* weights [[buffer(1)]],
+                                device const float* shared [[buffer(2)]],
+                                device const float* shared_logit [[buffer(3)]],
+                                device float* output [[buffer(4)]],
+                                constant PrefillMixtureBatchArgs& args [[buffer(5)]],
+                                device atomic_uint* error [[buffer(7)]],
+                                uint2 group [[threadgroup_position_in_grid]],
+                                ushort tid [[thread_index_in_threadgroup]]) {
+    const uint channel = group.x * 128u + uint(tid);
+    const uint row = group.y;
+    if (row >= args.tokens || channel >= args.channels) return;
+    const float slogit = shared_logit[row];
+    if (!isfinite(slogit)) { atomic_fetch_or_explicit(error, 1u, memory_order_relaxed); return; }
+    device const float* row_experts = experts + ulong(row) * ulong(args.selected) * ulong(args.channels);
+    device const float* row_weights = weights + ulong(row) * ulong(args.selected);
+    device const float* row_shared = shared + ulong(row) * ulong(args.channels);
+    device float* row_output = reinterpret_cast<device float*>(reinterpret_cast<device char*>(output) + ulong(row) * args.output_stride_bytes);
+    float value = row_shared[channel] * sigmoid_value(slogit);
+    uint bad_w = 0u;
+    if (args.selected == 10u) {
+        device const float* exp_ch = row_experts + channel;
+        #pragma unroll
+        for (uint route = 0u; route < 10u; ++route) {
+            const float w = row_weights[route];
+            if (!isfinite(w) || w < 0.0f) bad_w = 1u;
+            value += w * exp_ch[route * args.channels];
+        }
+    } else {
+        for (uint route = 0u; route < args.selected; ++route) {
+            const float w = row_weights[route];
+            if (!isfinite(w) || w < 0.0f) bad_w = 1u;
+            value += w * row_experts[route * args.channels + channel];
+        }
+    }
+    if (bad_w) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
+    checked_store(row_output, channel, value, error);
+}
+#endif

@@ -397,6 +397,9 @@ struct MetalGraph::Impl {
     bool hc_down_window_enabled = false, hc_down_window_prepared = false, hc_down_window_configured = false, hc_down_window_locked = false;
     uint64_t hc_down_window_encoded = 0;
 #endif
+    bool prefill_top10_mixture_prepared = false;
+    PrefillTop10MixtureTelemetry prefill_top10_mixture_telemetry{};
+    VerifyNaxTop10MixtureTelemetry verify_nax_top10_mixture_telemetry{};
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
     bool prefill_grouped_f32 = false;
     bool prefill_grouped_auto = false;
@@ -887,13 +890,30 @@ struct MetalGraph::Impl {
     // Arm B: byte ranges read and written since the last barrier, and the current dispatch's bindings.
     struct Span { size_t slot; uint64_t begin, end; };
     bool concurrent = false, concurrent_locked = false, pending_flag_reader = false, flag_written = false, flag_read = false;
-    std::vector<Span> span_reads, span_writes;
+    // Every range since the last barrier, plus one covering range per slot. A long run of dispatches that write
+    // their own rows never overlaps the earlier rows, so the covering range answers without rescanning the run.
+    struct SpanSet {
+        std::vector<Span> spans, covers;
+        void clear() { spans.clear(); covers.clear(); }
+        void add(const Span& span) {
+            spans.push_back(span);
+            for (auto& cover : covers) if (cover.slot == span.slot) {
+                cover.begin = std::min(cover.begin, span.begin); cover.end = std::max(cover.end, span.end); return;
+            }
+            covers.push_back(span);
+        }
+        // Exactly "some recorded range overlaps": a range outside its slot's cover overlaps none of that slot's ranges.
+        bool touches(const Span& span) const {
+            for (const auto& cover : covers) if (cover.slot == span.slot)
+                return cover.begin < span.end && span.begin < cover.end &&
+                    std::any_of(spans.begin(), spans.end(), [&](const Span& other) { return other.slot == span.slot && other.begin < span.end && span.begin < other.end; });
+            return false;
+        }
+    };
+    SpanSet span_reads, span_writes;
     std::vector<std::pair<Span, bool>> span_pending;
     uint64_t concurrent_barrier_count = 0, completed_concurrent_barriers = 0;
     uint64_t lifetime_dispatch_count = 0, lifetime_command_count = 0, lifetime_barrier_count = 0;
-    static bool touches(const std::vector<Span>& spans, const Span& span) {
-        return std::any_of(spans.begin(), spans.end(), [&](const Span& other) { return other.slot == span.slot && other.begin < span.end && span.begin < other.end; });
-    }
     void reset_spans() { span_reads.clear(); span_writes.clear(); span_pending.clear(); flag_written = flag_read = pending_flag_reader = false; }
     // Called before each concurrent dispatch is encoded: RAW and WAW against ranges written since the barrier, WAR against ranges read since it, and the error flag (every kernel ORs it, readers also load it).
     void concurrent_fence();
@@ -992,6 +1012,17 @@ struct MetalGraph::Impl {
         require(view.offset % 4 == 0, "GPU view offset must be four-byte aligned");
         return result;
     }
+    // Whether a view overlaps any registered matrix. Registration keeps a slot's matrices disjoint and the map orders them by
+    // offset, so only the first matrix at or after the view and the one before it can overlap. Every weight binding asks this.
+    template <class Shape>
+    bool overlaps_registered(const std::map<std::tuple<size_t, uint64_t, uint64_t>, Shape>& matrices, GpuView view) const {
+        if (view.owner != owner) return false;
+        const auto next = matrices.lower_bound({view.slot, view.offset, 0});
+        if (next != matrices.end() && std::get<0>(next->first) == view.slot && std::get<1>(next->first) < view.offset + view.bytes) return true;
+        if (next == matrices.begin()) return false;
+        const auto& [slot, offset, bytes] = std::prev(next)->first;
+        return slot == view.slot && offset + bytes > view.offset;
+    }
 #ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
     const LaneMatrixShape* lane_shape(GpuView view) const {
         if (!lane_slots.contains(view.slot)) return nullptr;
@@ -1003,11 +1034,7 @@ struct MetalGraph::Impl {
             view.bytes == draft_output_slice_.bytes) {
             return &(*draft_output_shape_);
         }
-            for (const auto& [key, shape] : lane_matrices) {
-            const auto [slot, offset, bytes] = key;
-            if (slot == view.slot && overlaps(view, {owner, slot, offset, bytes}))
-                throw FormatError("unregistered subview of packed weight storage");
-        }
+        if (overlaps_registered(lane_matrices, view)) throw FormatError("unregistered subview of packed weight storage");
         return nullptr;
     }
 #endif
@@ -1015,21 +1042,18 @@ struct MetalGraph::Impl {
         if (!planar_slots.contains(view.slot)) return nullptr;
         const auto found = planar_matrices.find({view.slot, view.offset, view.bytes});
         if (found != planar_matrices.end()) return &found->second;
-        for (const auto& [key, shape] : planar_matrices) {
-            static_cast<void>(shape);
-            const auto [slot, offset, bytes] = key;
-            if (slot == view.slot && overlaps(view, {owner, slot, offset, bytes}))
-                throw FormatError("unregistered subview of planar v3 weight storage");
-        }
+        if (overlaps_registered(planar_matrices, view)) throw FormatError("unregistered subview of planar v3 weight storage");
         return nullptr;
     }
     const Q8Tile64Entry* q8_tile64_entry(GpuView view, uint32_t columns, uint32_t rows) const {
+        if (!q8_tile64_cache_enabled) return nullptr;
         const auto found = q8_tile64_entries.find({view.slot, view.offset, view.bytes});
         if (found == q8_tile64_entries.end()) return nullptr;
         if (found->second.columns != columns || found->second.rows != rows) return nullptr;
         return &found->second;
     }
     void refresh_draft_output_tile64_alias() {
+        if (!q8_tile64_cache_enabled) return;
         if (!draft_output_slice_.bytes || !draft_output_parent_.has_value()) return;
         const auto [parent_view, entries, channels] = *draft_output_parent_;
         if (!entries || (entries % 64u) != 0u || !channels || (channels % 32u) != 0u) return;
@@ -1047,6 +1071,9 @@ struct MetalGraph::Impl {
         q8_tile64_entries.emplace(sub_key, Q8Tile64Entry{{}, sub_p0, sub_m, channels, entries, parent_view.slot, true});
     }
     void ensure_q8_tile64_all() {
+        // Compile-time policy: every eager/late preparation path reaches this guard.
+        // Original matrix registrations/views remain available to existing fallbacks.
+        if (!q8_tile64_cache_enabled) return;
         struct RepackQ8Tile64Args {
             uint32_t columns, rows, row_bytes, src_layout;
         };
@@ -1320,7 +1347,8 @@ struct MetalGraph::Impl {
             || (minimum_threads == 32 && (std::strcmp(name, "moe_three_build_union") == 0 ||
                 std::strcmp(name, "nax_verify_moe_build_union") == 0 ||
                 std::strcmp(name, "planar_moe_build_union_m8") == 0 ||
-                std::strcmp(name, "verify_fused_hc_write_rms_rows") == 0))
+                std::strcmp(name, "verify_fused_hc_write_rms_rows") == 0 ||
+                std::strcmp(name, "graph_route_batch") == 0))
             , "unsupported threadgroup capability for the selected kernel");
 #if !defined(TOKSPUR_PRIVATE_PIPELINE_LOOKUP) || !TOKSPUR_PRIVATE_PIPELINE_LOOKUP || defined(TOKSPUR_PRIVATE_DISPATCH_GRAPH)
         const auto text_key = [&] {
@@ -2360,6 +2388,29 @@ void MetalGraph::release(GpuView full_buffer) {
     for (const auto& owned_alloc : owned_t64_to_release) release(owned_alloc);
 }
 GraphMemory MetalGraph::memory() const { impl_->thread_check(); return impl_->ledger; }
+Q8Tile64CacheStats MetalGraph::q8_tile64_cache_stats() const {
+    const auto& p = *impl_; p.thread_check();
+    std::vector<Q8Tile64CacheCandidate> candidates;
+    std::vector<Q8Tile64CacheAllocation> entries;
+    candidates.reserve(p.q8_matrices.size()); entries.reserve(p.q8_tile64_entries.size());
+    for (const auto& [key, info] : p.q8_matrices) {
+        const auto [slot, offset, bytes] = key;
+        if (slot >= p.allocations.size() || !p.allocations[slot].buffer) continue;
+        Q8Tile64CacheCandidate candidate{bytes, q8_tile64_repack_bytes(info.columns, info.rows), std::nullopt};
+        if (const auto* entry = p.q8_tile64_entry({p.owner, slot, offset, bytes}, info.columns, info.rows))
+            candidate.cached_allocation_slot = entry->plane0.slot;
+        candidates.push_back(candidate);
+    }
+    for (const auto& [key, entry] : p.q8_tile64_entries) {
+        static_cast<void>(key);
+        const auto slot = entry.is_alias ? entry.plane0.slot : entry.alloc.slot;
+        require(slot < p.allocations.size(), "Q8 Tile64 cache allocation slot is invalid");
+        const auto& allocation = p.allocations[slot];
+        entries.push_back({slot, allocation.requested, allocation.charged,
+                           allocation.buffer != nil, entry.is_alias});
+    }
+    return summarize_q8_tile64_cache(q8_tile64_cache_enabled, candidates, entries);
+}
 std::string MetalGraph::device_name() const { impl_->thread_check(); return impl_->device.name.UTF8String; }
 #ifdef TOKSPUR_PRIVATE_NATIVE_PLAIN_LOADS
 void MetalGraph::configure_native_plain_loads(bool enabled) {
@@ -2387,7 +2438,7 @@ void MetalGraph::Impl::concurrent_fence() {
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
     if (hazard) ++carrier_flag_barriers;
 #endif
-    for (const auto& [span, output] : span_pending) hazard = hazard || touches(span_writes, span) || (output && touches(span_reads, span));
+    for (const auto& [span, output] : span_pending) hazard = hazard || span_writes.touches(span) || (output && span_reads.touches(span));
     if (hazard) {
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         span_reads.clear(); span_writes.clear(); flag_written = flag_read = false; ++concurrent_barrier_count;
@@ -2395,7 +2446,7 @@ void MetalGraph::Impl::concurrent_fence() {
         trace_record({{"event", Json("barrier")}, {"scope", Json("buffers")}});
 #endif
     }
-    for (const auto& [span, output] : span_pending) (output ? span_writes : span_reads).push_back(span);
+    for (const auto& [span, output] : span_pending) (output ? span_writes : span_reads).add(span);
     flag_written = true; flag_read = flag_read || pending_flag_reader;
     span_pending.clear(); pending_flag_reader = false;
 }
@@ -4158,6 +4209,55 @@ void MetalGraph::gemv(uint32_t type, GpuView matrix, GpuView input, GpuView outp
     p.parameter(std::array<uint32_t, 4>{columns, rows, static_cast<uint32_t>(row_bytes), 0}, 3);
     p.groups(MTLSizeMake((rows + 3) / 4, 1, 1));
 }
+void MetalGraph::gemv_rows(uint32_t type, GpuView matrix, GpuRowsF32 input, GpuRowsF32 output) {
+    auto& p = *impl_;
+    p.active();
+    const uint32_t columns = input.columns, rows = output.columns, count = input.rows;
+    const uint64_t in_bytes = uint64_t(columns) * 4, out_bytes = uint64_t(rows) * 4;
+    require(count && count == output.rows && columns && rows && input.stride_bytes >= in_bytes && output.stride_bytes >= out_bytes &&
+        input.view.bytes >= checked_add(checked_mul(count - 1, input.stride_bytes), in_bytes) &&
+        output.view.bytes >= checked_add(checked_mul(count - 1, output.stride_bytes), out_bytes), "graph GEMV row extent mismatch");
+    const auto in = [&](uint32_t t) { return slice(input.view, uint64_t(t) * input.stride_bytes, in_bytes); };
+    const auto out = [&](uint32_t t) { return slice(output.view, uint64_t(t) * output.stride_bytes, out_bytes); };
+    bool staged = false;
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+    // Only where gemv() itself takes the two-stage branch, and only where no row's output can feed another row's input.
+    staged = p.concurrent && !p.recording && !p.compatible_pipelines && count > 1 &&
+        type == 0 && p.small_gemv_splits > 1 && rows <= 64 && columns >= 1024 && columns <= 65536 &&
+        !overlaps(output.view, input.view) && !overlaps(output.view, matrix);
+#ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
+    staged = staged && !p.lane_shape(matrix);
+#endif
+#endif
+    if (!staged) {
+        for (uint32_t t = 0; t < count; ++t) gemv(type, matrix, in(t), out(t), columns, rows);
+        return;
+    }
+    require(checked_mul(in_bytes, rows) == matrix.bytes, "graph GEMV buffer shape mismatch");
+    static_cast<void>(p.allocation(matrix));
+    const uint64_t region = uint64_t(rows) * p.small_gemv_splits * 4;
+    const auto regions = uint32_t(p.small_gemv_scratch.bytes / region);
+    require(regions != 0, "small GEMV partial-sum scratch is smaller than one row");
+    const auto partials = [&](uint32_t i) { return slice(p.small_gemv_scratch, uint64_t(i) * region, region); };
+    const std::array<uint32_t, 4> shape{columns, rows, p.small_gemv_splits, 0};
+    for (uint32_t base = 0; base < count; base += regions) {
+        const uint32_t group = std::min(regions, count - base);
+        for (uint32_t i = 0; i < group; ++i) {
+            const auto x = in(base + i), y = out(base + i);
+            require(p.floats(x) == columns && p.floats(y, true) == rows, "graph GEMV buffer shape mismatch");
+            separate(y, {matrix, x}); separate(p.small_gemv_scratch, {matrix, x, y});
+            p.select("graph_small_gemv_partials", uint32_t(-1), shape);
+            p.bind(matrix, 0); p.bind(x, 1); p.bind(partials(i), 2, true);
+            p.parameter(shape, 3);
+            p.groups(MTLSizeMake((rows + 3) / 4, p.small_gemv_splits, 1));
+        }
+        for (uint32_t i = 0; i < group; ++i) {
+            p.select("graph_small_gemv_reduce", uint32_t(-1), shape);
+            p.bind(partials(i), 0); p.bind(out(base + i), 1, true);
+            p.parameter(shape, 2); p.threads(rows);
+        }
+    }
+}
 void MetalGraph::configure_q8_three_rows(bool enabled) {
     auto& p = *impl_; p.idle();
 #ifdef TOKSPUR_PRIVATE_Q8_THREE_ROWS
@@ -4916,6 +5016,7 @@ void MetalGraph::set_verify_nax_scope(bool active) {
 void MetalGraph::prepare_verify_nax(std::span<const std::pair<uint32_t, PrefillWeightLayout>> moe_layouts) {
     auto& p = *impl_; p.idle();
     require(p.verify_nax && [p.device supportsFamily:MTLGPUFamilyMetal4], "verify NAX preparation requires enabled Metal 4 policy");
+    if (verify_nax_batch_top10_mixture_enabled) prepare_prefill_top10_mixture();
     for (const uint32_t layout : {0u, 1u}) {
 #ifndef TOKSPUR_PRIVATE_LANE_LAYOUT
         if (layout != 0u) continue;
@@ -5011,13 +5112,15 @@ void MetalGraph::prepare_verify_nax(std::span<const std::pair<uint32_t, PrefillW
 #ifdef TOKSPUR_PRIVATE_QSA_PREFILL
     prepare_qsa_prefill();
 #endif
-    const auto t64_m8 = p.pipeline("nax_m8_dense_q8_t64", uint32_t(-1), 64);
-    const auto t64_sw = p.pipeline("nax_m8_dense_q8_swiglu_t64", uint32_t(-1), 64);
-    require(t64_m8.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
-        t64_sw.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength,
-        "verify NAX Q8_tile64 threadgroup memory exceeds device capability");
-    p.q8_tile64_ready = true;
-    p.ensure_q8_tile64_all();
+    if (q8_tile64_cache_enabled) {
+        const auto t64_m8 = p.pipeline("nax_m8_dense_q8_t64", uint32_t(-1), 64);
+        const auto t64_sw = p.pipeline("nax_m8_dense_q8_swiglu_t64", uint32_t(-1), 64);
+        require(t64_m8.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
+            t64_sw.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength,
+            "verify NAX Q8_tile64 threadgroup memory exceeds device capability");
+        p.q8_tile64_ready = true;
+        p.ensure_q8_tile64_all();
+    }
     p.verify_nax_prepared = true;
 }
 void MetalGraph::nax_m8_dense_q8(GpuView matrix, GpuRowsF32 input, GpuRowsF32 output, bool swiglu, float silu_scale) {
@@ -5760,6 +5863,128 @@ void MetalGraph::moe_mixture_rows(GpuView experts, GpuView weights, GpuView shar
     if (!p.mtp_priming_scope && !p.verify_nax_scope) ++p.router_window_encoded[3];
 }
 #endif
+bool MetalGraph::prefill_batch_top10() const {
+    impl_->thread_check();
+#if defined(TOKSPUR_PRIVATE_PREFILL_BATCH_TOP10) && TOKSPUR_PRIVATE_PREFILL_BATCH_TOP10
+    return true;
+#else
+    return false;
+#endif
+}
+bool MetalGraph::prefill_batch_mixture() const {
+    impl_->thread_check();
+#if defined(TOKSPUR_PRIVATE_PREFILL_BATCH_MIXTURE) && TOKSPUR_PRIVATE_PREFILL_BATCH_MIXTURE
+    return true;
+#else
+    return false;
+#endif
+}
+void MetalGraph::prepare_prefill_top10_mixture() {
+    auto& p = *impl_; p.idle();
+#if defined(TOKSPUR_PRIVATE_PREFILL_BATCH_TOP10) && TOKSPUR_PRIVATE_PREFILL_BATCH_TOP10
+    {
+        const auto pipeline = p.pipeline("graph_route_batch", uint32_t(-1), 32);
+        require(pipeline.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength, "prefill route batch threadgroup memory capability");
+    }
+#endif
+#if defined(TOKSPUR_PRIVATE_PREFILL_BATCH_MIXTURE) && TOKSPUR_PRIVATE_PREFILL_BATCH_MIXTURE
+    {
+        const auto pipeline = p.pipeline("graph_mixture_batch");
+        require(pipeline.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength, "prefill mixture batch threadgroup memory capability");
+    }
+#endif
+    p.prefill_top10_mixture_prepared = true;
+}
+void MetalGraph::prefill_route_batch(GpuView logits, GpuView indices, GpuView weights, uint32_t experts, uint32_t selected, uint32_t tokens, RouterMode mode, bool normalise) {
+    auto& p = *impl_; p.active();
+    require(prefill_batch_top10() && p.prefill_top10_mixture_prepared && !p.recording && !p.compatible_pipelines,
+        "prefill route batch requires explicit compilation, idle preparation and direct batches");
+    const uint32_t max_tokens = (p.prefill_dense_nax || p.prefill_grouped_nax) ? 2048u : 512u;
+    require(experts && experts <= 512 && selected && selected <= 64 && selected <= experts && tokens >= 2 && tokens <= max_tokens && uint32_t(mode) <= 1 &&
+        p.floats(logits) == uint64_t(tokens) * experts && p.floats(indices, true) == uint64_t(tokens) * selected && p.floats(weights, true) == uint64_t(tokens) * selected &&
+        logits.offset % 4 == 0 && indices.offset % 4 == 0 && weights.offset % 4 == 0, "prefill route batch geometry/mode mismatch");
+    validate_disjoint(std::array{logits}, std::array{indices, weights});
+    p.select("graph_route_batch", uint32_t(-1), {experts, selected, tokens, uint32_t(mode)}, 32);
+    p.bind(logits, 0); p.bind(indices, 1, true); p.bind(weights, 2, true);
+    p.parameter(std::array<uint32_t, 4>{experts, selected, uint32_t(mode), normalise}, 3);
+    p.parameter(tokens, 4);
+    p.dispatch(true, MTLSizeMake(1, tokens, 1), MTLSizeMake(32, 1, 1));
+#ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
+    p.carrier_route(indices, weights, tokens, selected, experts);
+#endif
+}
+void MetalGraph::prefill_mixture_batch(GpuView experts, GpuView weights, GpuView shared, GpuView shared_logit, GpuRowsF32 output, uint32_t selected) {
+    struct PrefillMixtureBatchArgs {
+        uint32_t channels, selected, tokens, reserved;
+        uint64_t input_stride_bytes, output_stride_bytes;
+    };
+    static_assert(sizeof(PrefillMixtureBatchArgs) == 32, "prefill mixture batch ABI");
+    auto& p = *impl_; p.active();
+    require(prefill_batch_mixture() && p.prefill_top10_mixture_prepared && !p.recording && !p.compatible_pipelines,
+        "prefill mixture batch requires explicit compilation, idle preparation and direct batches");
+    const uint32_t max_tokens = (p.prefill_dense_nax || p.prefill_grouped_nax) ? 2048u : 512u;
+    require(output.columns && output.columns <= 2560 && output.columns % 32 == 0 && selected && selected <= 64 &&
+        output.rows >= 2 && output.rows <= max_tokens && output.stride_bytes >= uint64_t(output.columns) * 4 && output.stride_bytes % 16 == 0,
+        "prefill mixture batch output geometry");
+    const auto output_bytes = checked_add(checked_mul(uint64_t(output.rows - 1), output.stride_bytes), uint64_t(output.columns) * 4);
+    static_cast<void>(p.allocation(experts)); static_cast<void>(p.allocation(weights)); static_cast<void>(p.allocation(shared)); static_cast<void>(p.allocation(shared_logit)); static_cast<void>(p.allocation(output.view, true));
+    require(experts.bytes == uint64_t(output.rows) * selected * output.columns * 4 && p.floats(weights) == uint64_t(output.rows) * selected &&
+        shared.bytes == uint64_t(output.rows) * output.columns * 4 && p.floats(shared_logit) == output.rows && output.view.bytes >= output_bytes &&
+        experts.offset % 4 == 0 && weights.offset % 4 == 0 && shared.offset % 4 == 0 && shared_logit.offset % 4 == 0 && output.view.offset % 4 == 0,
+        "prefill mixture batch view extent/alignment");
+    validate_disjoint(std::array{experts, weights, shared, shared_logit}, std::array{output.view});
+    const PrefillMixtureBatchArgs args{output.columns, selected, output.rows, 0, 0, output.stride_bytes};
+    p.select("graph_mixture_batch", uint32_t(-1), {output.columns, selected, output.rows, 0});
+    p.bind(experts, 0); p.bind(weights, 1); p.bind(shared, 2); p.bind(shared_logit, 3); p.bind(output.view, 4, true); p.parameter(args, 5);
+    p.groups(MTLSizeMake((output.columns + 127u) / 128u, output.rows, 1));
+}
+void MetalGraph::record_prefill_moe_chunk(uint32_t rows, bool used_batch_top10, bool top10_fallback, bool used_batch_mixture, bool mixture_fallback) {
+    auto& p = *impl_; p.thread_check();
+    if (p.mtp_priming_scope || p.verify_nax_scope) return;
+    auto& t = p.prefill_top10_mixture_telemetry;
+    ++t.moe_batch_calls;
+    t.moe_batch_rows += rows;
+    if (t.moe_batch_min_rows == 0 || rows < t.moe_batch_min_rows) t.moe_batch_min_rows = rows;
+    if (rows > t.moe_batch_max_rows) t.moe_batch_max_rows = rows;
+    if (used_batch_top10) {
+        ++t.top10_batched_calls;
+        t.top10_batched_rows += rows;
+    } else {
+        t.top10_scalar_calls += rows;
+        if (top10_fallback) ++t.top10_fallbacks;
+    }
+    if (used_batch_mixture) {
+        ++t.mixture_batched_calls;
+        t.mixture_batched_rows += rows;
+    } else {
+        t.mixture_scalar_calls += rows;
+        if (mixture_fallback) ++t.mixture_fallbacks;
+    }
+}
+PrefillTop10MixtureTelemetry MetalGraph::prefill_top10_mixture_telemetry() const {
+    impl_->thread_check();
+    return impl_->prefill_top10_mixture_telemetry;
+}
+void MetalGraph::reset_prefill_top10_mixture_telemetry() {
+    impl_->thread_check();
+    impl_->prefill_top10_mixture_telemetry = {};
+}
+void MetalGraph::record_verify_nax_moe_ops(uint32_t rows, bool top10, bool batched) {
+    auto& p = *impl_; p.thread_check();
+    require(p.verify_nax && p.verify_nax_prepared && p.verify_nax_scope &&
+        !p.mtp_priming_scope && !p.dflash2_scope && rows >= 2 && rows <= 8,
+        "verify NAX top10/mixture accounting requires isolated verification scope");
+    auto& t = p.verify_nax_top10_mixture_telemetry;
+    auto& calls = top10 ? t.top10_batched_calls : t.mixture_batched_calls;
+    auto& batch_rows = top10 ? t.top10_batched_rows : t.mixture_batched_rows;
+    auto& scalar = top10 ? t.top10_scalar_calls : t.mixture_scalar_calls;
+    if (batched) { calls = checked_add(calls, 1); batch_rows = checked_add(batch_rows, rows); }
+    else scalar = checked_add(scalar, rows);
+}
+VerifyNaxTop10MixtureTelemetry MetalGraph::verify_nax_top10_mixture_telemetry() const {
+    impl_->thread_check();
+    return impl_->verify_nax_top10_mixture_telemetry;
+}
 #ifdef TOKSPUR_PRIVATE_HC_DOWN_WINDOW
 void MetalGraph::configure_prefill_hc_down_window(bool enabled) {
     auto& p = *impl_; p.idle();
@@ -5791,13 +6016,15 @@ void MetalGraph::prepare_hc_down_window() {
                 if (p.nax_bf16_scratch.bytes) release(p.nax_bf16_scratch);
                 p.nax_bf16_scratch = zeros(min_bf16, "nax_bf16_scratch");
             }
-            const auto t64_m32 = p.pipeline("nax_prefill_dense_q8_t64_m32", uint32_t(-1), 128);
-            const auto t64_m8 = p.pipeline("nax_prefill_dense_q8_t64_m8", uint32_t(-1), 128);
-            require(t64_m32.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
-                t64_m8.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength,
-                "NAX HC down window Q8_tile64 threadgroup memory capability");
-            p.q8_tile64_ready = true;
-            p.ensure_q8_tile64_all();
+            if (q8_tile64_cache_enabled) {
+                const auto t64_m32 = p.pipeline("nax_prefill_dense_q8_t64_m32", uint32_t(-1), 128);
+                const auto t64_m8 = p.pipeline("nax_prefill_dense_q8_t64_m8", uint32_t(-1), 128);
+                require(t64_m32.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
+                    t64_m8.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength,
+                    "NAX HC down window Q8_tile64 threadgroup memory capability");
+                p.q8_tile64_ready = true;
+                p.ensure_q8_tile64_all();
+            }
         }
     }
     p.hc_down_window_prepared = true;
@@ -5910,17 +6137,19 @@ void MetalGraph::prepare_dense_mm_q8(PrefillWeightLayout layout) {
             if (p.nax_bf16_scratch.bytes) release(p.nax_bf16_scratch);
             p.nax_bf16_scratch = zeros(min_bf16, "nax_bf16_scratch");
         }
-        const auto t64_m32 = p.pipeline("nax_prefill_dense_q8_t64_m32", uint32_t(-1), 128);
-        const auto t64_m8 = p.pipeline("nax_prefill_dense_q8_t64_m8", uint32_t(-1), 128);
-        const auto t64_sw32 = p.pipeline("nax_prefill_dense_q8_swiglu_t64_m32", uint32_t(-1), 128);
-        const auto t64_sw8 = p.pipeline("nax_prefill_dense_q8_swiglu_t64_m8", uint32_t(-1), 128);
-        require(t64_m32.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
-            t64_m8.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
-            t64_sw32.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
-            t64_sw8.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength,
-            "NAX prefill Q8_tile64 threadgroup memory exceeds device capability");
-        p.q8_tile64_ready = true;
-        p.ensure_q8_tile64_all();
+        if (q8_tile64_cache_enabled) {
+            const auto t64_m32 = p.pipeline("nax_prefill_dense_q8_t64_m32", uint32_t(-1), 128);
+            const auto t64_m8 = p.pipeline("nax_prefill_dense_q8_t64_m8", uint32_t(-1), 128);
+            const auto t64_sw32 = p.pipeline("nax_prefill_dense_q8_swiglu_t64_m32", uint32_t(-1), 128);
+            const auto t64_sw8 = p.pipeline("nax_prefill_dense_q8_swiglu_t64_m8", uint32_t(-1), 128);
+            require(t64_m32.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
+                t64_m8.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
+                t64_sw32.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
+                t64_sw8.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength,
+                "NAX prefill Q8_tile64 threadgroup memory exceeds device capability");
+            p.q8_tile64_ready = true;
+            p.ensure_q8_tile64_all();
+        }
         p.dense_mm_prepared.insert(uint32_t(layout));
         return;
     }
@@ -7064,7 +7293,13 @@ void MetalGraph::prepare_gdn_tiles(uint32_t threads) {
     require(threads == 32 || threads == 64 || threads == 128, "unsupported GDN tile threadgroup");
     static_cast<void>(p.pipeline("graph_gdn_convolution_tile"));
     static_cast<void>(p.pipeline("graph_gdn_delta_tile", uint32_t(-1), threads));
-    // No new mode is published if either pipeline preparation refuses.
+#ifdef TOKSPUR_PRIVATE_VERIFY_GDN_ROW_BATCH
+    static_cast<void>(p.pipeline("graph_gdn_prepare_verify_rows"));
+    static_cast<void>(p.pipeline("graph_gdn_silu_prepare_verify_rows"));
+    static_cast<void>(p.pipeline("graph_gdn_gates_verify_rows"));
+    static_cast<void>(p.pipeline("graph_rms_sigmoid_gate"));
+#endif
+    // No new mode is published if any pipeline preparation refuses.
     p.gdn_tile_threads = threads;
 }
 void MetalGraph::gdn_convolution_tile(GpuView history, GpuView projected, GpuView weights,
@@ -7097,7 +7332,10 @@ void MetalGraph::gdn_delta_tile(GpuView state, GpuView query, GpuView key, GpuVi
     p.bind(state, 0); p.bind(query, 1); p.bind(key, 2); p.bind(value, 3); p.bind(decay, 4); p.bind(beta, 5);
     p.bind(candidate, 6, true); p.bind(output, 8, true);
     p.parameter(std::array<uint32_t, 4>{heads, width, tile.capacity, 128}, 9); p.parameter(tile.steps, 10);
-    p.dispatch(false, MTLSizeMake(heads * width, 1, 1), MTLSizeMake(p.gdn_tile_threads, 1, 1));
+    // Cooperative groups contain eight value columns and four complete key
+    // segments. Pad columns within each head so every shuffle lane exists.
+    const uint32_t threads = gdn_cooperative4_enabled ? heads * ((width + 7) / 8) * 32 : heads * width;
+    p.dispatch(false, MTLSizeMake(threads, 1, 1), MTLSizeMake(p.gdn_tile_threads, 1, 1));
 }
 void MetalGraph::rms(GpuView input, GpuView gains, GpuView output, uint32_t group_width, float epsilon) {
     auto& p = *impl_;
@@ -7108,6 +7346,17 @@ void MetalGraph::rms(GpuView input, GpuView gains, GpuView output, uint32_t grou
     separate(output, {input, gains});
     p.select("graph_rms"); p.bind(input, 0); p.bind(gains, 1); p.bind(output, 2, true);
     p.parameter(std::array<uint32_t, 4>{count, group_width, gains.bytes == uint64_t(group_width) * 4, 0}, 3); p.parameter(epsilon, 4);
+    p.groups(MTLSizeMake((count / group_width + 3) / 4, 1, 1));
+}
+void MetalGraph::rms_sigmoid_gate(GpuView input, GpuView gains, GpuView gate, GpuView output, uint32_t group_width, float epsilon) {
+    auto& p = *impl_;
+    p.active();
+    const auto count = p.floats(input);
+    require(group_width && count % group_width == 0 && group_width <= 65536 && p.floats(gate) == count && p.floats(output, true) == count &&
+            (p.floats(gains) == count || p.floats(gains) == group_width) && std::isfinite(epsilon) && epsilon > 0, "graph RMS sigmoid gate shape/epsilon mismatch");
+    separate(output, {input, gains, gate});
+    p.select("graph_rms_sigmoid_gate"); p.bind(input, 0); p.bind(gains, 1); p.bind(gate, 2); p.bind(output, 3, true);
+    p.parameter(std::array<uint32_t, 4>{count, group_width, gains.bytes == uint64_t(group_width) * 4, 0}, 4); p.parameter(epsilon, 5);
     p.groups(MTLSizeMake((count / group_width + 3) / 4, 1, 1));
 }
 void MetalGraph::activate(GpuView input, GpuView output, Activation kind, float scale) {
@@ -7747,6 +7996,63 @@ void MetalGraph::gdn_gates(GpuView alpha, GpuView beta_logits, GpuView rates, Gp
     p.bind(decay, 4, true); p.bind(beta, 5, true); p.parameter(heads, 6); p.threads(heads);
 }
 
+void MetalGraph::gdn_prepare_verify_rows(GpuView input, GpuView query, GpuView key,
+    GpuView value, GdnShape shape, GdnPolicy policy, StateTile tile) {
+    auto& p = *impl_; p.active();
+    validate_state_tile(tile); validate_gdn_policy(policy);
+    require(tile.steps >= 2 && tile.steps <= 8, "GDN preparation verify row count mismatch");
+    const auto raw = gdn_qkv_count(shape);
+    require(p.floats(input) == uint64_t(tile.capacity) * raw &&
+        p.floats(query, true) == uint64_t(tile.capacity) * shape.value_heads * shape.key_width &&
+        p.floats(key, true) == uint64_t(tile.capacity) * shape.value_heads * shape.key_width &&
+        p.floats(value, true) == uint64_t(tile.capacity) * shape.value_heads * shape.value_width,
+        "GDN preparation verify tape mismatch");
+    validate_disjoint(std::array{input}, std::array{query, key, value});
+    p.select("graph_gdn_prepare_verify_rows");
+    p.bind(input, 0); p.bind(query, 1, true); p.bind(key, 2, true); p.bind(value, 3, true);
+    p.parameter(std::array<uint32_t, 4>{shape.key_heads, shape.value_heads, shape.key_width, shape.value_width}, 4);
+    p.parameter(std::array<float, 2>{policy.query_scale, policy.l2_epsilon}, 5);
+    p.parameter(uint32_t(policy.l2_mode), 6);
+    p.groups(MTLSizeMake((shape.value_heads + 3) / 4, tile.steps, 1));
+}
+
+void MetalGraph::gdn_silu_prepare_verify_rows(GpuView input, GpuView query, GpuView key,
+    GpuView value, GdnShape shape, GdnPolicy policy, StateTile tile) {
+    auto& p = *impl_; p.active();
+    validate_gdn_shape(shape); validate_gdn_policy(policy); validate_state_tile(tile);
+    require(tile.steps >= 2 && tile.steps <= 8, "GDN SiLU preparation verify row count mismatch");
+    const auto raw = gdn_qkv_count(shape);
+    require(p.floats(input) == uint64_t(tile.capacity) * raw &&
+        p.floats(query, true) == uint64_t(tile.capacity) * shape.value_heads * shape.key_width &&
+        p.floats(key, true) == uint64_t(tile.capacity) * shape.value_heads * shape.key_width &&
+        p.floats(value, true) == uint64_t(tile.capacity) * shape.value_heads * shape.value_width,
+        "GDN SiLU preparation verify tape mismatch");
+    validate_disjoint(std::array{input}, std::array{query, key, value});
+    p.select("graph_gdn_silu_prepare_verify_rows");
+    p.bind(input, 0); p.bind(query, 1, true); p.bind(key, 2, true); p.bind(value, 3, true);
+    p.parameter(std::array<uint32_t, 4>{shape.key_heads, shape.value_heads, shape.key_width, shape.value_width}, 4);
+    p.parameter(std::array<float, 2>{policy.query_scale, policy.l2_epsilon}, 5);
+    p.parameter(uint32_t(policy.l2_mode), 6);
+    p.groups(MTLSizeMake((shape.value_heads + 3) / 4, tile.steps, 1));
+}
+
+void MetalGraph::gdn_gates_verify_rows(GpuView alpha, GpuView beta_logits, GpuView rates,
+    GpuView bias, GpuView decay, GpuView beta, uint32_t heads, StateTile tile) {
+    auto& p = *impl_; p.active(); validate_state_tile(tile);
+    require(tile.steps >= 2 && tile.steps <= 8 && heads && heads <= 64,
+        "GDN gates verify row/head count mismatch");
+    const auto count = uint64_t(tile.capacity) * heads;
+    require(p.floats(alpha) == count && p.floats(beta_logits) == count &&
+        p.floats(rates) == heads && p.floats(bias) == heads &&
+        p.floats(decay, true) == count && p.floats(beta, true) == count,
+        "GDN gates verify tape mismatch");
+    validate_disjoint(std::array{alpha, beta_logits, rates, bias}, std::array{decay, beta});
+    p.select("graph_gdn_gates_verify_rows");
+    p.bind(alpha, 0); p.bind(beta_logits, 1); p.bind(rates, 2); p.bind(bias, 3);
+    p.bind(decay, 4, true); p.bind(beta, 5, true);
+    p.parameter(std::array<uint32_t, 2>{heads, tile.steps}, 6); p.threads(heads * tile.steps);
+}
+
 void MetalGraph::split_query_gate(GpuView packed, GpuView query, GpuView gate, uint32_t heads, uint32_t width, QueryPacking packing) {
     auto& p = *impl_; p.active();
     require(heads && heads <= 64 && width && width <= 256 && uint32_t(packing) <= 1 && p.floats(packed) == 2ull * heads * width &&
@@ -8318,13 +8624,15 @@ void MetalGraph::prepare_dflash2() {
     prepare_gdn_chunk();
 #endif
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM
-    const auto dflash_t64_m8 = p.pipeline("nax_m8_dense_q8_t64", uint32_t(-1), 64);
-    const auto dflash_t64_sw = p.pipeline("nax_m8_dense_q8_swiglu_t64", uint32_t(-1), 64);
-    require(dflash_t64_m8.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
-        dflash_t64_sw.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength,
-        "DFlash2 Q8_tile64 threadgroup memory exceeds device capability");
-    p.q8_tile64_ready = true;
-    p.ensure_q8_tile64_all();
+    if (q8_tile64_cache_enabled) {
+        const auto dflash_t64_m8 = p.pipeline("nax_m8_dense_q8_t64", uint32_t(-1), 64);
+        const auto dflash_t64_sw = p.pipeline("nax_m8_dense_q8_swiglu_t64", uint32_t(-1), 64);
+        require(dflash_t64_m8.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength &&
+            dflash_t64_sw.staticThreadgroupMemoryLength <= p.device.maxThreadgroupMemoryLength,
+            "DFlash2 Q8_tile64 threadgroup memory exceeds device capability");
+        p.q8_tile64_ready = true;
+        p.ensure_q8_tile64_all();
+    }
 #endif
     p.dflash2_prepared = true;
 }
@@ -9129,12 +9437,16 @@ void MetalGraph::prepare_verify_hc_gdn_fused() {
         static_cast<void>(p.pipeline(kname, 8u, 128, false, 0u));
         static_cast<void>(p.pipeline(kname, 8u, 128, false, 1u));
     }
-    static_cast<void>(p.pipeline("verify_fused_hc_write_rms_rows", uint32_t(-1), 32));
     for (const auto* name : {"verify_fused_hc_inject_partials",
-                             "verify_fused_hc_read_rows",
                              "verify_fused_hc_gated_mix_rows",
+                             "verify_fused_hc_write_rms_rows",
+                             "verify_fused_shared_logit_f32"}) {
+        static_cast<void>(p.pipeline(name, uint32_t(-1), 256));
+    }
+    for (const auto* name : {"verify_fused_hc_read_rows",
                              "verify_fused_hc_write_rows",
-                             "verify_fused_gdn_alpha_beta_f32"}) {
+                             "verify_fused_gdn_alpha_beta_f32",
+                             "verify_fused_expert_gate_f32"}) {
         static_cast<void>(p.pipeline(name, uint32_t(-1), 128));
     }
     if (!p.verify_hc_partials_scratch.owner) {
@@ -9208,6 +9520,38 @@ void MetalGraph::verify_fused_hc_q8(GpuView matrix, GpuRowsF32 input, GpuRowsF32
     p.groups(MTLSizeMake((output.columns + 3u) / 4u, 1, 1));
 }
 
+void MetalGraph::verify_fused_hc_inject_scales_rows(GpuView weights, GpuView normalized,
+    GpuView inject_logits, GpuView scales,
+    uint32_t branches, uint32_t channels, uint32_t tokens) {
+    auto& p = *impl_; p.active();
+    require(p.verify_hc_gdn_fused_prepared && p.verify_hc_partials_scratch.owner &&
+        !p.recording && !p.compatible_pipelines,
+        "fused verify HC inject+read requires prepared direct batches");
+    const uint32_t columns = checked_mul(branches, channels);
+    require(branches >= 1 && branches <= 16 && channels >= 32 && channels >= branches &&
+        columns <= 65536 && columns % 32 == 0 && tokens >= 1 && tokens <= 64,
+        "fused verify HC inject+read geometry mismatch");
+    require(!p.planar_shape(weights), "fused verify HC inject+read refuses planar weights");
+#ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
+    require(!p.lane_shape(weights), "fused verify HC inject+read requires FP32 row-major weights");
+#endif
+    require(p.floats(weights) == checked_mul(branches, columns) &&
+        p.floats64(normalized) == uint64_t(tokens) * columns &&
+        p.floats(inject_logits, true) == checked_mul(tokens, branches) &&
+        p.floats(scales, true) == checked_mul(tokens, branches),
+        "fused verify HC inject+read buffer span mismatch");
+
+    const uint32_t splits = (columns >= 1024 && branches <= 64) ? p.small_gemv_splits : 1u;
+    require(splits >= 1 && splits <= 32, "fused verify HC inject+read invalid split count");
+    validate_disjoint(std::array{weights, normalized}, std::array{inject_logits, scales});
+    validate_disjoint(std::array{inject_logits}, std::array{scales});
+
+    const std::array<uint32_t, 4> pshape{columns, branches, splits, tokens};
+    p.select("verify_fused_hc_inject_partials", uint32_t(-1), pshape, 256);
+    p.bind(weights, 0); p.bind(normalized, 1); p.bind(inject_logits, 2, true); p.bind(scales, 3, true); p.parameter(pshape, 4);
+    p.dispatch(true, MTLSizeMake(branches, tokens, 1), MTLSizeMake(256, 1, 1));
+}
+
 void MetalGraph::verify_fused_hc_inject_read_rows(GpuView weights, GpuView normalized, GpuView scores,
     GpuView inject_logits, GpuView output, GpuView scales,
     uint32_t branches, uint32_t channels, uint32_t tokens) {
@@ -9230,27 +9574,12 @@ void MetalGraph::verify_fused_hc_inject_read_rows(GpuView weights, GpuView norma
         p.floats64(output, true) == uint64_t(tokens) * channels &&
         p.floats(scales, true) == checked_mul(tokens, branches),
         "fused verify HC inject+read buffer span mismatch");
-
-    const uint32_t splits = (columns >= 1024 && branches <= 64) ? p.small_gemv_splits : 1u;
-    require(splits >= 1 && splits <= 32, "fused verify HC inject+read invalid split count");
-    const GpuView partials = slice(p.verify_hc_partials_scratch, 0,
-        uint64_t(tokens) * branches * splits * sizeof(float));
-    validate_disjoint(std::array{weights, normalized, scores}, std::array{partials, inject_logits, output, scales});
-    validate_disjoint(std::array{partials}, std::array{inject_logits, output, scales});
+    validate_disjoint(std::array{weights, normalized, scores}, std::array{inject_logits, output, scales});
     validate_disjoint(std::array{inject_logits}, std::array{output, scales});
     validate_disjoint(std::array{output}, std::array{scales});
 
-    const std::array<uint32_t, 4> pshape{columns, branches, splits, tokens};
-    p.select("verify_fused_hc_inject_partials", uint32_t(-1), pshape, 128);
-    p.bind(weights, 0); p.bind(normalized, 1); p.bind(partials, 2, true); p.parameter(pshape, 3);
-    p.dispatch(true, MTLSizeMake(branches == 4u ? 1u : branches, (splits + 3u) / 4u, (tokens + 7u) / 8u), MTLSizeMake(128, 1, 1));
-
-    const std::array<uint32_t, 4> rshape{branches, channels, tokens, splits};
-    p.select("verify_fused_hc_read_rows", uint32_t(-1), rshape, 128);
-    p.bind(normalized, 0); p.bind(scores, 1); p.bind(partials, 2);
-    p.bind(output, 3, true); p.bind(inject_logits, 4, true); p.bind(scales, 5, true);
-    p.parameter(rshape, 6);
-    p.threads(tokens * ((channels + 3u) / 4u));
+    verify_fused_hc_inject_scales_rows(weights, normalized, inject_logits, scales, branches, channels, tokens);
+    verify_fused_hc_read_rows(normalized, scores, output, branches, channels, tokens);
 }
 
 void MetalGraph::verify_fused_hc_read_rows(GpuView normalized, GpuView scores, GpuView output,
@@ -9268,9 +9597,9 @@ void MetalGraph::verify_fused_hc_read_rows(GpuView normalized, GpuView scores, G
     validate_disjoint(std::array{normalized, scores}, std::array{output});
 
     const std::array<uint32_t, 4> shape{branches, channels, tokens, 0u};
-    p.select("verify_fused_hc_gated_mix_rows", uint32_t(-1), shape, 128);
+    p.select("verify_fused_hc_gated_mix_rows", uint32_t(-1), shape, 256);
     p.bind(normalized, 0); p.bind(scores, 1); p.bind(output, 2, true); p.parameter(shape, 3);
-    p.threads(tokens * ((channels + 3u) / 4u));
+    p.dispatch(false, MTLSizeMake(tokens * channels, 1, 1), MTLSizeMake(256, 1, 1));
 }
 
 void MetalGraph::verify_fused_hc_write_rows(GpuView streams, GpuView input, GpuView scales, GpuView destination,
@@ -9319,10 +9648,10 @@ void MetalGraph::verify_fused_hc_write_rms_rows(GpuView streams, GpuView input, 
 
     const uint32_t packed_tokens = tokens | (shared_gains ? (1u << 16u) : 0u);
     const std::array<uint32_t, 4> shape{branches, channels, packed_tokens, std::bit_cast<uint32_t>(epsilon)};
-    p.select("verify_fused_hc_write_rms_rows", uint32_t(-1), {branches, channels, tokens, shared_gains ? 1u : 0u}, 32);
+    p.select("verify_fused_hc_write_rms_rows", uint32_t(-1), {branches, channels, tokens, shared_gains ? 1u : 0u}, 256);
     p.bind(streams, 0); p.bind(input, 1); p.bind(scales, 2); p.bind(gains, 3);
     p.bind(destination, 4, true); p.bind(normalized, 5, true); p.parameter(shape, 6);
-    p.dispatch(true, MTLSizeMake(branches, tokens, 1), MTLSizeMake(32, 1, 1));
+    p.dispatch(true, MTLSizeMake(branches, tokens, 1), MTLSizeMake(256, 1, 1));
 }
 
 void MetalGraph::verify_fused_gdn_alpha_beta_f32(GpuView w_alpha, GpuView w_beta, GpuRowsF32 input,
@@ -9369,6 +9698,85 @@ void MetalGraph::verify_fused_gdn_alpha_beta_f32(GpuView w_alpha, GpuView w_beta
     p.bind(w_alpha, 0); p.bind(w_beta, 1); p.bind(input.view, 2);
     p.bind(out_alpha.view, 3, true); p.bind(out_beta.view, 4, true); p.parameter(args, 5);
     p.groups(MTLSizeMake(2u * half_groups, (input.rows + 3u) / 4u, 1));
+}
+
+void MetalGraph::verify_fused_expert_gate_f32(GpuView weights, GpuRowsF32 input, GpuRowsF32 output) {
+    struct VerifyFusedRowsF32Args {
+        uint32_t tokens, columns, outputs, splits;
+        uint64_t input_stride_bytes, output_stride_bytes;
+    };
+    static_assert(sizeof(VerifyFusedRowsF32Args) == 32, "VerifyFusedRowsF32Args ABI");
+    auto& p = *impl_; p.active();
+    require(p.verify_hc_gdn_fused_prepared && !p.recording && !p.compatible_pipelines,
+        "fused verify FP32 expert gate requires prepared direct batches");
+    require(input.rows >= 1 && input.rows <= 8 && input.rows == output.rows &&
+        input.columns >= 32 && input.columns <= 65536 && input.columns % 32 == 0 &&
+        output.columns >= 1 && output.columns <= 4096 &&
+        input.stride_bytes >= uint64_t(input.columns) * 4ull && input.stride_bytes % 4 == 0 &&
+        output.stride_bytes >= uint64_t(output.columns) * 4ull && output.stride_bytes % 4 == 0,
+        "fused verify FP32 expert gate geometry mismatch");
+    require(!p.planar_shape(weights), "fused verify FP32 expert gate refuses planar weights");
+#ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
+    require(!p.lane_shape(weights), "fused verify FP32 expert gate requires FP32 row-major weights");
+#endif
+    const uint64_t w_floats = checked_mul(input.columns, output.columns);
+    const uint64_t in_bytes = checked_add(checked_mul(uint64_t(input.rows - 1), input.stride_bytes), uint64_t(input.columns) * 4ull);
+    const uint64_t out_bytes = checked_add(checked_mul(uint64_t(output.rows - 1), output.stride_bytes), uint64_t(output.columns) * 4ull);
+    require(p.floats(weights) == w_floats, "fused verify FP32 expert gate weight span mismatch");
+    static_cast<void>(p.allocation(input.view));
+    static_cast<void>(p.allocation(output.view, true));
+    require(input.view.bytes >= in_bytes && output.view.bytes >= out_bytes &&
+        input.view.offset % 4 == 0 && output.view.offset % 4 == 0,
+        "fused verify FP32 expert gate buffer span or alignment mismatch");
+    validate_disjoint(std::array{weights, input.view}, std::array{output.view});
+
+    const VerifyFusedRowsF32Args args{
+        input.rows, input.columns, output.columns, 0u,
+        input.stride_bytes, output.stride_bytes
+    };
+    p.select("verify_fused_expert_gate_f32", uint32_t(-1), {input.rows, input.columns, output.columns, 0u}, 128);
+    p.bind(weights, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(args, 3);
+    p.groups(MTLSizeMake((output.columns + 3u) / 4u, 1, 1));
+}
+
+void MetalGraph::verify_fused_shared_logit_f32(GpuView weights, GpuRowsF32 input, GpuRowsF32 output) {
+    struct VerifyFusedRowsF32Args {
+        uint32_t tokens, columns, outputs, splits;
+        uint64_t input_stride_bytes, output_stride_bytes;
+    };
+    static_assert(sizeof(VerifyFusedRowsF32Args) == 32, "VerifyFusedRowsF32Args ABI");
+    auto& p = *impl_; p.active();
+    require(p.verify_hc_gdn_fused_prepared && !p.recording && !p.compatible_pipelines,
+        "fused verify FP32 shared logit requires prepared direct batches");
+    require(input.rows >= 1 && input.rows <= 8 && input.rows == output.rows &&
+        input.columns >= 32 && input.columns <= 65536 && input.columns % 32 == 0 &&
+        output.columns == 1 &&
+        input.stride_bytes >= uint64_t(input.columns) * 4ull && input.stride_bytes % 4 == 0 &&
+        output.stride_bytes >= 4ull && output.stride_bytes % 4 == 0,
+        "fused verify FP32 shared logit geometry mismatch");
+    require(!p.planar_shape(weights), "fused verify FP32 shared logit refuses planar weights");
+#ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
+    require(!p.lane_shape(weights), "fused verify FP32 shared logit requires FP32 row-major weights");
+#endif
+    const uint64_t in_bytes = checked_add(checked_mul(uint64_t(input.rows - 1), input.stride_bytes), uint64_t(input.columns) * 4ull);
+    const uint64_t out_bytes = checked_add(checked_mul(uint64_t(output.rows - 1), output.stride_bytes), 4ull);
+    require(p.floats(weights) == input.columns, "fused verify FP32 shared logit weight span mismatch");
+    static_cast<void>(p.allocation(input.view));
+    static_cast<void>(p.allocation(output.view, true));
+    require(input.view.bytes >= in_bytes && output.view.bytes >= out_bytes &&
+        input.view.offset % 4 == 0 && output.view.offset % 4 == 0,
+        "fused verify FP32 shared logit buffer span or alignment mismatch");
+    validate_disjoint(std::array{weights, input.view}, std::array{output.view});
+
+    const uint32_t effective_splits = (input.columns >= 1024u && p.small_gemv_splits > 1u) ? p.small_gemv_splits : 0u;
+    require(effective_splits <= 32u, "fused verify FP32 shared logit invalid split count");
+    const VerifyFusedRowsF32Args args{
+        input.rows, input.columns, 1u, effective_splits,
+        input.stride_bytes, output.stride_bytes
+    };
+    p.select("verify_fused_shared_logit_f32", uint32_t(-1), {input.rows, input.columns, 1u, effective_splits}, 256);
+    p.bind(weights, 0); p.bind(input.view, 1); p.bind(output.view, 2, true); p.parameter(args, 3);
+    p.dispatch(true, MTLSizeMake(input.rows, 1, 1), MTLSizeMake(256, 1, 1));
 }
 
 } // namespace tokspur

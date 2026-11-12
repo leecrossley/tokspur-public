@@ -52,6 +52,7 @@ void prepare_moe_mm_many(MetalGraph& g,const MoeWeights& w,MoeShape shape,MoeMmL
 #ifdef TOKSPUR_PRIVATE_MOE_ROUTER_WINDOW
     g.prepare_moe_router_window();
 #endif
+    g.prepare_prefill_top10_mixture();
     if (is_planar_moe(g, w, shape)) {
         g.prepare_planar_moe_v3(w.gate.encoding, w.down.encoding, true,
             g.prefill_grouped_nax() ? 2048u : 512u, shape.experts, shape.selected, shape.channels, shape.hidden);
@@ -116,7 +117,11 @@ uint64_t moe_mm_many_dispatches(const MetalGraph& g,const MoeWeights& w,MoeShape
 #ifdef TOKSPUR_PRIVATE_MOE_ROUTER_F32_BATCH
     if(g.moe_router_f32_batch_enabled() && w.router.encoding==0 && s.channels==2560 && s.experts==512 && n>1)router=1;
 #endif
-    return fixed+router+uint64_t(n)*(2+g.gemv_dispatches(w.shared_router.encoding,s.channels,1));
+    const uint32_t max_batch_rows = grouped_nax ? 2048u : 512u;
+    const uint64_t route_dispatches = (g.prefill_batch_top10() && s.experts <= 512 && n >= 2 && n <= max_batch_rows) ? 1ull : uint64_t(n);
+    const uint64_t shared_router_dispatches = uint64_t(n) * g.gemv_dispatches(w.shared_router.encoding, s.channels, 1);
+    const uint64_t mixture_dispatches = (g.prefill_batch_mixture() && s.channels <= 2560 && n >= 2 && n <= max_batch_rows) ? 1ull : uint64_t(n);
+    return fixed + router + route_dispatches + shared_router_dispatches + mixture_dispatches;
 }
 void encode_moe_mm_many(MetalGraph& g,const MoeWeights& w,const MoeMmManyScratch& s,GpuRowsF32 input,GpuRowsF32 output,MoeShape shape,RouterMode mode,bool normalise,MoeMmLayouts l){
     const bool grouped_nax =
@@ -157,15 +162,28 @@ void encode_moe_mm_many(MetalGraph& g,const MoeWeights& w,const MoeMmManyScratch
         }else
 #endif
         {
+            const uint32_t max_batch_rows = grouped_nax ? 2048u : 512u;
+            const bool use_batch_top10 = g.prefill_batch_top10() && shape.experts <= 512 && n >= 2 && n <= max_batch_rows;
+            const bool top10_fallback = g.prefill_batch_top10() && !use_batch_top10;
+            const bool use_batch_mixture = g.prefill_batch_mixture() && shape.channels <= 2560 && n >= 2 && n <= max_batch_rows;
+            const bool mixture_fallback = g.prefill_batch_mixture() && !use_batch_mixture;
             bool router_batched=false;
 #ifdef TOKSPUR_PRIVATE_MOE_ROUTER_F32_BATCH
             router_batched=g.moe_router_f32_batch_enabled() && shape.channels==2560 && shape.experts==512 && n>1 && n<=512;
             if(router_batched){g.moe_router_f32_batch(w.router.view,input,rows(active(g,s.rows.logits,shape.experts,n),n,shape.experts));
                 TOKSPUR_OPERATOR_CHECKPOINT(g,"moe","router_f32_batched",{n,shape.channels,shape.experts,shape.selected});}
 #endif
-            for(uint32_t t=0;t<n;++t){const auto r=token(g,s.rows,shape,t);if(!router_batched)g.gemv(0,w.router.view,one(g,input.view,input.stride_bytes,uint64_t(shape.channels)*4,t),r.logits,shape.channels,shape.experts);g.route(r.logits,r.indices,r.weights,shape.selected,mode,normalise);}
-            if(router_batched){TOKSPUR_OPERATOR_CHECKPOINT(g,"moe","topk_after_batched_router",{n,shape.experts,shape.selected,0});}
-            else{TOKSPUR_OPERATOR_CHECKPOINT(g,"moe","router_f32_and_topk_interleaved",{n,shape.channels,shape.experts,shape.selected});}
+            // Rows are independent: every projection, then every top-k, so a concurrent batch needs one barrier here instead of one per row.
+            if(!router_batched)g.gemv_rows(0,w.router.view,input,rows(active(g,s.rows.logits,shape.experts,n),n,shape.experts));
+            if (use_batch_top10) {
+                g.prefill_route_batch(active(g, s.rows.logits, shape.experts, n), active(g, s.rows.indices, shape.selected, n), active(g, s.rows.weights, shape.selected, n), shape.experts, shape.selected, n, mode, normalise);
+                TOKSPUR_OPERATOR_CHECKPOINT(g, "moe", "topk_batched_after_scalar_router", {n, shape.experts, shape.selected, 0});
+            } else {
+                for(uint32_t t=0;t<n;++t){const auto r=token(g,s.rows,shape,t);g.route(r.logits,r.indices,r.weights,shape.selected,mode,normalise);}
+                if(router_batched){TOKSPUR_OPERATOR_CHECKPOINT(g,"moe","topk_after_batched_router",{n,shape.experts,shape.selected,0});}
+                else{TOKSPUR_OPERATOR_CHECKPOINT(g,"moe","router_f32_and_topk_interleaved",{n,shape.channels,shape.experts,shape.selected});}
+            }
+            g.record_prefill_moe_chunk(n, use_batch_top10, top10_fallback, use_batch_mixture, mixture_fallback);
         }
 #ifdef TOKSPUR_PRIVATE_ROUTE_ATTRIBUTION
         g.route_attribution_rows(w.router.view,input,active(g,s.rows.logits,shape.experts,n),active(g,s.rows.indices,shape.selected,n),active(g,s.rows.weights,shape.selected,n),shape.selected,mode,normalise);
@@ -250,9 +268,16 @@ void encode_moe_mm_many(MetalGraph& g,const MoeWeights& w,const MoeMmManyScratch
         }else
 #endif
         {
-            for(uint32_t t=0;t<n;++t){const auto r=token(g,s.rows,shape,t);g.gemv(0,w.shared_router.view,one(g,input.view,input.stride_bytes,uint64_t(shape.channels)*4,t),r.shared_logit,shape.channels,1);g.mixture(r.down,r.weights,r.shared_down,r.shared_logit,one(g,output.view,output.stride_bytes,uint64_t(shape.channels)*4,t));}
-
-            TOKSPUR_OPERATOR_CHECKPOINT(g,"moe","shared_router_f32_and_mixture_interleaved",{n,shape.channels,shape.selected,0});
+            const uint32_t max_batch_rows = grouped_nax ? 2048u : 512u;
+            const bool use_batch_mixture = g.prefill_batch_mixture() && shape.channels <= 2560 && n >= 2 && n <= max_batch_rows;
+            g.gemv_rows(0,w.shared_router.view,input,rows(active(g,s.rows.shared_logit,1,n),n,1));
+            if (use_batch_mixture) {
+                g.prefill_mixture_batch(active(g, s.rows.down, uint64_t(shape.selected) * shape.channels, n), active(g, s.rows.weights, shape.selected, n), active(g, s.rows.shared_down, shape.channels, n), active(g, s.rows.shared_logit, 1, n), output, shape.selected);
+                TOKSPUR_OPERATOR_CHECKPOINT(g, "moe", "shared_router_f32_and_mixture_batched", {n, shape.channels, shape.selected, 0});
+            } else {
+                for(uint32_t t=0;t<n;++t){const auto r=token(g,s.rows,shape,t);g.mixture(r.down,r.weights,r.shared_down,r.shared_logit,one(g,output.view,output.stride_bytes,uint64_t(shape.channels)*4,t));}
+                TOKSPUR_OPERATOR_CHECKPOINT(g,"moe","shared_router_f32_and_mixture_interleaved",{n,shape.channels,shape.selected,0});
+            }
         }
     }catch(...){try{g.abort();}catch(const FormatError&){}throw;}
 }

@@ -46,6 +46,60 @@ fn reset_peers_do_not_remove_the_listener() {
 }
 
 #[test]
+fn non_loopback_peers_do_not_remove_the_listener() {
+    use std::io::Write;
+    use std::net::{IpAddr, TcpStream, UdpSocket};
+    use std::time::{Duration, Instant};
+    use tokspur_server::http::{Limits, Listener};
+
+    // A UDP connect picks the host's outbound address without sending anything.
+    let Some(local) = UdpSocket::bind(("0.0.0.0", 0))
+        .and_then(|socket| socket.connect(("192.0.2.1", 9)).map(|()| socket))
+        .and_then(|socket| socket.local_addr())
+        .ok()
+        .map(|address| address.ip())
+        .filter(|ip| matches!(ip, IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified()))
+    else {
+        return;
+    };
+    let listener = Listener::new(0, 8).unwrap();
+    // std cannot choose a source address, so BSD nc connects from the host address to loopback.
+    let Ok(mut outside) = std::process::Command::new("/usr/bin/nc")
+        .args([
+            "-s",
+            &local.to_string(),
+            "127.0.0.1",
+            &listener.port().to_string(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    match listener.accept(
+        Instant::now() + Duration::from_millis(500),
+        Limits::default(),
+    ) {
+        Ok(_) => panic!("a non-loopback peer was accepted"),
+        Err(error) => assert_eq!(error.status(), 408, "{error}"),
+    }
+    let _cleanup_kill = outside.kill();
+    let _cleanup_wait = outside.wait();
+    let mut peer = TcpStream::connect(("127.0.0.1", listener.port())).unwrap();
+    peer.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut connection = listener
+        .accept(Instant::now() + Duration::from_secs(1), Limits::default())
+        .unwrap();
+    let request = connection
+        .read_request(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(request.path, "/health");
+}
+
+#[test]
 fn measured_sampling_is_checked_before_submission() {
     use tokspur_server::admission::validate_calibrated_sampling;
     let ready = json(

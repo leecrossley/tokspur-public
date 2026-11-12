@@ -1,6 +1,9 @@
 #include "grouped_mm_fixture.hpp"
 #include "tokspur/moe_mm_many.hpp"
 #include "tokspur/metal.hpp"
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
+#include "tokspur/verify_nax.hpp"
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -98,6 +101,10 @@ void exercise(const char* library,MoeShape shape,uint32_t n,uint32_t gate_type,u
         auto b=g.submit();need(b.dispatches==ordinary_dispatches,"ordinary row-by-row dispatch count");
         g.begin();encode_moe_mm_many(g,weights,candidate,in,out,shape,mode,true);b=g.submit();
         need(b.dispatches==moe_mm_many_dispatches(g,weights,shape,n) && g.memory().allocations==ledger.allocations && g.memory().live_bytes==ledger.live_bytes,"MoE deterministic dispatch/no-encode-allocation invariant");
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+        // Rows are independent, so barriers follow the operator stages. One per row would serialise every router and mixture dispatch.
+        if(concurrent){std::cout<<"MoE concurrent barriers="<<g.concurrent_barriers()<<" rows="<<n<<std::endl;need(g.concurrent_barriers()<std::max(n,64u),"MoE rows serialised by per-row barriers");}
+#endif
         const auto got=read(g,y),owned=read(g,baseline);std::vector<float> active;std::vector<double> expected,half_reference;const std::array<Matrix*,6> matrices{&gate_w,&up_w,&down_w,&shared_gate,&shared_up,&shared_down};
         const auto route_bytes=uint64_t(n)*shape.selected*4;
         need(g.read(g.slice(candidate.rows.indices,0,route_bytes))==g.read(g.slice(control.rows.indices,0,route_bytes)) && g.read(g.slice(candidate.rows.weights,0,route_bytes))==g.read(g.slice(control.rows.weights,0,route_bytes)),"unchanged router IDs and weights");
@@ -410,9 +417,269 @@ void cpu_controls(){
     need(difference.maximum<=scaled_limit && difference.l2<=relative_l2_limit,"prospective CPU raw/half generated domain screen");
     std::cout<<"PASS CPU generated MoE checks="<<checks<<" raw_half_scaled="<<difference.maximum<<" raw_half_relative_l2="<<difference.l2<<" no Metal/model execution\n";
 }
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
+void verify_nax_top10_mixture_controls(const char* library) {
+    MetalGraph g(library, 256ull << 20); Arena a{g, {}};
+    g.configure_small_gemv(16); g.configure_block_gemv(3);
+    g.configure_verify_nax(true); g.configure_verify_nax_m8(true);
+    // No prefill configuration or prepare_moe_mm_many: verification owns preparation.
+    constexpr MoeShape shape{64, 32, 16, 4};
+    constexpr uint32_t capacity = 8;
+    constexpr float poison = -7654.25f;
+    auto gate_w = make_matrix(a, 8, shape.channels, shape.hidden, shape.experts, 44);
+    auto up_w = make_matrix(a, 8, shape.channels, shape.hidden, shape.experts, 45);
+    auto down_w = make_matrix(a, 8, shape.hidden, shape.channels, shape.experts, 46);
+    auto shared_gate = make_matrix(a, 8, shape.channels, shape.hidden, 1, 47);
+    auto shared_up = make_matrix(a, 8, shape.channels, shape.hidden, 1, 48);
+    auto shared_down = make_matrix(a, 8, shape.hidden, shape.channels, 1, 49);
+    std::vector<float> router(shape.channels * shape.experts), shared_router(shape.channels);
+    for (uint32_t e = 0; e < shape.experts; ++e) router[e * shape.channels] = float(e) / 16;
+    shared_router[0] = 0.25f;
+    const MoeWeights weights{{a.floats(router), 0}, gate_w.gpu, up_w.gpu, down_w.gpu,
+        shared_gate.gpu, shared_up.gpu, shared_down.gpu, {a.floats(shared_router), 0}};
+    const auto scratch = allocate_moe_mm_many_scratch(g, shape, capacity);
+    const auto control = allocate_moe_mm_many_scratch(g, shape, capacity);
+    std::vector<float> input(capacity * shape.channels, 0.125f), output(capacity * shape.channels + 16, poison);
+    for (uint32_t t = 0; t < capacity; ++t) input[t * shape.channels] = t % 2 ? -0.5f : 0.5f;
+    const auto x = a.floats(input, false), y = a.floats(output, false), baseline = a.floats(output, false);
+    const std::array layouts{std::pair{8u, PrefillWeightLayout::gguf}};
+    g.prepare_verify_nax(layouts);
+    static_cast<void>(g.configure_profiling(128)); // Kernel selection proof only, no timing assertion.
+    const auto ledger = g.memory();
+    const auto check_counts = [&](VerifyNaxTop10MixtureTelemetry before, VerifyNaxTop10MixtureTelemetry after, uint32_t n) {
+        const bool enabled = verify_nax_batch_top10_mixture_enabled;
+        need(after.top10_batched_calls - before.top10_batched_calls == (enabled ? 1u : 0u) &&
+            after.top10_batched_rows - before.top10_batched_rows == (enabled ? n : 0u) &&
+            after.top10_scalar_calls - before.top10_scalar_calls == (enabled ? 0u : n) &&
+            after.mixture_batched_calls - before.mixture_batched_calls == (enabled ? 1u : 0u) &&
+            after.mixture_batched_rows - before.mixture_batched_rows == (enabled ? n : 0u) &&
+            after.mixture_scalar_calls - before.mixture_scalar_calls == (enabled ? 0u : n),
+            "verification-only accounting disagrees with selected dispatches");
+    };
+    const auto slice = [&](GpuView v, uint32_t row, uint64_t width) { return g.slice(v, uint64_t(row) * width * 4, width * 4); };
+    try {
+        for (uint32_t n = 2; n <= 8; ++n) for (auto mode : {RouterMode::softmax, RouterMode::sigmoid}) for (bool normalise : {false, true}) {
+            g.write(y, std::as_bytes(std::span(output))); g.write(baseline, std::as_bytes(std::span(output)));
+            // Production computes this before entering VerifyNaxScopeGuard.
+            const auto expected = verify_nax_moe_dispatches(g, weights, shape, n);
+            const auto before = g.verify_nax_top10_mixture_telemetry();
+            {
+                VerifyNaxScopeGuard scope(g, true, true);
+                need(expected == verify_nax_moe_dispatches(g, weights, shape, n), "verify batch estimator depends on transient scope");
+                g.begin();
+                encode_verify_nax_moe(g, weights, scratch.rows, {}, x, y, shape, mode, normalise, n);
+                const auto result = g.submit();
+                need(result.dispatches == expected, "verify batch encoder/estimator disagreement");
+                g.record_prefill_moe_chunk(n, true, false, true, false);
+            }
+            const auto profile = g.last_profile();
+            const auto count = [&](const char* kernel) { return uint64_t(std::count_if(profile.kernels.begin(), profile.kernels.end(), [&](const auto& k) { return k.kernel == kernel; })); };
+            const bool enabled = verify_nax_batch_top10_mixture_enabled;
+            need(count("graph_route_batch") == (enabled ? 1 : 0) && count("graph_route") == (enabled ? 0 : n), "verify top10 selected kernel count");
+            need(count("graph_mixture_batch") == (enabled ? 1 : 0) && count("graph_mixture") == (enabled ? 0 : n), "verify mixture selected kernel count");
+            const auto after = g.verify_nax_top10_mixture_telemetry();
+            check_counts(before, after, n);
+            need(g.prefill_top10_mixture_telemetry().moe_batch_calls == 0, "verification polluted prefill counters");
+            // Compare the exact scalar operators on the encoded projection results.
+            g.begin();
+            for (uint32_t t = 0; t < n; ++t) {
+                g.route(slice(scratch.rows.logits, t, shape.experts), slice(control.rows.indices, t, shape.selected),
+                    slice(control.rows.weights, t, shape.selected), shape.selected, mode, normalise);
+                g.mixture(slice(scratch.rows.down, t, shape.selected * shape.channels), slice(control.rows.weights, t, shape.selected),
+                    slice(scratch.rows.shared_down, t, shape.channels), slice(scratch.rows.shared_logit, t, 1), slice(baseline, t, shape.channels));
+            }
+            static_cast<void>(g.submit());
+            need(g.read(g.slice(scratch.rows.indices, 0, uint64_t(n) * shape.selected * 4)) == g.read(g.slice(control.rows.indices, 0, uint64_t(n) * shape.selected * 4)), "verify top10 IDs differ from scalar");
+            need(g.read(g.slice(scratch.rows.weights, 0, uint64_t(n) * shape.selected * 4)) == g.read(g.slice(control.rows.weights, 0, uint64_t(n) * shape.selected * 4)), "verify top10 weights differ from scalar");
+            need(g.read(y) == g.read(baseline), "verify mixture output or inactive canary differs from scalar");
+            for (float value : read(g, y)) need(std::isfinite(value), "nonfinite valid verification output");
+            need(g.memory().allocations == ledger.allocations && g.memory().live_bytes == ledger.live_bytes, "verify batch encode allocated scratch");
+            need(g.verify_nax_top10_mixture_telemetry().top10_scalar_calls == after.top10_scalar_calls &&
+                g.verify_nax_top10_mixture_telemetry().mixture_scalar_calls == after.mixture_scalar_calls,
+                "ordinary scalar reference polluted verification counters");
+        }
+        refuses([&] { g.record_verify_nax_moe_ops(8, true, false); });
+        {
+            VerifyNaxScopeGuard scope(g, true, true);
+            g.set_mtp_priming_scope(true);
+            refuses([&] { g.record_verify_nax_moe_ops(8, true, false); });
+            g.set_mtp_priming_scope(false);
+#ifdef TOKSPUR_PRIVATE_NATIVE_MTP
+            g.set_dflash2_scope(true);
+            refuses([&] { g.record_verify_nax_moe_ops(8, false, false); });
+            g.set_dflash2_scope(false);
+#endif
+        }
+        // A failed submission must not clear lifetime counts or poison the valid retry.
+        const auto retry_before = g.read(y);
+        const auto before_failure = g.verify_nax_top10_mixture_telemetry();
+        auto bad = input; bad[shape.channels + 3] = std::numeric_limits<float>::quiet_NaN();
+        g.write(x, std::as_bytes(std::span(bad)));
+        refuses([&] {
+            VerifyNaxScopeGuard scope(g, true, true); g.begin();
+            encode_verify_nax_moe(g, weights, scratch.rows, {}, x, y, shape, RouterMode::sigmoid, true, 8);
+            static_cast<void>(g.submit());
+        });
+        try { g.abort(); } catch (const FormatError&) {}
+        const auto failed = g.verify_nax_top10_mixture_telemetry();
+        check_counts(before_failure, failed, 8);
+        g.write(x, std::as_bytes(std::span(input))); g.write(y, std::as_bytes(std::span(output)));
+        {
+            VerifyNaxScopeGuard scope(g, true, true); g.begin();
+            encode_verify_nax_moe(g, weights, scratch.rows, {}, x, y, shape, RouterMode::sigmoid, true, 8);
+            static_cast<void>(g.submit());
+        }
+        need(g.read(y) == retry_before, "verify batching valid retry changed output/canaries");
+        const auto retried = g.verify_nax_top10_mixture_telemetry();
+        check_counts(failed, retried, 8);
+    } catch (...) {
+        try { g.abort(); } catch (const FormatError&) {}
+        release_moe_mm_many_scratch(g, scratch); release_moe_mm_many_scratch(g, control); throw;
+    }
+    release_moe_mm_many_scratch(g, scratch); release_moe_mm_many_scratch(g, control);
+    std::cout << "PASS verify_nax_top10_mixture_controls enabled=" << verify_nax_batch_top10_mixture_enabled << " checks=" << checks << '\n';
+}
+#endif
+void prefill_top10_mixture_controls(const char* library){
+    MetalGraph g(library,1536ull<<20);Arena a{g,{}};
+    g.configure_small_gemv(16);g.configure_block_gemv(3);g.configure_prefill_dense_f32(true);g.configure_prefill_dense_nax(true);g.configure_prefill_grouped_f32(true);g.configure_prefill_grouped_nax(true);
+    g.prepare_prefill_top10_mixture();
+    const bool b_top10 = g.prefill_batch_top10();
+    const bool b_mix = g.prefill_batch_mixture();
+    std::cout<<"prefill_top10_mixture_controls batch_top10="<<b_top10<<" batch_mixture="<<b_mix<<std::endl;
+    constexpr uint32_t c=2560,e=512,selected_k=10,capacity=2048;
+    constexpr uint64_t xs=c*4+32;
+    std::vector<float> logits_host(uint64_t(capacity)*e),down_rows(uint64_t(capacity)*selected_k*c),shared_down_rows(uint64_t(capacity)*c),slogit_host(capacity);
+    uint32_t rng=44;
+    for(uint32_t t=0;t<capacity;++t){
+        slogit_host[t]=float(int((rng=rng*1664525u+1013904223u)%1993)-996)/997;
+        for(uint32_t ex=0;ex<e;++ex){
+            rng=rng*1664525u+1013904223u;
+            logits_host[uint64_t(t)*e+ex]=float(int(rng%1993)-996)/997;
+        }
+    }
+    // Inject deterministic tie patterns in rows 0, 1, 2:
+    // Row 0: all 512 experts tied at 0.0f -> must select 0..9
+    for(uint32_t ex=0;ex<e;++ex)logits_host[ex]=0.0f;
+    // Row 1: 4-way ties across SIMD groups (ex, ex+128, ex+256, ex+384)
+    for(uint32_t ex=0;ex<128;++ex){
+        const float val = float(128 - int(ex)) / 64.0f;
+        logits_host[e + ex] = val;
+        logits_host[e + ex + 128] = val;
+        logits_host[e + ex + 256] = val;
+        logits_host[e + ex + 384] = val;
+    }
+    // Row 2: negative ties
+    for(uint32_t ex=0;ex<e;++ex)logits_host[2*e + ex] = (ex % 17 == 0) ? -1.5f : -12.5f;
+    for(auto& v:down_rows){rng=rng*1664525u+1013904223u;v=float(int(rng%1993)-996)/997/16;}
+    for(auto& v:shared_down_rows){rng=rng*1664525u+1013904223u;v=float(int(rng%1993)-996)/997/16;}
+    const auto packed_logits=a.floats(logits_host);
+    const auto down_gpu=a.floats(down_rows),shared_down_gpu=a.floats(shared_down_rows),all_slogit=a.floats(slogit_host);
+    std::vector<float> poison_routes(uint64_t(capacity)*selected_k+16,-1234.5f),poison_out(uint64_t(capacity)*(xs/4)+16,-7654.25f);
+    const auto all_ids=a.floats(poison_routes,false),old_ids=a.floats(poison_routes,false);
+    const auto all_weights=a.floats(poison_routes,false),old_weights=a.floats(poison_routes,false);
+    const auto all_mix=a.floats(poison_out,false),old_mix=a.floats(poison_out,false);
+
+    for(uint32_t n:{2u,3u,4u,5u,6u,7u,8u,16u,17u,31u,32u,33u,511u,512u,2048u}){
+        for(auto mode:{RouterMode::softmax,RouterMode::sigmoid})for(bool normalise:{false,true}){
+            g.write(all_ids,std::as_bytes(std::span(poison_routes)));
+            g.write(old_ids,std::as_bytes(std::span(poison_routes)));
+            g.write(all_weights,std::as_bytes(std::span(poison_routes)));
+            g.write(old_weights,std::as_bytes(std::span(poison_routes)));
+            g.begin();for(uint32_t t=0;t<n;++t)g.route(g.slice(packed_logits,uint64_t(t)*e*4,e*4),g.slice(old_ids,uint64_t(t)*selected_k*4,selected_k*4),g.slice(old_weights,uint64_t(t)*selected_k*4,selected_k*4),selected_k,mode,normalise);const auto rscalar=g.submit();
+            need(rscalar.dispatches==n,"scalar route dispatch count");
+            if(b_top10){
+                const auto ledger=g.memory();
+                g.begin();g.prefill_route_batch(g.slice(packed_logits,0,uint64_t(n)*e*4),g.slice(all_ids,0,uint64_t(n)*selected_k*4),g.slice(all_weights,0,uint64_t(n)*selected_k*4),e,selected_k,n,mode,normalise);const auto rbatch=g.submit();
+                need(rbatch.dispatches==1 && g.memory().allocations==ledger.allocations && g.memory().live_bytes==ledger.live_bytes,"prefill_route_batch single dispatch/no-allocation");
+                need(g.read(all_ids)==g.read(old_ids) && g.read(all_weights)==g.read(old_weights),"prefill_route_batch byte-identical IDs/weights/tail-padding to scalar route");
+                const auto tied=g.read(g.slice(all_ids,0,selected_k*4));
+                for(uint32_t j=0;j<selected_k;++j){uint32_t id=0;std::memcpy(&id,tied.data()+j*4,4);need(id==j,"prefill_route_batch exact tie selects lowest ID");}
+            }
+        }
+        g.write(all_mix,std::as_bytes(std::span(poison_out)));
+        g.write(old_mix,std::as_bytes(std::span(poison_out)));
+        g.begin();for(uint32_t t=0;t<n;++t)g.mixture(g.slice(down_gpu,uint64_t(t)*selected_k*c*4,uint64_t(selected_k)*c*4),g.slice(old_weights,uint64_t(t)*selected_k*4,selected_k*4),g.slice(shared_down_gpu,uint64_t(t)*c*4,c*4),g.slice(all_slogit,uint64_t(t)*4,4),g.slice(old_mix,uint64_t(t)*xs,c*4));const auto mscalar=g.submit();
+        need(mscalar.dispatches==n,"scalar mixture dispatch count");
+        if(b_mix){
+            const auto ledger=g.memory();
+            g.begin();g.prefill_mixture_batch(g.slice(down_gpu,0,uint64_t(n)*selected_k*c*4),g.slice(old_weights,0,uint64_t(n)*selected_k*4),g.slice(shared_down_gpu,0,uint64_t(n)*c*4),g.slice(all_slogit,0,uint64_t(n)*4),{all_mix,n,c,xs},selected_k);const auto mbatch=g.submit();
+            need(mbatch.dispatches==1 && g.memory().allocations==ledger.allocations && g.memory().live_bytes==ledger.live_bytes,"prefill_mixture_batch single dispatch/no-allocation");
+            need(g.read(all_mix)==g.read(old_mix),"prefill_mixture_batch byte-identical output/strided-padding/tail-padding to scalar mixture");
+        }
+    }
+    // Sticky error flag checks for non-finite inputs
+    if(b_top10){
+        auto bad_logits=logits_host;bad_logits[e+7]=std::numeric_limits<float>::quiet_NaN();
+        const auto bad_l_gpu=a.floats(bad_logits);
+        refuses([&]{g.begin();g.prefill_route_batch(g.slice(bad_l_gpu,0,4ull*e*4),g.slice(all_ids,0,4ull*selected_k*4),g.slice(all_weights,0,4ull*selected_k*4),e,selected_k,4,RouterMode::softmax,true);static_cast<void>(g.submit());});
+        try{g.abort();}catch(const FormatError&){}
+    }
+    if(b_mix){
+        auto bad_slogit=slogit_host;bad_slogit[2]=std::numeric_limits<float>::infinity();
+        const auto bad_sl_gpu=a.floats(bad_slogit);
+        refuses([&]{g.begin();g.prefill_mixture_batch(g.slice(down_gpu,0,4ull*selected_k*c*4),g.slice(old_weights,0,4ull*selected_k*4),g.slice(shared_down_gpu,0,4ull*c*4),g.slice(bad_sl_gpu,0,4ull*4),{all_mix,4,c,xs},selected_k);static_cast<void>(g.submit());});
+        try{g.abort();}catch(const FormatError&){}
+    }
+    // Full encode_moe_mm_many check across n = {1, 2, 3, 16, 17, 512, 2048}
+    const MoeShape shape{2560,64,512,10};
+    const auto s_cand=allocate_moe_mm_many_scratch(g,shape,2048,true);
+    try{
+        auto gate_w=make_matrix(a,12,shape.channels,shape.hidden,shape.experts,44),up_w=make_matrix(a,13,shape.channels,shape.hidden,shape.experts,45),down_w=make_matrix(a,7,shape.hidden,shape.channels,shape.experts,46);
+        auto sg_w=make_matrix(a,8,shape.channels,shape.hidden,1,47),su_w=make_matrix(a,8,shape.channels,shape.hidden,1,48),sd_w=make_matrix(a,8,shape.hidden,shape.channels,1,49);
+        std::vector<float> router(uint64_t(shape.channels)*shape.experts),shared(shape.channels);
+        for(auto& v:router){rng=rng*1664525u+1013904223u;v=float(int(rng%1993)-996)/997/256;}
+        for(auto& v:shared){rng=rng*1664525u+1013904223u;v=float(int(rng%1993)-996)/997/64;}
+        const MoeWeights w_cand{{a.floats(router),0},gate_w.gpu,up_w.gpu,down_w.gpu,sg_w.gpu,su_w.gpu,sd_w.gpu,{a.floats(shared),0}};
+        prepare_moe_mm_many(g,w_cand,shape);
+        const uint64_t stride=uint64_t(shape.channels)*4;
+        std::vector<float> input(uint64_t(2048)*shape.channels,-9876.25f),poison(input.size()+16,-7654.25f);
+        for(auto& v:input){rng=rng*1664525u+1013904223u;v=float(int(rng%1993)-996)/997;}
+        const auto x_in=a.floats(input),y_out=a.floats(poison,false);
+        const auto fnv1a=[](std::span<const std::byte> bytes){
+            uint64_t h=14695981039346656037ull;
+            for(auto b:bytes){h^=uint64_t(std::to_integer<uint8_t>(b));h*=1099511628211ull;}
+            return h;
+        };
+        for(uint32_t n:{1u,2u,3u,16u,17u,512u,2048u}){
+            g.write(y_out,std::as_bytes(std::span(poison)));
+            g.reset_prefill_top10_mixture_telemetry();
+            g.begin();encode_moe_mm_many(g,w_cand,s_cand,{x_in,n,shape.channels,stride},{y_out,n,shape.channels,stride},shape,RouterMode::softmax,true);const auto b=g.submit();
+            const auto expected_d=moe_mm_many_dispatches(g,w_cand,shape,n);
+            need(b.dispatches==expected_d,"encode_moe_mm_many dispatch contract across n");
+            const auto tel=g.prefill_top10_mixture_telemetry();
+            need(tel.moe_batch_calls==1 && tel.moe_batch_rows==n && tel.moe_batch_min_rows==n && tel.moe_batch_max_rows==n,"telemetry batch width accounting");
+            if(n==1){
+                need(tel.top10_batched_calls==0 && tel.top10_scalar_calls==1 && tel.top10_fallbacks==(b_top10?1u:0u),"N=1 top10 fallback accounting");
+                need(tel.mixture_batched_calls==0 && tel.mixture_scalar_calls==1 && tel.mixture_fallbacks==(b_mix?1u:0u),"N=1 mixture fallback accounting");
+            }else{
+                need(tel.top10_batched_calls==(b_top10?1u:0u) && tel.top10_batched_rows==(b_top10?n:0u) && tel.top10_scalar_calls==(b_top10?0u:n) && tel.top10_fallbacks==0,"N>=2 top10 batch accounting");
+                need(tel.mixture_batched_calls==(b_mix?1u:0u) && tel.mixture_batched_rows==(b_mix?n:0u) && tel.mixture_scalar_calls==(b_mix?0u:n) && tel.mixture_fallbacks==0,"N>=2 mixture batch accounting");
+            }
+            const auto out_fnv=fnv1a(g.read(y_out));
+            const auto ids_fnv=fnv1a(g.read(g.slice(s_cand.rows.indices,0,uint64_t(n)*shape.selected*4)));
+            const auto wts_fnv=fnv1a(g.read(g.slice(s_cand.rows.weights,0,uint64_t(n)*shape.selected*4)));
+            std::cout<<"encode_moe_mm_many N="<<n<<" dispatches="<<b.dispatches<<" top10_batched="<<tel.top10_batched_calls<<" mix_batched="<<tel.mixture_batched_calls<<" fallbacks="<<(tel.top10_fallbacks+tel.mixture_fallbacks)<<" out_fnv="<<std::hex<<out_fnv<<" ids_fnv="<<ids_fnv<<" wts_fnv="<<wts_fnv<<std::dec<<std::endl;
+        }
+    }catch(...){try{g.abort();}catch(const FormatError&){}release_moe_mm_many_scratch(g,s_cand);throw;}
+    release_moe_mm_many_scratch(g,s_cand);
+    std::cout<<"PASS prefill_top10_mixture_controls checks="<<checks<<std::endl;
+}
 }
 int main(int argc,char** argv){try{
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
+    if (argc == 3 && std::string(argv[1]) == "--execute-verify-nax-top10-mixture-controls" && argv[2][0] == '/') {
+        need(host_thermal_state() == 0, "verify batching controls require a coordinated nominal GPU window");
+        verify_nax_top10_mixture_controls(argv[2]); return 0;
+    }
+#endif
+
     if(argc==2 && std::string(argv[1])=="--check-generated-cpu"){cpu_controls();return 0;}
+    if(argc==3 && std::string(argv[1])=="--execute-prefill-top10-mixture-controls" && argv[2][0]=='/'){
+        while(host_thermal_state()!=0){std::cerr<<"waiting for nominal thermal state\n";std::this_thread::sleep_for(std::chrono::seconds(5));}
+        prefill_top10_mixture_controls(argv[2]);
+        return 0;
+    }
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
     if(argc==3 && std::string(argv[1])=="--execute-f32-routes" && argv[2][0]=='/'){
         need(host_thermal_state()==0,"F32 route scope control requires a coordinated nominal GPU window");
@@ -450,5 +717,11 @@ int main(int argc,char** argv){try{
 #endif
     exercise(argv[2],{256,64,16,10},3,12,7,RouterMode::softmax);exercise(argv[2],{256,64,16,10},512,13,8,RouterMode::sigmoid);
     exercise(argv[2],{2560,640,16,10},3,12,7,RouterMode::sigmoid);exercise(argv[2],{2560,640,16,10},3,13,8,RouterMode::softmax);
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+    // Production channel width, where the shared router is a two-stage GEMV, across more rows than it has partial-sum regions.
+    exercise(argv[2],{2560,64,16,10},130,13,8,RouterMode::softmax,false,true);
+    // Production router geometry, where the 512-expert projection is a single dispatch per row.
+    exercise(argv[2],{2560,32,512,10},130,13,8,RouterMode::softmax,false,true);
+#endif
     std::cout<<"PASS generated full MoE cases="<<cases<<" checks="<<checks<<" D-Cal/state/model/task gates remain open\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

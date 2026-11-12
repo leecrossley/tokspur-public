@@ -34,6 +34,7 @@ void weights(const MoeWeights& w,MoeShape s) {
 }
 GpuView active(MetalGraph& g,GpuView v,uint64_t width,uint32_t steps){return g.slice(v,0,checked_mul(checked_mul(width,steps),4));}
 GpuView row(MetalGraph& g,GpuView v,uint64_t width,uint32_t at){return g.slice(v,uint64_t(at)*width*4,width*4);}
+GpuRowsF32 rows(GpuView v,uint32_t steps,uint32_t width){return {v,steps,width,uint64_t(width)*4};}
 MoeScratch token(MetalGraph& g,const MoeScratch& s,MoeShape shape,uint32_t at) {
     const auto n=counts(shape,1);const auto v=s.views();std::array<GpuView,10> result{};
     for(size_t i=0;i<v.size();++i)result[i]=row(g,v[i],n[i],at);
@@ -75,8 +76,9 @@ void encode_moe_many(MetalGraph& g,const MoeWeights& w,const MoeManyScratch& s,G
         bytes(s.token_map,meta.token_map);bytes(s.counts,meta.counts);bytes(s.tasks,meta.tasks);
         const std::array reads{input,w.router.view,w.gate.view,w.up.view,w.down.view,w.shared_gate.view,w.shared_up.view,w.shared_down.view,w.shared_router.view};
         std::array<GpuView,14> writes{output};const auto all=s.views();std::copy(all.begin(),all.end(),writes.begin()+1);g.validate_disjoint(reads,writes);
-        for(uint32_t t=0;t<steps;++t){const auto r=token(g,s.rows,shape,t);g.gemv(w.router.encoding,w.router.view,row(g,input,shape.channels,t),r.logits,shape.channels,shape.experts);
-            g.route(r.logits,r.indices,r.weights,shape.selected,mode,normalize);}
+        // Rows are independent: every projection, then every top-k, so a concurrent batch needs one barrier here instead of one per row.
+        g.gemv_rows(w.router.encoding,w.router.view,rows(active(g,input,shape.channels,steps),steps,shape.channels),rows(active(g,s.rows.logits,shape.experts,steps),steps,shape.experts));
+        for(uint32_t t=0;t<steps;++t){const auto r=token(g,s.rows,shape,t);g.route(r.logits,r.indices,r.weights,shape.selected,mode,normalize);}
         const auto ids=active(g,s.rows.indices,shape.selected,steps);
 #ifdef TOKSPUR_PRIVATE_ROUTE_LOCK
         g.route_lock_rows(active(g,s.rows.logits,shape.experts,steps),ids,active(g,s.rows.weights,shape.selected,steps),steps,shape.channels,shape.experts,shape.selected);
@@ -91,8 +93,8 @@ void encode_moe_many(MetalGraph& g,const MoeWeights& w,const MoeManyScratch& s,G
         shared(g,w.shared_gate,input,s.rows.shared_gate,shape.channels,shape.hidden,steps);shared(g,w.shared_up,input,s.rows.shared_up,shape.channels,shape.hidden,steps);
         const auto sg=active(g,s.rows.shared_gate,shape.hidden,steps),su=active(g,s.rows.shared_up,shape.hidden,steps);g.swiglu(sg,su,sg);
         shared(g,w.shared_down,s.rows.shared_gate,s.rows.shared_down,shape.hidden,shape.channels,steps);
-        for(uint32_t t=0;t<steps;++t){const auto r=token(g,s.rows,shape,t);g.gemv(w.shared_router.encoding,w.shared_router.view,row(g,input,shape.channels,t),r.shared_logit,shape.channels,1);
-            g.mixture(r.down,r.weights,r.shared_down,r.shared_logit,row(g,output,shape.channels,t));}
+        g.gemv_rows(w.shared_router.encoding,w.shared_router.view,rows(active(g,input,shape.channels,steps),steps,shape.channels),rows(active(g,s.rows.shared_logit,1,steps),steps,1));
+        for(uint32_t t=0;t<steps;++t){const auto r=token(g,s.rows,shape,t);g.mixture(r.down,r.weights,r.shared_down,r.shared_logit,row(g,output,shape.channels,t));}
     }catch(...){try{g.abort();}catch(const FormatError&){}throw;}
 }
 }

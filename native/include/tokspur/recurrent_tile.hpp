@@ -31,7 +31,8 @@ void encode_recurrent_layer_tile(MetalGraph& graph, const RecurrentWeights& weig
     , const MoeManyScratch* grouped_ffn = nullptr, bool reuse_residual_rows512 = false
 #endif
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
-    , const VerifyNaxMoeScratch* verify_nax_moe = nullptr
+    , const VerifyNaxMoeScratch* verify_nax_moe = nullptr,
+    bool input_prenormalized = false, GpuView next_rms_gains = {}, float next_rms_epsilon = 0.0f
 #endif
     );
 // Recover only this layer's GDN matrix/history, from the SAME accepted base.

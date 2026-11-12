@@ -760,9 +760,10 @@ fn history(
                     )?;
                     let parsed;
                     let value = if arguments.kind() == Kind::String {
+                        // The server emits `arguments` from a call of at most 64 KiB, and escaping can grow each byte to six (`\u000a`). Accept everything this server can emit, so a client that echoes it verbatim is not refused on its next turn.
                         parsed = parse_json_limited(
                             arguments.string()?,
-                            JsonLimits::new(65536, 16384, 32),
+                            JsonLimits::new(6 * 65536, 65536, 33),
                         )?;
                         &parsed
                     } else {

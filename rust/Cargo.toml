@@ -55,3 +55,6 @@ undocumented_unsafe_blocks = "deny"
 
 [profile.release]
 debug = 1
+# Cross-crate inlining for the per-token serving path; costs release build time only.
+lto = "thin"
+codegen-units = 1

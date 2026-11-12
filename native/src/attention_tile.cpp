@@ -210,7 +210,8 @@ void encode_attention_layer_tile(MetalGraph& g, const AttentionLayerWeights& w, 
     const QsaCache& cache, GpuView sum, GpuView next, GpuView input, GpuView output, uint32_t base, uint32_t steps,
     AttentionLayerShape shape, QsaPolicy policy, RouterMode router, bool normalize, AttentionTileMode mode, AttentionTileHcMode hc
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
-    , const VerifyNaxMoeScratch* verify_nax_moe
+    , const VerifyNaxMoeScratch* verify_nax_moe,
+    bool input_prenormalized, GpuView next_rms_gains, float next_rms_epsilon
 #endif
     ) {
     try {
@@ -230,10 +231,15 @@ void encode_attention_layer_tile(MetalGraph& g, const AttentionLayerWeights& w, 
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
         use_verify_nax = g.verify_nax_active() && verify_nax_moe && mode == AttentionTileMode::core_and_q8 && steps >= 2 && steps <= 8;
         if (use_verify_nax) {
+            if (next_rms_gains.owner != 0) g.validate_disjoint(std::array{next_rms_gains}, writes);
             std::vector<GpuView> all_protected(protected_reads.begin(), protected_reads.end());
             all_protected.insert(all_protected.end(), writes.begin(), writes.end());
             g.validate_disjoint(all_protected, verify_nax_moe->views());
-            encode_verify_nax_residual_read(g, w.attention_read, s.rows.residual, input, shape.residual, steps, policy.rms_epsilon);
+            if (input_prenormalized) {
+                encode_verify_nax_residual_read_prenorm(g, w.attention_read, s.rows.residual, shape.residual, steps);
+            } else {
+                encode_verify_nax_residual_read(g, w.attention_read, s.rows.residual, input, shape.residual, steps, policy.rms_epsilon);
+            }
             encode_verify_nax_projection(g, w.attention.query_gate, s.rows.residual.input, s.rows.attention.packed, c, 2 * q, steps);
             encode_verify_nax_projection(g, w.attention.key, s.rows.residual.input, s.rows.attention.raw_key, c, k, steps);
             encode_verify_nax_projection(g, w.attention.value, s.rows.residual.input, s.rows.attention.raw_value, c, k, steps);
@@ -361,7 +367,12 @@ void encode_attention_layer_tile(MetalGraph& g, const AttentionLayerWeights& w, 
             TOKSPUR_OPERATOR_CHECKPOINT(g, "dense_q8", "verify_qsa_output", {steps, q, c, 8});
             encode_verify_nax_residual_write_read(g, w.ffn_read, s.rows.residual, input, s.rows.attention_output, s.rows.residual.scales, s.rows.intermediate_streams, shape.residual, steps, policy.rms_epsilon);
             encode_verify_nax_moe(g, w.ffn, s.rows.moe, *verify_nax_moe, s.rows.residual.input, s.rows.ffn_output, shape.moe, router, normalize, steps);
-            encode_verify_nax_residual_write(g, s.rows.intermediate_streams, s.rows.ffn_output, s.rows.residual.scales, output, shape.residual, steps);
+            if (next_rms_gains.owner != 0) {
+                encode_verify_nax_residual_write_rms(g, s.rows.intermediate_streams, s.rows.ffn_output, s.rows.residual.scales,
+                    next_rms_gains, output, s.rows.residual.normalized, shape.residual, steps, next_rms_epsilon);
+            } else {
+                encode_verify_nax_residual_write(g, s.rows.intermediate_streams, s.rows.ffn_output, s.rows.residual.scales, output, shape.residual, steps);
+            }
             return;
         }
 #endif

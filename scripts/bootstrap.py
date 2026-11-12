@@ -573,18 +573,35 @@ def main() -> None:
                 )
             if not api.exists():
                 run([args.python, "-m", "venv", str(ROOT / ".venv")], env=env)
+            # Every downloaded file must match requirements.lock, including the
+            # setuptools build backend, so the editable install builds without
+            # fetching anything.
             run(
                 [
                     str(api),
                     "-m",
                     "pip",
                     "install",
-                    "-c",
-                    str(ROOT / "constraints.txt"),
+                    "--require-hashes",
+                    "--only-binary",
+                    ":all:",
+                    "--no-deps",
+                    "-r",
+                    str(ROOT / "requirements.lock"),
+                ],
+                env=env,
+            )
+            run(
+                [
+                    str(api),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-build-isolation",
+                    "--no-deps",
+                    "--no-index",
                     "-e",
                     str(ROOT),
-                    "pytest",
-                    "ruff",
                 ],
                 env=env,
             )

@@ -99,11 +99,124 @@ SampledSparseLaw make_shortlist_law(uint32_t full_vocab, std::span<const uint32_
     return SampledSparseLaw::from_grid_units(full_vocab, std::span(ids).first(out_n), std::span(units).first(out_n));
 }
 
+void test_q8_slice_lifetime(const char* metallib) {
+    constexpr uint32_t columns = 256u, rows = 256u, row_bytes = columns / 32u * 34u;
+    for (const auto layout : {PrefillWeightLayout::gguf, PrefillWeightLayout::q8_lanes_v1}) {
+        for (const bool late : {false, true}) {
+            MetalGraph g(metallib, 256ull << 20);
+            g.configure_verify_nax(true); g.configure_verify_nax_m8(true);
+            check(g.configure_profiling(1) != ProfileMode::disabled, "slice route proof requires profiling support");
+            const auto prepare = [&] { g.prepare_verify_nax({}); g.prepare_dflash2(); };
+            if (late) prepare();
+            std::vector<std::byte> raw(uint64_t(rows) * row_bytes);
+            for (uint32_t row = 0; row < rows; ++row) for (uint32_t block = 0; block < columns / 32u; ++block) {
+                const size_t at = uint64_t(row) * row_bytes + block * 34u;
+                const uint16_t scale = f32_to_f16_bits(0.0078125f);
+                std::memcpy(raw.data() + at, &scale, 2);
+                for (uint32_t c = 0; c < 32u; ++c)
+                    raw[at + 2u + c] = std::byte(uint8_t(int((row * 7u + block * 3u + c) % 17u) - 8));
+            }
+            auto payload = raw;
+            if (layout == PrefillWeightLayout::q8_lanes_v1) lanes::pack_rows(lanes::row_layout(8u, columns), raw, payload);
+            const auto before_source = g.memory().live_bytes;
+            const auto parent = g.upload(payload, "cache policy first draft parent", true);
+            const auto second_parent = g.upload(payload, "cache policy replacement draft parent", true);
+            const auto source_charge = g.memory().live_bytes - before_source;
+            const auto register_source = [&](GpuView view) {
+                if (layout == PrefillWeightLayout::q8_lanes_v1) g.register_lane_matrix(view, {8u, columns, rows, 1u});
+                else g.register_q8_matrix(view, columns, rows);
+            };
+            // Late registration is after pipeline preparation, still before the first submission.
+            // Upload both parents before registration can eagerly allocate cache copies.
+            register_source(parent);
+            register_source(second_parent);
+            auto borrowed = g.suballocate_draft_output_slice(parent, 128u, columns);
+            if (!late) {
+                const auto pending = g.q8_tile64_cache_stats();
+                check(pending.registered_candidates == 2 && !pending.owning_allocations && !pending.aliases,
+                      "unprepared draft source created copies or aliases");
+                prepare();
+            }
+            const auto check_cache = [&](uint64_t sources, uint64_t aliases) {
+                const auto s = g.q8_tile64_cache_stats();
+                check(s.enabled == q8_tile64_cache_enabled && s.registered_candidates == sources &&
+                      s.registered_source_bytes == sources * payload.size(), "draft source registration identity differs");
+                check(s.owning_allocations == (q8_tile64_cache_enabled ? sources : 0u) &&
+                      s.aliases == (q8_tile64_cache_enabled ? aliases : 0u), "draft owner/alias lifecycle differs");
+                check(s.covered_candidates == (q8_tile64_cache_enabled ? sources : 0u) &&
+                      s.omitted_candidates == (q8_tile64_cache_enabled ? 0u : sources), "draft cache coverage differs");
+                check(s.owned_logical_bytes == (q8_tile64_cache_enabled ? sources * q8_tile64_repack_bytes(columns, rows) : 0u),
+                      "draft alias changed distinct-owner logical byte accounting");
+                check(q8_tile64_cache_enabled ? s.owned_charged_bytes >= s.owned_logical_bytes : !s.owned_charged_bytes,
+                      "disabled draft cache retained charged storage");
+                if (!sources) check(!s.owned_charged_bytes && !s.candidate_repack_logical_bytes && !s.omitted_repack_logical_bytes,
+                                    "released draft source retained byte accounting");
+            };
+            check_cache(2, 1);
+            const auto prepared_bytes = g.memory().live_bytes - source_charge - g.q8_tile64_cache_stats().owned_charged_bytes;
+            std::vector<float> x(columns);
+            for (uint32_t c = 0; c < columns; ++c) x[c] = float(int(c % 19u) - 9) / 64.0f;
+            const auto input = g.upload(std::as_bytes(std::span(x)), "draft slice input", true);
+            const auto output = g.zeros(128u * sizeof(float), "draft slice output");
+            const auto check_projection = [&](GpuView view, uint32_t count) {
+                check(g.prefill_weight_layout(view) == layout, "borrowed draft view lost source layout");
+                const auto live = g.memory();
+                g.set_dflash2_scope(true); g.begin();
+                g.dflash2_dense_q8(view, {input, 1u, columns, columns * 4u}, {output, 1u, count, count * 4u});
+                check(g.submit().dispatches == 1, "borrowed draft projection dispatch count differs");
+                g.set_dflash2_scope(false);
+                const auto& kernels = g.last_profile().kernels;
+                check(kernels.size() == 1 && kernels[0].kernel == (q8_tile64_cache_enabled ? "nax_m8_dense_q8_t64" : "nax_m8_qmv_q8"),
+                      "borrowed draft projection selected wrong cache-policy route");
+                std::vector<float> actual(count);
+                g.read(g.slice(output, 0, count * sizeof(float)), std::as_writable_bytes(std::span(actual)));
+                for (uint32_t row = 0; row < count; ++row) {
+                    double expected = 0;
+                    for (uint32_t c = 0; c < columns; ++c)
+                        expected += double(int((row * 7u + (c / 32u) * 3u + c % 32u) % 17u) - 8) * 0.0078125 * x[c];
+                    check(std::isfinite(actual[row]) && std::abs(double(actual[row]) - expected) <= 1e-5 * std::max(1.0, std::abs(expected)),
+                          "borrowed draft projection differs from independent represented-weight FP64 oracle");
+                }
+                check(g.memory().live_bytes == live.live_bytes && g.memory().allocations == live.allocations,
+                      "borrowed draft projection allocated storage");
+            };
+            check_projection(borrowed, 128u);
+            const auto first_borrowed = borrowed;
+            const auto before_resize = g.memory();
+            borrowed = g.suballocate_draft_output_slice(parent, 64u, columns);
+            check_cache(2, 1); check_projection(borrowed, 64u);
+            check(g.memory().live_bytes == before_resize.live_bytes && g.memory().allocations == before_resize.allocations,
+                  "draft slice resize duplicated storage");
+            borrowed = g.suballocate_draft_output_slice(second_parent, 128u, columns);
+            check_cache(2, 1); check_projection(borrowed, 128u);
+            const auto before_repeat = g.memory();
+            prepare(); g.register_q8_matrix(second_parent, columns, rows);
+            check(g.memory().live_bytes == before_repeat.live_bytes && g.memory().allocations == before_repeat.allocations,
+                  "repeated draft preparation duplicated copies");
+            check(g.read(parent) == payload && g.read(second_parent) == payload, "draft cache changed original source bytes");
+            g.release(parent); check_cache(1, 1);
+            rejects([&] { static_cast<void>(g.slice(first_borrowed, 0, 4)); }, "released first-parent view remained usable");
+            check_projection(borrowed, 128u);
+            g.release(second_parent); check_cache(0, 0);
+            rejects([&] { static_cast<void>(g.slice(borrowed, 0, 4)); }, "released replacement-parent view remained usable");
+            g.release(output); g.release(input);
+            check(g.memory().live_bytes == prepared_bytes, "draft parent/alias fixture leaked GPU storage");
+        }
+    }
+    std::cout << "PASS Q8 cache policy=" << q8_tile64_cache_enabled
+              << " draft slice layouts, registration before/after preparation, resize/replacement, parent release and stale-view refusal; profiling is diagnostic only\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
-        check(argc == 2, "usage: test-dflash2_shortlist METALLIB");
+        const bool correctness_only = argc == 3 && std::strcmp(argv[2], "--correctness-only") == 0;
+        const bool lifetime_only = argc == 3 && std::strcmp(argv[2], "--q8-cache-lifetime-only") == 0;
+        check(argc == 2 || correctness_only || lifetime_only,
+              "usage: test-dflash2_shortlist METALLIB [--correctness-only | --q8-cache-lifetime-only]");
+        test_q8_slice_lifetime(argv[1]);
+        if (lifetime_only) return 0;
         MetalGraph g(argv[1], 1024ull << 20);
         g.configure_verify_nax(true);
         const std::array<std::pair<uint32_t, PrefillWeightLayout>, 0> no_moe{};
@@ -350,6 +463,10 @@ int main(int argc, char** argv) {
         }
 
         check(g.memory().live_bytes == initial_bytes, "test_dflash2_shortlist synthetic block leaked GPU buffers");
+        if (correctness_only) {
+            std::cout << "PASS DFlash2 shortlist generated correctness checks; large projection benchmark not selected\n";
+            return 0;
+        }
 
         // Now measure actual Gemma-4-26B DFlash2 output projection + selector GPU time on M5 Max:
         // (A) k=7 x 248,320  (B) k=3 x 248,320  (C) k=3 x 32,768.

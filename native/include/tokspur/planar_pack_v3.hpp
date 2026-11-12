@@ -129,6 +129,8 @@ struct AdoptedPackV3 {
     PackPlanV3 plan;
     std::string manifest_sha256;
     uint32_t authentication_workers = 1;
+    // Describes completed source reads, not pages released by the OS.
+    std::string_view authentication_source_read_mode = "not_read";
 };
 
 [[nodiscard]] std::vector<std::byte> build_header_v3(const PackPlanV3& plan);
@@ -149,6 +151,30 @@ struct AdoptedPackV3 {
     uint64_t reserve_bytes = derived_pack::default_reserve_bytes
 );
 
+[[nodiscard]] BudgetReportV3 measure_pack_v3_budget(
+    const PackPlanV3& plan, const std::filesystem::path& output_directory,
+    const std::filesystem::path& existing_pack_v2_path, uint32_t experts_per_chunk,
+    uint64_t reserve_bytes, uint64_t chunk_bytes
+);
+
+struct PublishedPackV3 {
+    AdoptedPackV3 verified;
+    bool existed;
+    double build_seconds;
+};
+
+// Fully authenticate against the supplied sources before publishing or accepting a seal.
+[[nodiscard]] PublishedPackV3 build_or_verify_pack_v3(
+    PackPlanV3 plan, std::shared_ptr<const ModelFiles> source,
+    std::shared_ptr<const ModelFiles> mtp_sidecar, const std::filesystem::path& output,
+    uint32_t experts_per_chunk, uint64_t reserve_bytes, uint64_t chunk_bytes,
+    void (*check_cancelled)() = nullptr
+);
+
+void validate_pack_v3_output_name(const std::filesystem::path& output);
+void require_full_pack_v3_census(const PackPlanV3& plan);
+int pack_v3_cli(int argc, char** argv);
+
 // Single-block fixture planner (e.g. block_id in {0, 2, 3, 48}) for sequential D1 prototype.
 [[nodiscard]] PackPlanV3 plan_block_pack_v3(
     const ModelFiles& source,
@@ -164,7 +190,8 @@ struct AdoptedPackV3 {
     const std::filesystem::path& output,
     uint32_t experts_per_chunk = 8,
     uint64_t reserve_bytes = derived_pack::default_reserve_bytes,
-    uint64_t chunk_bytes = derived_pack::default_chunk_bytes
+    uint64_t chunk_bytes = derived_pack::default_chunk_bytes,
+    void (*check_cancelled)() = nullptr
 );
 
 [[nodiscard]] PackPlanV3 build_derived_pack_v3(
@@ -195,7 +222,8 @@ struct AdoptedPackV3 {
     uint64_t chunk_bytes = derived_pack::default_chunk_bytes,
     uint32_t authentication_workers = 1,
     derived_pack::TrustMode trust_mode = derived_pack::TrustMode::full,
-    bool require_full_census = true
+    bool require_full_census = true,
+    void (*check_cancelled)() = nullptr
 );
 
 [[nodiscard]] AdoptedPackV3 adopt_derived_pack_v3(

@@ -2,6 +2,7 @@
 #include "tokspur/numeric.hpp"
 #include "tokspur/model.hpp"
 #include "tokspur/derived_pack.hpp"
+#include "tokspur/planar_pack_v3.hpp"
 #ifdef TOKSPUR_HAS_METAL
 #include "tokspur/metal.hpp"
 #include "tokspur/graph.hpp"
@@ -240,6 +241,10 @@ int main(int argc, char** argv) {
 #else
             throw tokspur::FormatError("the Q8-many check requires the owned macOS build");
 #endif
+        }
+        if (argc >= 2 && (std::string_view(argv[1]) == "pack-v3-plan" ||
+                          std::string_view(argv[1]) == "pack-v3-build")) {
+            return tokspur::planar_v3::pack_v3_cli(argc, argv);
         }
         if (argc >= 2 && std::string_view(argv[1]) == "pack-build") {
             std::filesystem::path output_path;

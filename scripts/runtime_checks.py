@@ -1659,7 +1659,11 @@ def main():
     if args.command == "archive":
         archive(args.source, args.output)
     elif args.command == "capture":
-        capture(args.trace, args.argv[1:] if args.argv[:1] == ["--"] else args.argv)
+        capture(
+            args.trace,
+            args.argv[1:] if args.argv[:1] == ["--"] else args.argv,
+            arm=args.arm,
+        )
     elif args.command in ("replay", "check-prepared"):
         print(
             json.dumps(

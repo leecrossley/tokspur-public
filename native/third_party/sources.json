@@ -294,7 +294,7 @@
     },
     {
       "path": "native/kernels/nax_prefill.metal",
-      "sha256": "40bb9073a157c4bb80f6e08aec565f8464eef60a7078c48f12e2654f941e539d",
+      "sha256": "ba77dc37fc0e1635212513308f4bc15fc5ee3f4c406ae11be394f2819f310957",
       "sources": [
         "llama.cpp",
         "Splash"
@@ -305,7 +305,7 @@
         "shared/gguf_float.metal three-part BF16 weight split and plane matmul"
       ],
       "status": "recorded-adaptation",
-      "lines": 7594
+      "lines": 7649
     },
     {
       "path": "native/kernels/raw_decode.metal",
@@ -333,7 +333,7 @@
     },
     {
       "path": "native/kernels/gdn_chunk.metal",
-      "sha256": "c621c8c4b813b9704635ba98dca4ff2ab4e4ad0e78328c57f384728d345e7008",
+      "sha256": "6f72f64989b78ee3ce6de55a0ef2afa018f5a613aea2e363e3bb650af9d210b8",
       "sources": [
         "llama.cpp"
       ],
@@ -341,7 +341,7 @@
         "CS64 delta-net algebra from src/models/delta-net-base.cpp"
       ],
       "status": "recorded-adaptation",
-      "lines": 398
+      "lines": 433
     },
     {
       "path": "native/src/gdn_chunk_math.cpp",
@@ -369,7 +369,7 @@
     },
     {
       "path": "native/kernels/dflash2.metal",
-      "sha256": "a5347e8eea099850f121cc605bfd434d72020e6c515240da7d2693b4c332a236",
+      "sha256": "a59637856c5a82c97486779382cbc675ca28ef396bfc9bbabd5bf790fdf1f367",
       "sources": [
         "Splash"
       ],
@@ -377,7 +377,7 @@
         "draft convolution, ring attention, candidate selection"
       ],
       "status": "recorded-adaptation",
-      "lines": 1446
+      "lines": 1467
     },
     {
       "path": "native/src/dflash2_drafter.cpp",
@@ -435,7 +435,7 @@
     },
     {
       "path": "native/kernels/logit_topk.metal",
-      "sha256": "a8e420b494b72832195926d5be34aba06ca840e622b6d0d91311b48316a9fb71",
+      "sha256": "a2695fdbd37b58282ba7de426674f5deb4168db712a543528499d87c6a4aabb1",
       "sources": [
         "Splash"
       ],
@@ -443,7 +443,7 @@
         "top_insert, top_pop, SIMD selection and two-stage top-64"
       ],
       "status": "recorded-adaptation",
-      "lines": 314
+      "lines": 365
     }
   ],
   "unresolved": [],

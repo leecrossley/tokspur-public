@@ -73,6 +73,7 @@ int main(void) {
     printf("RENAME_EXCL=%u\n", (unsigned)RENAME_EXCL);
     printf("RENAME_SECLUDE=%u\n", (unsigned)RENAME_SECLUDE);
     printf("F_NOCACHE=%d\n", (int)F_NOCACHE);
+    printf("ENOTSUP=%d\n", (int)ENOTSUP);
     printf("AT_FDCWD=%d\n", (int)AT_FDCWD);
     printf("AT_SYMLINK_NOFOLLOW=%d\n", (int)AT_SYMLINK_NOFOLLOW);
     printf("AT_REMOVEDIR=%d\n", (int)AT_REMOVEDIR);
@@ -170,6 +171,7 @@ int main(void) {
     assert_eq!(sdk_layout::LINGER_SIZE as i64, sdk["LINGER_SIZE"]);
     assert_eq!(i64::from(sdk_layout::RENAME_EXCL), sdk["RENAME_EXCL"]);
     assert_eq!(i64::from(sdk_layout::F_NOCACHE), sdk["F_NOCACHE"]);
+    assert_eq!(i64::from(sdk_layout::ENOTSUP), sdk["ENOTSUP"]);
     assert_eq!(
         i64::from(sdk_layout::ATTR_BIT_MAP_COUNT),
         sdk["ATTR_BIT_MAP_COUNT"]

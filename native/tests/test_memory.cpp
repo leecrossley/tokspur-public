@@ -7,14 +7,20 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <libproc.h>
 #include <list>
+#include <malloc/malloc.h>
+#include <memory>
 #include <random>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 
@@ -22,10 +28,124 @@ namespace {
 size_t checks = 0;
 void require(bool b, const char* m) { ++checks; if (!b) throw std::runtime_error(m); }
 void reject(const std::function<void()>& f) { ++checks; try { f(); } catch (const tokspur::FormatError&) { return; } throw std::runtime_error("invalid memory operation accepted"); }
+
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define TOKSPUR_TEST_ASAN 1
+#endif
+#endif
+
+#ifndef TOKSPUR_TEST_ASAN
+uint64_t phys_footprint() {
+    rusage_info_v4 info{};
+    if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, reinterpret_cast<rusage_info_t*>(&info)) != 0)
+        throw std::runtime_error("cannot read own physical footprint");
+    return info.ri_phys_footprint;
+}
+
+struct PhysicalRelease { uint64_t accounted, filled_growth, released; };
+
+// Fills and touches an embedding-rows slab, then measures the physical footprint across reclaim and
+// allocator pressure relief. `skip_reclaim` is the built-in broken control: it reports the charged
+// bytes as released without releasing them, so accounting looks right and the footprint does not move.
+PhysicalRelease physical_release(bool skip_reclaim) {
+    using namespace tokspur;
+    constexpr uint32_t width = 256;
+    constexpr uint64_t budget = uint64_t(64) << 20;
+    const uint64_t stored = budget / (uint64_t(width) * sizeof(float)) + 64;
+    std::vector<float> source(stored * width);
+    for (size_t i = 0; i < source.size(); ++i) source[i] = float(i % 1021) * 0.25f;
+    std::vector<float> row(width);
+    malloc_zone_pressure_relief(nullptr, 0);
+    const auto before = phys_footprint();
+    auto cache = std::make_unique<EmbeddingRows>(std::as_bytes(std::span(source)), 0, width, stored, stored, budget);
+    for (uint64_t r = 0; r < cache->capacity(); ++r) cache->copy(r, row);
+    const auto filled = phys_footprint();
+    const auto accounted = skip_reclaim ? cache->charged_bytes() - sizeof(EmbeddingRows) : cache->reclaim();
+    malloc_zone_pressure_relief(nullptr, 0);
+    const auto after = phys_footprint();
+    return {accounted, filled > before ? filled - before : 0, filled > after ? filled - after : 0};
+}
+#endif
 }
 int main() {
     try {
         using namespace tokspur;
+#ifndef TOKSPUR_TEST_ASAN
+        if (const char* check = std::getenv("TOKSPUR_PHYSICAL_RELEASE_CHECK"); check && std::string_view(check) == "1") {
+            // Opt-in diagnostic: the reclaimed slab must leave the physical footprint, not only the ledger.
+            const auto released = physical_release(false);
+            const auto control = physical_release(true);
+            std::cout << "{\"event\":\"physical_release\",\"accounted_bytes\":" << released.accounted
+                      << ",\"filled_growth_bytes\":" << released.filled_growth << ",\"released_bytes\":" << released.released
+                      << ",\"control_accounted_bytes\":" << control.accounted << ",\"control_released_bytes\":" << control.released
+                      << "}" << std::endl;
+            require(released.accounted > (uint64_t(32) << 20), "reclaim accounts the slab");
+            require(released.filled_growth >= released.accounted / 10 * 9, "filled slab is resident");
+            require(control.accounted > (uint64_t(32) << 20), "skipped reclaim still accounts the slab");
+            require(control.released < control.accounted / 2, "physical release control: a skipped reclaim must not pass");
+            require(released.released >= released.accounted / 10 * 9, "reclaim releases the footprint it accounts");
+        }
+#endif
+        {
+            // Report-only memory plan room: exact below the limit, saturating at zero above it.
+            constexpr uint64_t gib = uint64_t(1) << 30;
+            const auto plan = memory_plan_room(96 * gib, 40 * gib, 8 * gib);
+            require(plan.room == 48 * gib && plan.room + 40 * gib + 8 * gib == 96 * gib, "memory plan room keeps the reserve");
+            require(plan.would_allow_cache_bytes == 24 * gib, "memory plan half-of-room rule");
+            require(memory_plan_room(96 * gib, 90 * gib, 8 * gib).room == 0, "memory plan room saturates under the reserve");
+            require(memory_plan_room(96 * gib, 100 * gib, 0).room == 0, "memory plan room saturates above the limit");
+            require(memory_plan_room(96 * gib, UINT64_MAX, 8 * gib).room == 0, "memory plan room cannot wrap");
+            require(memory_plan_room(0, 0, 0).room == 0 && memory_plan_room(0, 0, 0).would_allow_cache_bytes == 0,
+                "memory plan with no limit allows nothing");
+        }
+        require(q8_tile64_repack_bytes(32, 1) == 2176 && q8_tile64_repack_bytes(64, 65) == 8704,
+            "Q8 Tile64 row-tail geometry");
+        reject([&] { static_cast<void>(q8_tile64_repack_bytes(31, 64)); });
+        reject([&] { static_cast<void>(q8_tile64_repack_bytes(32, 0)); });
+        reject([&] { static_cast<void>(q8_tile64_repack_bytes(32, UINT64_MAX)); });
+        reject([&] { static_cast<void>(q8_tile64_repack_bytes(UINT64_MAX - 31, 64)); });
+        // Two registered views overlap one owner, two aliases add no storage,
+        // one uncached candidate has its own padded size, and one owner is dead.
+        const std::array<Q8Tile64CacheCandidate, 3> tile_candidates{{
+            {4352, 4352, 7}, {2176, 2176, 7}, {3264, 4352, std::nullopt}}};
+        const std::array<Q8Tile64CacheAllocation, 5> tile_entries{{
+            {7, 4352, 16384, true, false}, {7, 4352, 16384, true, false},
+            {7, 4352, 16384, true, true}, {7, 4352, 16384, true, true},
+            {9, 999, 4096, false, false}}};
+        const auto tiles = summarize_q8_tile64_cache(true, tile_candidates, tile_entries);
+        require(tiles.enabled && tiles.registered_candidates == 3 && tiles.registered_source_bytes == 9792 &&
+            tiles.candidate_repack_logical_bytes == 10880 && tiles.covered_candidates == 2 &&
+            tiles.omitted_candidates == 1 && tiles.omitted_repack_logical_bytes == 4352 &&
+            tiles.owning_allocations == 1 && tiles.owned_logical_bytes == 4352 &&
+            tiles.owned_charged_bytes == 16384 && tiles.aliases == 2, "Q8 cache owner/alias/candidate accounting");
+        const auto tiles_off = summarize_q8_tile64_cache(false, tile_candidates, {});
+        require(!tiles_off.enabled && tiles_off.omitted_candidates == 3 &&
+            tiles_off.omitted_repack_logical_bytes == 10880 && tiles_off.covered_candidates == 0 &&
+            tiles_off.owning_allocations == 0 && tiles_off.owned_charged_bytes == 0 && tiles_off.aliases == 0,
+            "disabled Q8 cache must report omitted candidates without storage");
+        auto released_entries = tile_entries;
+        for (auto& entry : released_entries) entry.live = false;
+        const auto released_tiles = summarize_q8_tile64_cache(true, tile_candidates, released_entries);
+        require(released_tiles.owning_allocations == 0 && released_tiles.owned_logical_bytes == 0 &&
+            released_tiles.owned_charged_bytes == 0 && released_tiles.aliases == 0 &&
+            released_tiles.omitted_candidates == 3, "released Q8 owners/aliases remain charged");
+        const auto no_candidates = summarize_q8_tile64_cache(true, {}, tile_entries);
+        require(no_candidates.registered_candidates == 0 && no_candidates.omitted_repack_logical_bytes == 0 &&
+            no_candidates.owned_charged_bytes == 16384, "actual Q8 owner storage inferred from candidate totals");
+        reject([&] { static_cast<void>(summarize_q8_tile64_cache(false, tile_candidates, tile_entries)); });
+        const std::array<Q8Tile64CacheAllocation, 1> dangling_alias{{{8, 64, 4096, true, true}}};
+        reject([&] { static_cast<void>(summarize_q8_tile64_cache(true, {}, dangling_alias)); });
+        auto inconsistent = tile_entries; inconsistent[1].charged_bytes += 4096;
+        reject([&] { static_cast<void>(summarize_q8_tile64_cache(true, {}, inconsistent)); });
+        const std::array<Q8Tile64CacheAllocation, 1> undercharged{{{7, 4352, 4096, true, false}}};
+        reject([&] { static_cast<void>(summarize_q8_tile64_cache(true, {}, undercharged)); });
+        const std::array<Q8Tile64CacheCandidate, 2> overflowing_candidates{{
+            {1, UINT64_MAX, std::nullopt}, {1, 1, std::nullopt}}};
+        reject([&] { static_cast<void>(summarize_q8_tile64_cache(true, overflowing_candidates, {})); });
+        const std::array<Q8Tile64CacheAllocation, 2> overflowing_owners{{
+            {1, UINT64_MAX, UINT64_MAX, true, false}, {2, 1, 1, true, false}}};
+        reject([&] { static_cast<void>(summarize_q8_tile64_cache(true, {}, overflowing_owners)); });
         const NgramSpec spec{3, 2, 4, 20, 16, 15, {3, 5, 7}, {0, 7, 18, 31}, {7, 11, 13, 17}};
         auto history = empty_ngram_history(spec); history.previous[0] = 9; history.previous[1] = 8;
         const auto before = history;

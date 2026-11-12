@@ -310,7 +310,7 @@ def test_package_writes_the_archive_licences_and_checksum(release, tmp_path):
     } <= set(members)
     assert stat.S_IMODE(members[f"{top}/install.sh"].mode) == 0o755
     installer = Path(result["installer"]).read_text()
-    assert 'team_id="${TOKSPUR_TEAM_ID:-ABCDE12345}"' in installer
+    assert 'pinned_team_id="ABCDE12345"' in installer
     assert "@TOKSPUR_TEAM_ID@" not in installer
     # verify-build checks these modes after extraction, so the archive must keep them.
     assert stat.S_IMODE(members[f"{top}/package"].mode) == 0o700

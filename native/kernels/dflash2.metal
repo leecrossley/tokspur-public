@@ -653,34 +653,55 @@ kernel void dflash2_top16_sharded(device const float* logits [[buffer(0)]],
         }
     }
 
-    threadgroup float round_values[2][8];
-    threadgroup uint round_ids[2][8];
-    for (uint rank = 0u; rank < K; ++rank) {
+    threadgroup float sg_vals[8][K];
+    threadgroup uint sg_ids[8][K];
+    for (uint r = 0u; r < K; ++r) {
         const float head_val = values[0];
         const uint head_id = ids[0];
         float simd_val;
         uint simd_id;
         dflash2_detail::simd_best_head(head_val, head_id, simd_val, simd_id);
-        const uint slot = rank & 1u;
+        const ushort win_lane = simd_min((head_id != 0xffffffffu && head_id == simd_id) ? lane : ushort(32));
+        if (win_lane < 32u) simd_val = simd_shuffle(head_val, win_lane);
         if (!lane) {
-            round_values[slot][sg] = simd_val;
-            round_ids[slot][sg] = simd_id;
+            sg_vals[sg][r] = simd_val;
+            sg_ids[sg][r] = simd_id;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float best = round_values[slot][0];
-        uint best_id = round_ids[slot][0];
-        #pragma unroll
-        for (uint other = 1u; other < 8u; ++other) {
-            if (dflash2_detail::top_beats(round_values[slot][other], round_ids[slot][other], best, best_id)) {
-                best = round_values[slot][other];
-                best_id = round_ids[slot][other];
+        if (simd_id == 0xffffffffu) {
+            if (!lane) {
+                for (uint rem = r + 1u; rem < K; ++rem) {
+                    sg_vals[sg][rem] = -INFINITY;
+                    sg_ids[sg][rem] = 0xffffffffu;
+                }
             }
+            break;
         }
-        if (tid == rank) {
-            partial_ids[group * K + rank] = best_id;
-            partial_values[group * K + rank] = best;
+        if (head_id == simd_id) dflash2_detail::top_pop<K>(values, ids);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u) {
+        uint cur = 0u;
+        float out_v = -INFINITY;
+        uint out_i = 0xffffffffu;
+        for (uint rank = 0u; rank < K; ++rank) {
+            const bool active = (lane < 8u) && (cur < K);
+            const float v = active ? sg_vals[lane][cur] : -INFINITY;
+            const uint id = active ? sg_ids[lane][cur] : 0xffffffffu;
+            float best;
+            uint best_id;
+            dflash2_detail::simd_best_head(v, id, best, best_id);
+            const ushort win_lane = simd_min((id != 0xffffffffu && id == best_id) ? lane : ushort(32));
+            if (win_lane < 8u) best = simd_shuffle(v, win_lane);
+            if (uint(lane) == rank) {
+                out_i = best_id;
+                out_v = best;
+            }
+            if (active && best_id != 0xffffffffu && id == best_id) ++cur;
         }
-        if (head_val == best && head_id == best_id) dflash2_detail::top_pop<K>(values, ids);
+        if (uint(lane) < K) {
+            partial_ids[group * K + uint(lane)] = out_i;
+            partial_values[group * K + uint(lane)] = out_v;
+        }
     }
     if (bad) atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
 }

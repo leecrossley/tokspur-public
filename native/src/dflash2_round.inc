@@ -201,7 +201,7 @@ if (dflash2 && mtp_depth == 7) {
         {"used_carried_anchor", Json(bool(pending))},
         {"pending_anchor", Json(bool(mtp_anchor.peek(stack.position())))},
         {"round_wall_ms", number(round_wall)},
-        {"timings_qualified", Json(false)}})).dump() << std::endl;
+        {"timings_qualified", Json(false)}})).dump() << '\n';
 
     std::array<uint32_t, 8> round_ids{};
     std::array<float, 8> round_scores{};
@@ -227,13 +227,14 @@ if (dflash2 && mtp_depth == 7) {
             {"token_prefix", Json::integer(base + t + 1)},
             {"round_committed_prefix", Json::integer(stack.position())},
             {"entropy_words", Json::integer(sampler.random().words_consumed())},
-            {"gpu_profile", Json()}})).dump() << std::endl;
+            {"gpu_profile", Json()}})).dump() << '\n';
         if (selector.publication->stopped && t == count - 1) {
             stop_id = id;
             retained.stopped(id);
             if (is_v2) mtp_generation.mark_stop_drained();
         }
     }
+    std::cout << std::flush;
     i += emitted_now - 1;
     if (stop_id) break;
     continue;

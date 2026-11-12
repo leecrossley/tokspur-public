@@ -337,12 +337,11 @@ kernel void gdn_chunk_rms_rows_fast(device const float* x[[buffer(0)]],device co
         return;
     }
     const uint chunks128=p.value_width>>7u;
-    float xv[32];
     uint bad=0u;
+    #pragma unroll 4
     for(uint k=0u;k<chunks128;++k){
         const uint idx=k*128u+uint(tid);
         const float v=xr[idx];
-        xv[k]=v;
         bad|=nonfin_gdn(v);
         v_tile[k*4u+uint(sg)][lane]=v;
     }
@@ -352,6 +351,7 @@ kernel void gdn_chunk_rms_rows_fast(device const float* x[[buffer(0)]],device co
     if(sg==0u){
         const uint steps32=chunks128*4u;
         float sum=0.0f;
+        #pragma unroll 4
         for(uint m=0u;m<steps32;++m){const float vm=v_tile[m][lane];sum+=vm*vm;}
         sum=simd_sum(sum);
         if(!lane){
@@ -367,11 +367,13 @@ kernel void gdn_chunk_rms_rows_fast(device const float* x[[buffer(0)]],device co
     if(shared_abort)return;
     const float inv=shared_inv;
     uint wbad=0u;
+    #pragma unroll 4
     for(uint k=0u;k<chunks128;++k){
         const uint idx=k*128u+uint(tid);
+        const float rv=v_tile[k*4u+uint(sg)][lane];
         const float gn=gr[idx];
         wbad|=nonfin_gdn(gn);
-        const float out=(xv[k]*inv)*gn;
+        const float out=(rv*inv)*gn;
         wbad|=nonfin_gdn(out);
         yr[idx]=out;
     }
@@ -392,6 +394,39 @@ kernel void gdn_chunk_solve64(device const float* state[[buffer(0)]],device cons
 }
 kernel void gdn_chunk_emit64(device const float* state[[buffer(0)]],device const float* q[[buffer(1)]],device const float* k[[buffer(2)]],device const float* prefix[[buffer(3)]],device const float* attention[[buffer(4)]],device const float* residual[[buffer(5)]],device float* next[[buffer(6)]],device float* y[[buffer(8)]],constant GdnChunkParams& p[[buffer(14)]],device atomic_uint* e[[buffer(7)]],uint id[[thread_position_in_grid]]){
     if(id>=p.heads*p.value_width)return;const uint h=id/p.value_width,c=id%p.value_width;const uint width=p.heads*p.value_width;
+#ifndef TOKSPUR_TEST_GDN_CS64_REFERENCE
+    // The 128-thread dispatch owns one complete head at value_width 128.
+    // Its decay factors depend only on (head,token), not on key/value columns.
+    // Preserve all FP32 products and sequential sums; share only the factors.
+    if (p.value_width == 128u) {
+        threadgroup float prefix_exp[64], tail_exp[64];
+        const float last = checked_gdn(prefix[h * 64 + p.count - 1], e);
+        const float last_exp = exp(last);
+        if (c < p.count) {
+            prefix_exp[c] = exp(checked_gdn(prefix[h * 64 + c], e));
+            tail_exp[c] = exp(checked_gdn(last - prefix[h * 64 + c], e));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < p.count; ++i) {
+            float x = 0;
+            for (uint a = 0; a < 128; ++a)
+                x += checked_gdn(state[(ulong(h) * 128 + a) * p.value_width + c], e)
+                    * checked_gdn(grow(q, p.offset + i, p.input_stride)[h * 128 + a], e);
+            x *= prefix_exp[i];
+            for (uint j = 0; j <= i; ++j)
+                x += attention[(h * 64 + i) * 64 + j] * residual[ulong(j) * width + id];
+            put_gdn(grow(y, p.offset + i, p.output_stride), id, x, e);
+        }
+        for (uint a = 0; a < 128; ++a) {
+            float x = last_exp * checked_gdn(state[(ulong(h) * 128 + a) * p.value_width + c], e);
+            for (uint j = 0; j < p.count; ++j)
+                x += (tail_exp[j] * checked_gdn(grow(k, p.offset + j, p.input_stride)[h * 128 + a], e))
+                    * residual[ulong(j) * width + id];
+            put_gdn(next, (ulong(h) * 128 + a) * p.value_width + c, x, e);
+        }
+        return;
+    }
+#endif
     for(uint i=0;i<p.count;++i){float x=0;for(uint a=0;a<128;++a)x+=checked_gdn(state[(ulong(h)*128+a)*p.value_width+c],e)*checked_gdn(grow(q,p.offset+i,p.input_stride)[h*128+a],e);x*=exp(checked_gdn(prefix[h*64+i],e));for(uint j=0;j<=i;++j)x+=attention[(h*64+i)*64+j]*residual[ulong(j)*width+id];put_gdn(grow(y,p.offset+i,p.output_stride),id,x,e);}
     const float last=checked_gdn(prefix[h*64+p.count-1],e);
     for(uint a=0;a<128;++a){float x=exp(last)*checked_gdn(state[(ulong(h)*128+a)*p.value_width+c],e);for(uint j=0;j<p.count;++j)x+=(exp(checked_gdn(last-prefix[h*64+j],e))*checked_gdn(grow(k,p.offset+j,p.input_stride)[h*128+a],e))*residual[ulong(j)*width+id];put_gdn(next,(ulong(h)*128+a)*p.value_width+c,x,e);}

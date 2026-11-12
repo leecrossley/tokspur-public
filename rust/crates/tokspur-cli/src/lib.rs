@@ -4,6 +4,8 @@
 
 pub mod error;
 pub mod layout;
+mod model_config;
+mod pack_command;
 pub mod serve;
 pub mod state;
 mod text_assets;
@@ -16,8 +18,7 @@ use std::path::{Path, PathBuf};
 use tokspur_gguf::ModelFiles;
 use tokspur_json::Json;
 use tokspur_pack::{
-    DEFAULT_CHUNK_BYTES, DEFAULT_RESERVE_BYTES, MTP_SIDECAR_SHA256,
-    build_derived_pack_with_progress, plan_static_pack,
+    DEFAULT_CHUNK_BYTES, DEFAULT_RESERVE_BYTES, build_derived_pack_with_progress, plan_static_pack,
 };
 use tokspur_sys::net::port_available;
 
@@ -25,8 +26,8 @@ use crate::error::CliError;
 use crate::layout::RuntimeLayout;
 use crate::serve::{DrainTimeouts, ServeOptions, serve_foreground};
 use crate::state::{
-    StateLock, adopt_weights, check_adopted_weights, check_adoption, configure_runtime,
-    format_pretty_sorted_json, inference_processes, private_dir, read_json_file,
+    StateLock, adopt_weights, check_adopted_weights, configure_runtime, format_pretty_sorted_json,
+    inference_processes, private_dir, read_json_file,
 };
 use crate::verify::verify_build;
 
@@ -37,6 +38,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub enum HelpTopic {
     General,
     Doctor,
+    CheckModelConfig,
     Adopt,
     Configure,
     Plan,
@@ -47,12 +49,44 @@ pub enum HelpTopic {
     PackBuild,
 }
 
+/// Lossless derived pack format selected for planning or construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackFormat {
+    V2,
+    V3,
+}
+
+impl PackFormat {
+    fn parse(value: Option<&String>) -> Result<Self, CliError> {
+        match value.map(String::as_str) {
+            Some("v2") => Ok(Self::V2),
+            Some("v3") => Ok(Self::V3),
+            _ => Err(CliError::Usage("--format requires v2 or v3".to_owned())),
+        }
+    }
+
+    const fn default_chunk_mib(self) -> u64 {
+        match self {
+            Self::V2 => DEFAULT_CHUNK_BYTES / (1 << 20),
+            Self::V3 => 16,
+        }
+    }
+
+    const fn filename(self) -> &'static str {
+        match self {
+            Self::V2 => "tokspur-pack-v2.asa.gguf",
+            Self::V3 => "tokspur-pack-v3.asa.gguf",
+        }
+    }
+}
+
 /// Parsed CLI subcommand.
 #[derive(Clone, PartialEq)]
 pub enum Command {
     PrintVersion,
     PrintHelp(HelpTopic),
     Doctor,
+    CheckModelConfig(PathBuf),
     Adopt {
         target: Option<PathBuf>,
         draft: Option<PathBuf>,
@@ -65,12 +99,15 @@ pub enum Command {
     VerifyBuild,
     Serve(Box<ServeOptions>),
     PackPlan {
+        format: PackFormat,
         target_dir: Option<PathBuf>,
+        chunk_mib: Option<u64>,
         reserve_gb: f64,
         json: bool,
         check: bool,
     },
     PackBuild {
+        format: PackFormat,
         output: Option<PathBuf>,
         reserve_gb: f64,
         chunk_mib: u64,
@@ -83,6 +120,7 @@ impl fmt::Debug for Command {
             Self::PrintVersion => formatter.write_str("PrintVersion"),
             Self::PrintHelp(topic) => formatter.debug_tuple("PrintHelp").field(topic).finish(),
             Self::Doctor => formatter.write_str("Doctor"),
+            Self::CheckModelConfig(_) => formatter.write_str("CheckModelConfig([redacted])"),
             Self::Adopt {
                 target,
                 draft,
@@ -101,23 +139,29 @@ impl fmt::Debug for Command {
             Self::VerifyBuild => formatter.write_str("VerifyBuild"),
             Self::Serve(opts) => formatter.debug_tuple("Serve").field(opts).finish(),
             Self::PackPlan {
+                format,
                 target_dir,
+                chunk_mib,
                 reserve_gb,
                 json,
                 check,
             } => formatter
                 .debug_struct("PackPlan")
+                .field("format", format)
                 .field("target_dir", &target_dir.as_ref().map(|_| "[redacted]"))
+                .field("chunk_mib", chunk_mib)
                 .field("reserve_gb", reserve_gb)
                 .field("json", json)
                 .field("check", check)
                 .finish(),
             Self::PackBuild {
+                format,
                 output,
                 reserve_gb,
                 chunk_mib,
             } => formatter
                 .debug_struct("PackBuild")
+                .field("format", format)
                 .field("output", &output.as_ref().map(|_| "[redacted]"))
                 .field("reserve_gb", reserve_gb)
                 .field("chunk_mib", chunk_mib)
@@ -150,14 +194,15 @@ const HELP_TEXT: &str = "\
 usage: tokspur [--version] [--state-root <abs-path>] <command> [options]
 
 commands:
+  check-model-config  Compare a local config.json with the Flash-Next text profile
   doctor            Read-only readiness summary; never loads a model
   adopt             Fully hash existing weights without copying them
   configure         Write isolated settings; never starts inference
   plan              Show the selected native policy
   verify-build      Verify built or staged executables, metallib and provenance
   serve             Foreground API; refuses other inference workers
-  pack plan         Plan lossless tokspur-pack-v2 layout and check 50 GiB reserve
-  pack build        Stream and seal tokspur-pack-v2 with byte-exact inverse proof
+  pack plan         Plan the selected lossless pack layout and check 50 GiB reserve
+  pack build        Stream and seal a lossless pack with byte-exact inverse proof
 ";
 
 const DOCTOR_HELP_TEXT: &str = "\
@@ -262,28 +307,31 @@ const PACK_HELP_TEXT: &str = "\
 usage: tokspur [--state-root <abs-path>] pack <plan|build> [options]
 
 subcommands:
-  plan              Plan lossless tokspur-pack-v2 layout and check 50 GiB reserve
-  build             Stream and seal tokspur-pack-v2 with byte-exact inverse proof
+  plan              Plan the selected lossless pack layout and check 50 GiB reserve
+  build             Stream and seal a lossless pack with byte-exact inverse proof
 ";
 
 const PACK_PLAN_HELP_TEXT: &str = "\
-usage: tokspur [--state-root <abs-path>] pack plan [--target-dir <dir>] [--reserve-gb <gb>] [--json] [--check]
+usage: tokspur [--state-root <abs-path>] pack plan [--format v2|v3] [--target-dir <dir>] [--reserve-gb <gb>] [--chunk-mib <mib>] [--json] [--check]
 
 options:
+  --format <v2|v3>   Pack layout (default: v2); v3 plans use adopted shards and the MTP sidecar
   --target-dir <dir> Directory whose volume free space is checked against reserve
   --reserve-gb <gb>  Required free disk reserve in GiB (default: 50.0)
+  --chunk-mib <mib>  V3 streaming chunk size in MiB (1..64, default: 16)
   --json             Emit structured JSON plan output
-  --check            Exit non-zero if free space falls below reserve
+  --check            Exit non-zero if the disk or streaming RAM budget check fails
   -h, --help         Show this help message and exit
 ";
 
 const PACK_BUILD_HELP_TEXT: &str = "\
-usage: tokspur [--state-root <abs-path>] pack build [--output <file>] [--reserve-gb <gb>] [--chunk-mib <mib>]
+usage: tokspur [--state-root <abs-path>] pack build [--format v2|v3] [--output <file>] [--reserve-gb <gb>] [--chunk-mib <mib>]
 
 options:
-  --output <file>    Destination path for tokspur-pack-v2.asa.gguf
+  --format <v2|v3>   Pack layout (default: v2)
+  --output <file>    Destination file (default: derived/tokspur-pack-<format>.asa.gguf); v3 requires a .gguf suffix
   --reserve-gb <gb>  Required free disk reserve in GiB (default: 50.0)
-  --chunk-mib <mib>  Streaming copy chunk size in MiB
+  --chunk-mib <mib>  Streaming copy chunk size in MiB (v2 default: 4; v3: 1..64, default: 16)
   -h, --help         Show this help message and exit
 ";
 
@@ -292,6 +340,9 @@ impl HelpTopic {
         match self {
             Self::General => HELP_TEXT,
             Self::Doctor => DOCTOR_HELP_TEXT,
+            Self::CheckModelConfig => {
+                "usage: tokspur check-model-config <config.json>\n\nCompare the text architecture and dimensions offline before downloading weights. Exit 0 means the checked fields match; asset adoption is a separate check.\n"
+            }
             Self::Adopt => ADOPT_HELP_TEXT,
             Self::Configure => CONFIGURE_HELP_TEXT,
             Self::Plan => PLAN_HELP_TEXT,
@@ -355,6 +406,17 @@ where
     let sub = filtered[0].as_str();
     let rest = &filtered[1..];
     let command = match sub {
+        "check-model-config" => match rest {
+            [arg] if matches!(arg.as_str(), "--help" | "-h") => {
+                Command::PrintHelp(HelpTopic::CheckModelConfig)
+            }
+            [path] if !path.starts_with('-') => Command::CheckModelConfig(PathBuf::from(path)),
+            _ => {
+                return Err(CliError::Usage(
+                    "usage: tokspur check-model-config <config.json>".to_owned(),
+                ));
+            }
+        },
         "doctor" => {
             if matches!(rest.first().map(String::as_str), Some("--help" | "-h")) {
                 return Ok(CliArgs {
@@ -1057,12 +1119,22 @@ where
             match action {
                 "plan" => {
                     let mut target_dir = None;
+                    let mut chunk_mib = None;
+                    let mut format = PackFormat::V2;
                     let mut reserve_gb = 50.0f64;
                     let mut json = false;
                     let mut check = false;
                     let mut i = 0;
                     while i < pack_rest.len() {
                         match pack_rest[i].as_str() {
+                            "--chunk-mib" => {
+                                i += 1;
+                                chunk_mib = Some(parse_chunk_mib(pack_rest.get(i))?);
+                            }
+                            "--format" => {
+                                i += 1;
+                                format = PackFormat::parse(pack_rest.get(i))?;
+                            }
                             "--target-dir" => {
                                 i += 1;
                                 let val = pack_rest.get(i).ok_or_else(|| {
@@ -1093,7 +1165,14 @@ where
                         }
                         i += 1;
                     }
+                    if chunk_mib.is_some() && format == PackFormat::V2 {
+                        return Err(CliError::Usage(
+                            "unrecognised pack plan argument: --chunk-mib".to_owned(),
+                        ));
+                    }
                     Command::PackPlan {
+                        chunk_mib,
+                        format,
                         target_dir,
                         reserve_gb,
                         json,
@@ -1102,11 +1181,20 @@ where
                 }
                 "build" => {
                     let mut output = None;
+                    let mut format = PackFormat::V2;
                     let mut reserve_gb = 50.0f64;
-                    let mut chunk_mib = (DEFAULT_CHUNK_BYTES / (1024 * 1024)).max(1);
+                    let mut chunk_mib = None;
                     let mut i = 0;
                     while i < pack_rest.len() {
                         match pack_rest[i].as_str() {
+                            "--chunk-mib" => {
+                                i += 1;
+                                chunk_mib = Some(parse_chunk_mib(pack_rest.get(i))?);
+                            }
+                            "--format" => {
+                                i += 1;
+                                format = PackFormat::parse(pack_rest.get(i))?;
+                            }
                             "--output" => {
                                 i += 1;
                                 let val = pack_rest.get(i).ok_or_else(|| {
@@ -1120,15 +1208,6 @@ where
                                     CliError::Usage("--reserve-gb requires a number".to_owned())
                                 })?;
                                 reserve_gb = parse_nonnegative_gb(val)?;
-                            }
-                            "--chunk-mib" => {
-                                i += 1;
-                                let val = pack_rest.get(i).ok_or_else(|| {
-                                    CliError::Usage("--chunk-mib requires an integer".to_owned())
-                                })?;
-                                chunk_mib = val.parse::<u64>().map_err(|_| {
-                                    CliError::Usage("invalid --chunk-mib integer".to_owned())
-                                })?;
                             }
                             "--help" | "-h" => {
                                 return Ok(CliArgs {
@@ -1145,9 +1224,10 @@ where
                         i += 1;
                     }
                     Command::PackBuild {
+                        format,
                         output,
                         reserve_gb,
-                        chunk_mib,
+                        chunk_mib: chunk_mib.unwrap_or_else(|| format.default_chunk_mib()),
                     }
                 }
                 other => {
@@ -1166,6 +1246,13 @@ where
         state_root,
         command,
     })
+}
+
+fn parse_chunk_mib(value: Option<&String>) -> Result<u64, CliError> {
+    value
+        .ok_or_else(|| CliError::Usage("--chunk-mib requires an integer".to_owned()))?
+        .parse()
+        .map_err(|_| CliError::Usage("invalid --chunk-mib integer".to_owned()))
 }
 
 fn parse_nonnegative_gb(raw: &str) -> Result<f64, CliError> {
@@ -1207,13 +1294,14 @@ pub fn execute(cli: CliArgs, out: &mut dyn Write) -> Result<i32, CliError> {
                 })?;
             return Ok(0);
         }
+        Command::CheckModelConfig(ref path) => return model_config::check_file(path, out),
         _ => {}
     }
 
     let layout = RuntimeLayout::detect(cli.state_root.as_deref())?;
 
     match cli.command {
-        Command::PrintVersion | Command::PrintHelp(_) => Ok(0),
+        Command::PrintVersion | Command::PrintHelp(_) | Command::CheckModelConfig(_) => Ok(0),
         Command::Plan => {
             let profile = read_json_file(&layout.hardware_profile_path())?;
             let formatted = format_pretty_sorted_json(&profile)?;
@@ -1319,15 +1407,25 @@ pub fn execute(cli: CliArgs, out: &mut dyn Write) -> Result<i32, CliError> {
         }
         Command::Serve(opts) => serve_foreground(&layout, &opts),
         Command::PackPlan {
+            format,
             target_dir,
+            chunk_mib,
             reserve_gb,
             json,
             check,
         } => {
-            let default_base = match &layout {
-                RuntimeLayout::Checkout(c) => c.state_root.join(".tokspur"),
-                RuntimeLayout::Staged(_) => layout.tokspur_base()?,
-            };
+            let default_base = layout.tokspur_base()?;
+            if format == PackFormat::V3 {
+                return pack_command::plan_v3(
+                    &layout,
+                    target_dir.as_deref(),
+                    reserve_gb,
+                    chunk_mib.unwrap_or_else(|| format.default_chunk_mib()),
+                    json,
+                    check,
+                    out,
+                );
+            }
             let dir = target_dir.unwrap_or_else(|| {
                 serve::default_derived_pack_path(&default_base, false)
                     .parent()
@@ -1375,60 +1473,40 @@ pub fn execute(cli: CliArgs, out: &mut dyn Write) -> Result<i32, CliError> {
             Ok(if !check || plan.budget_passed { 0 } else { 1 })
         }
         Command::PackBuild {
+            format,
             output,
             reserve_gb,
             chunk_mib,
         } => {
             let tokspur_base = layout.tokspur_base()?;
-            let _lock = StateLock::acquire(&tokspur_base)?;
-            let adoption = read_json_file(&tokspur_base.join("adoption.json"))?;
-            let assets_profile = read_json_file(&layout.assets_profile_path())?;
-            check_adoption(&adoption, &assets_profile)?;
-
-            let shard_paths: Vec<PathBuf> = adoption
-                .find("target")
-                .ok()
-                .flatten()
-                .and_then(|t| t.find("assets").ok().flatten())
-                .and_then(|a| a.array().ok())
-                .ok_or_else(|| CliError::Validation("adoption missing target assets".to_owned()))?
-                .iter()
-                .filter_map(|a| a.find("path").ok().flatten())
-                .filter_map(|v| v.string().ok())
-                .filter_map(|b| std::str::from_utf8(b).ok())
-                .map(PathBuf::from)
-                .collect();
-
-            let draft_assets = adoption
-                .find("draft")
-                .ok()
-                .flatten()
-                .and_then(|t| t.find("assets").ok().flatten())
-                .and_then(|a| a.array().ok())
-                .ok_or_else(|| CliError::Validation("adoption missing draft assets".to_owned()))?;
-            let mtp_path = draft_assets
-                .iter()
-                .find(|a| {
-                    a.find("sha256")
-                        .ok()
-                        .flatten()
-                        .and_then(|v| v.string().ok())
-                        == Some(MTP_SIDECAR_SHA256.as_bytes())
-                })
-                .or_else(|| (draft_assets.len() == 1).then(|| &draft_assets[0]))
-                .and_then(|a| a.find("path").ok().flatten())
-                .and_then(|v| v.string().ok())
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    CliError::Validation("adopted draft missing MTP sidecar".to_owned())
+            if let (RuntimeLayout::Staged(staged), Some(path)) = (&layout, &output) {
+                let absolute = std::path::absolute(path).map_err(|source| CliError::Io {
+                    context: "cannot resolve pack output".to_owned(),
+                    source,
                 })?;
-
+                layout::ensure_no_symlink_components(&absolute, "pack output")?;
+                if layout::at_or_below_directory(&absolute, &staged.package_dir)? {
+                    return Err(CliError::Validation(
+                        "pack output must be outside the immutable package directory".to_owned(),
+                    ));
+                }
+            }
+            let _lock = StateLock::acquire(&tokspur_base)?;
+            if format == PackFormat::V3 {
+                return pack_command::build_v3(
+                    &layout,
+                    output.as_deref(),
+                    reserve_gb,
+                    chunk_mib,
+                    out,
+                );
+            }
+            let (shard_paths, mtp_path) = pack_command::adopted_pack_sources(&layout)?;
             let out_path = if let Some(explicit) = output {
                 explicit
             } else {
                 let derived_dir = private_dir(&tokspur_base, Path::new("derived"))?;
-                derived_dir.join("tokspur-pack-v2.asa.gguf")
+                derived_dir.join(format.filename())
             };
 
             let source_models =
@@ -1491,6 +1569,47 @@ pub fn execute(cli: CliArgs, out: &mut dyn Write) -> Result<i32, CliError> {
 mod tests {
     use super::*;
     use crate::serve::{SpeculativeAsset, build_carrier_flags, build_derived_pack_flags};
+
+    #[test]
+    fn pack_chunk_defaults_match_native_and_plan_accepts_v3_only_override() {
+        for (format, expected) in [("v2", 4), ("v3", 16)] {
+            let Command::PackBuild { chunk_mib, .. } =
+                parse_args(["pack", "build", "--format", format])
+                    .unwrap()
+                    .command
+            else {
+                panic!("expected build")
+            };
+            assert_eq!(chunk_mib, expected);
+        }
+        assert!(parse_args(["pack", "plan", "--format", "v2", "--chunk-mib", "2"]).is_err());
+        assert!(matches!(
+            parse_args(["pack", "plan", "--chunk-mib", "2", "--format", "v3"])
+                .unwrap()
+                .command,
+            Command::PackPlan {
+                chunk_mib: Some(2),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pack_v2_is_the_default_and_format_is_explicit() {
+        for action in ["plan", "build"] {
+            let implicit = parse_args(["pack", action]).unwrap();
+            assert_eq!(
+                parse_args(["pack", action, "--format", "v2"]).unwrap(),
+                implicit
+            );
+            assert_ne!(
+                parse_args(["pack", action, "--format", "v3"]).unwrap(),
+                implicit
+            );
+            assert!(parse_args(["pack", action, "--format"]).is_err());
+            assert!(parse_args(["pack", action, "--format", "v4"]).is_err());
+        }
+    }
 
     #[test]
     fn cli_args_and_serve_options_redact_paths_in_debug() {

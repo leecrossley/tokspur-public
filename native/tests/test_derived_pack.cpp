@@ -1,7 +1,9 @@
 #include "tokspur/derived_pack.hpp"
+#include "tokspur/planar_pack_v3.hpp"
 #include "tokspur/expert_lanes.hpp"
 #include "tokspur/gguf.hpp"
 #include "tokspur/numeric.hpp"
+#include "grouped_mm_fixture.hpp"
 
 #include <algorithm>
 #include <array>
@@ -13,6 +15,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
@@ -283,6 +286,177 @@ int run_cli_verify(int argc, char** argv) {
         return 1;
     }
 }
+void test_v3_authentication_sources(const std::filesystem::path& dir) {
+    using namespace tokspur::planar_v3;
+    std::filesystem::create_directory(dir);
+    std::vector<SyntheticTensorSpec> tensors{
+        {"token_embd.weight", 8, {256, 4}, make_valid_q8_rows(256, 4, 1)},
+        {"per_layer_token_embd.weight", 0, {64, 2}, make_f32_bytes(128, 2)},
+        {"output.weight", 8, {512, 256}, make_valid_q8_rows(512, 256, 3)},
+        {"output_hc_norm.weight", 0, {20000}, make_f32_bytes(20000, 4)},
+    };
+    // Exercise every v3 authentication branch, including both halves of a
+    // co-located gate/up unit and reads spanning the 32 KiB chunk boundary.
+    for (uint32_t block = 0; block < 3; ++block) {
+        const uint32_t type = block == 0 ? 12 : (block == 1 ? 13 : 8);
+        const uint32_t down_type = block == 2 ? 8 : 7;
+        const auto prefix = "blk." + std::to_string(block) + ".";
+        for (const auto* part : {"ffn_gate_exps.weight", "ffn_up_exps.weight"}) {
+            tensors.push_back({prefix + part, type, {256, 32, 4},
+                               grouped_fixture::weights({type, 256, 32, 4, 1, 1, true})});
+        }
+        tensors.push_back({prefix + "ffn_down_exps.weight", down_type, {32, 256, 4},
+                           grouped_fixture::weights({down_type, 32, 256, 4, 1, 1, true})});
+    }
+    const std::vector<SyntheticTensorSpec> mtp_tensors{
+        {"blk.48.attn_q.weight", 8, {512, 128}, make_valid_q8_rows(512, 128, 5)},
+    };
+    const auto source_path = dir / "source.gguf", mtp_path = dir / "mtp.gguf";
+    const auto pack_path = dir / "pack.asa.gguf";
+    write_gguf_shard(source_path, "qwen35moe", tensors);
+    write_gguf_shard(mtp_path, "qwen35moe", mtp_tensors);
+    const auto source = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{source_path});
+    const auto mtp = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{mtp_path});
+    static_cast<void>(build_derived_pack_v3(source, mtp, pack_path, 2, 0, 32768));
+    const auto adopt = [&](std::shared_ptr<const ModelFiles> origin, std::shared_ptr<const ModelFiles> sidecar,
+                           uint32_t workers) {
+        return adopt_derived_pack_v3(std::move(origin), std::move(sidecar), pack_path,
+                                    2, 32768, workers, TrustMode::full, false);
+    };
+    const auto single = adopt(source, mtp, 1), parallel = adopt(source, mtp, 4);
+    require(single.manifest_sha256 == parallel.manifest_sha256 && parallel.authentication_workers == 4,
+            "v3 single and parallel authentication differ");
+    const std::string_view expected_read_mode =
+#if defined(TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM) && TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM
+        "bounded_nocache";
+#else
+        "mapped";
+#endif
+    require(single.authentication_source_read_mode == expected_read_mode &&
+            parallel.authentication_source_read_mode == expected_read_mode,
+            "v3 full authentication source-read mode mismatch");
+    uint32_t layouts = 0;
+    for (const auto& tensor : single.plan.tensors) layouts |= uint32_t{1} << uint32_t(tensor.kind);
+    require(layouts == 0x3ffu, "v3 CPU authentication fixture must cover all ten tensor layouts");
+    const MappedFile packed_file(pack_path);
+    const auto packed_bytes = packed_file.bytes();
+    std::cout << "v3_auth_source_read_mode=" << expected_read_mode
+              << " manifest_sha256=" << single.manifest_sha256
+              << " pack_sha256=" << hash(std::string_view(reinterpret_cast<const char*>(packed_bytes.data()), packed_bytes.size()))
+              << '\n';
+    for (size_t i = 0; i < 2; ++i) {
+        require(std::ranges::equal(source->tensor_bytes(tensors[i].name), tensors[i].payload),
+                "CPU embedding mapping changed during v3 authentication");
+    }
+    for (size_t i = 2; i < tensors.size(); ++i) {
+        auto changed = tensors;
+        changed[i].payload.back() ^= std::byte{1};
+        const auto changed_path = dir / ("changed-" + std::to_string(i) + ".gguf");
+        write_gguf_shard(changed_path, "qwen35moe", changed);
+        const auto origin = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{changed_path});
+        refuses([&] { static_cast<void>(adopt(origin, mtp, 4)); },
+                "v3 full authentication accepted changed source tensor tail");
+    }
+    auto changed_mtp = mtp_tensors;
+    changed_mtp[0].payload.back() ^= std::byte{1};
+    const auto changed_mtp_path = dir / "changed-mtp.gguf";
+    write_gguf_shard(changed_mtp_path, "qwen35moe", changed_mtp);
+    const auto sidecar = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{changed_mtp_path});
+    refuses([&] { static_cast<void>(adopt(source, sidecar, 4)); },
+            "v3 full authentication accepted changed MTP source tail");
+#if defined(TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM) && TOKSPUR_PRIVATE_PACK_AUTH_RECLAIM
+    // The bounded descriptor must bind the same file as the retained mapping.
+    std::filesystem::rename(source_path, dir / "original-source.gguf");
+    write_gguf_shard(source_path, "qwen35moe", tensors);
+    refuses([&] { static_cast<void>(adopt(source, mtp, 4)); },
+            "v3 nocache authentication accepted a replaced source inode");
+#endif
+}
+
+void test_v3_publication(const std::filesystem::path& dir, std::shared_ptr<const ModelFiles> source,
+                         std::shared_ptr<const ModelFiles> mtp) {
+    using namespace tokspur::planar_v3;
+    std::filesystem::create_directory(dir);
+    const auto output = dir / "block.asa.gguf";
+    const auto seal = dir / "block.asa.seal";
+    const auto full = plan_derived_pack_v3(*source, mtp.get());
+    refuses([&] { static_cast<void>(build_or_verify_pack_v3(full, source, mtp, output, 2, 0, 32768)); },
+            "partial target cannot publish a full v3 recipe");
+    const auto block = plan_block_pack_v3(*source, mtp.get(), 0);
+    for (const auto* reserved : {"tokspur-pack-v2.asa.gguf", "TokSpur-Pack-V2.Gguf", "wrong.seal"}) {
+        refuses([&] { static_cast<void>(build_or_verify_pack_v3(block, source, mtp, dir / reserved, 2, 0, 32768)); },
+                "reserved pack or seal destination refused");
+    }
+    const auto budget = measure_pack_v3_budget(block, dir, {}, 2, 0, 32768);
+    require(budget.planned_pack_v3_file_bytes == block.file_bytes && budget.streaming_ring_buffer_bytes >= 65536,
+            "pack v3 budget accounts for configured Q8 write and readback buffers");
+    const auto publish = [&](uint64_t reserve = 0) {
+        return build_or_verify_pack_v3(block, source, mtp, output, 2, reserve, 32768);
+    };
+    refuses([&] {
+        static_cast<void>(build_or_verify_pack_v3(block, source, mtp, output, 2, 0, 32768,
+                                                  [] { throw FormatError("interrupted test build"); }));
+    }, "interruption refused");
+    require(count_entries(dir) == 0, "interrupted write left no partial pack or seal");
+
+    const int lock = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    require(lock >= 0 && ::flock(lock, LOCK_EX | LOCK_NB) == 0, "acquire competing output directory lock");
+    refuses([&] { static_cast<void>(publish()); }, "competing v3 publisher refused");
+    ::close(lock);
+    require(count_entries(dir) == 0, "competing writer left no output");
+
+    write_file_bytes(seal, Bytes(65, std::byte{'0'}), 0444);
+    refuses([&] { static_cast<void>(publish()); }, "orphan v3 seal refused");
+    require(!std::filesystem::exists(output) && std::filesystem::remove(seal), "orphan seal preserved");
+    require(::symlink("missing.gguf", output.c_str()) == 0, "create dangling pack symlink");
+    refuses([&] { static_cast<void>(publish()); }, "dangling v3 output symlink refused");
+    require(std::filesystem::is_symlink(output) && std::filesystem::remove(output), "output symlink preserved");
+
+    write_file_bytes(output, Bytes(64, std::byte{'x'}), 0444);
+    refuses([&] { static_cast<void>(publish()); }, "incompatible existing pack refused");
+    require(std::filesystem::file_size(output) == 64 && !std::filesystem::exists(seal) &&
+            std::filesystem::remove(output), "incompatible pack never replaced or sealed");
+    const auto built = publish();
+    require(!built.existed && built.verified.manifest_sha256.size() == 64, "built and fully authenticated new v3 pack");
+    struct stat pack_st{}, seal_st{};
+    require(::stat(output.c_str(), &pack_st) == 0 && ::stat(seal.c_str(), &seal_st) == 0 &&
+            (pack_st.st_mode & 0777) == 0444 && (seal_st.st_mode & 0777) == 0444, "v3 pack and seal immutable");
+    const auto existing = publish(std::numeric_limits<uint64_t>::max());
+    struct stat same{};
+    require(existing.existed && existing.verified.manifest_sha256 == built.verified.manifest_sha256 &&
+            ::stat(seal.c_str(), &same) == 0 && same.st_ino == seal_st.st_ino, "existing v3 seal was reused");
+    require(std::filesystem::remove(seal), "simulate interruption after pack publication");
+    const auto repaired = publish();
+    require(repaired.existed && repaired.verified.manifest_sha256 == built.verified.manifest_sha256 &&
+            ::stat(output.c_str(), &same) == 0 && same.st_ino == pack_st.st_ino, "missing v3 seal repaired in place");
+
+    require(std::filesystem::remove(seal), "remove valid seal for mismatch test");
+    write_file_bytes(seal, Bytes(64, std::byte{'0'}), 0444);
+    require(::stat(seal.c_str(), &seal_st) == 0, "stat wrong seal");
+    refuses([&] { static_cast<void>(publish()); }, "mismatched v3 seal refused");
+    require(::stat(seal.c_str(), &same) == 0 && same.st_ino == seal_st.st_ino, "mismatched seal never replaced");
+    require(std::filesystem::remove(seal), "remove wrong seal");
+    require(::symlink("missing.seal", seal.c_str()) == 0, "create dangling seal symlink");
+    refuses([&] { static_cast<void>(publish()); }, "dangling v3 seal symlink refused");
+    require(std::filesystem::is_symlink(seal) && std::filesystem::remove(seal), "seal symlink preserved");
+    static_cast<void>(publish());
+
+    // A matching manifest seal must not bypass full source verification on retry.
+    require(::chmod(output.c_str(), 0600) == 0, "unseal fixture");
+    const int fd = ::open(output.c_str(), O_RDWR | O_CLOEXEC);
+    std::byte byte{};
+    const auto offset = static_cast<off_t>(block.data_offset);
+    require(fd >= 0 && ::pread(fd, &byte, 1, offset) == 1, "read v3 test byte");
+    byte ^= std::byte{1};
+    require(::pwrite(fd, &byte, 1, offset) == 1 && ::fchmod(fd, 0444) == 0, "alter v3 test byte");
+    ::close(fd);
+    refuses([&] { static_cast<void>(publish()); }, "tampered v3 payload refused even with a matching seal");
+    require(std::filesystem::remove(seal), "remove seal on corrupt fixture");
+    refuses([&] { static_cast<void>(publish()); }, "tampered v3 payload cannot be resealed");
+    require(!std::filesystem::exists(seal) && ::stat(output.c_str(), &same) == 0 &&
+            same.st_ino == pack_st.st_ino, "corrupt pack preserved and no new seal issued");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -322,6 +496,9 @@ int main(int argc, char** argv) {
 
         auto source = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{shard0_path, shard1_path});
         auto mtp = std::make_shared<const ModelFiles>(std::vector<std::filesystem::path>{mtp_path});
+
+        test_v3_publication(root.path / "v3", source, mtp);
+        test_v3_authentication_sources(root.path / "v3-auth");
 
         // 1. Planning checks
         const auto planned = plan_derived_pack(*source, mtp.get());

@@ -3,6 +3,7 @@
 use std::ffi::CString;
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use tokspur_json::parse_json;
@@ -349,6 +350,31 @@ impl RuntimeLayout {
     }
 }
 
+/// Check directory identity as well as spelling on case-insensitive or normalizing volumes.
+/// A prospective path can include components that do not exist yet.
+pub(crate) fn at_or_below_directory(path: &Path, directory: &Path) -> Result<bool, CliError> {
+    if path.starts_with(directory) {
+        return Ok(true);
+    }
+    let identity = |entry: &Path| match std::fs::symlink_metadata(entry) {
+        Ok(meta) => Ok(Some((meta.dev(), meta.ino()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CliError::Io {
+            context: "cannot inspect staged directory identity".to_owned(),
+            source,
+        }),
+    };
+    let Some(boundary) = identity(directory)? else {
+        return Ok(false);
+    };
+    for ancestor in path.ancestors() {
+        if identity(ancestor)? == Some(boundary) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn validate_staged_state_root(
     package_dir: &Path,
     raw: Option<PathBuf>,
@@ -358,7 +384,7 @@ fn validate_staged_state_root(
     };
     let clean = validate_clean_absolute_path(&state_root, "staged state root")?;
     ensure_no_symlink_components(&clean, "staged state root")?;
-    if clean.starts_with(package_dir) || package_dir.starts_with(&clean) {
+    if at_or_below_directory(&clean, package_dir)? || at_or_below_directory(package_dir, &clean)? {
         return Err(CliError::Validation(
             "Staged state root must be separate from the immutable package directory".to_owned(),
         ));
