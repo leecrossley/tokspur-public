@@ -428,7 +428,9 @@ pub fn file_volume_uuid(fd: BorrowedFd<'_>) -> io::Result<Option<[u8; 16]>> {
     };
     if status != 0 {
         let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Unsupported {
+        // getattrlist(2) reports a volume without the attribute as ENOTSUP (45); std maps only ENOSYS and EOPNOTSUPP to `Unsupported`.
+        if error.kind() == io::ErrorKind::Unsupported || error.raw_os_error() == Some(ffi::ENOTSUP)
+        {
             return Ok(None);
         }
         return Err(error);

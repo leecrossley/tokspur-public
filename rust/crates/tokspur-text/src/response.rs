@@ -461,8 +461,14 @@ pub struct ResponseParser {
     had_calls: bool,
     executor_parameters: bool,
     token_framing: bool,
+    control_tokens: bool,
+    /// Stream offsets at which an added control token begins (see [`ResponseParser::feed_control`]).
+    controls: Vec<usize>,
     literal: LiteralState,
 }
+
+/// The frame markers that [`ResponseParser::with_control_tokens`] accepts only as added tokens.
+pub const CONTROL_MARKERS: [&[u8]; 4] = [b"<think>", b"</think>", b"<tool_call>", b"</tool_call>"];
 
 impl fmt::Debug for ResponseParser {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -554,6 +560,8 @@ impl ResponseParser {
             had_calls: false,
             executor_parameters,
             token_framing: false,
+            control_tokens: false,
+            controls: Vec::new(),
             literal: LiteralState::default(),
         })
     }
@@ -566,6 +574,39 @@ impl ResponseParser {
     pub fn with_token_framing(mut self) -> Self {
         self.token_framing = true;
         self
+    }
+
+    /// With token framing, recognises [`CONTROL_MARKERS`] only where they arrive as the tokenizer's own added tokens, fed through [`Self::feed_control`]. The same spellings built from ordinary tokens are text, so text the model copies (a file, a tool result) cannot open thinking, open or close a tool call, or hide a genuine marker behind a Markdown heuristic.
+    pub fn with_control_tokens(mut self) -> Self {
+        self.token_framing = true;
+        self.control_tokens = true;
+        self
+    }
+
+    /// Appends the bytes of one added token. Under [`Self::with_control_tokens`] a control marker fed here frames the response; any other bytes are plain [`Self::feed`] input.
+    pub fn feed_control(&mut self, bytes: &[u8]) -> ResponseStatus {
+        if self.control_tokens && CONTROL_MARKERS.contains(&bytes) {
+            self.controls.push(self.received);
+        }
+        self.feed(bytes)
+    }
+
+    /// Whether an added control token begins at `index` of `pending`.
+    fn control_at(&self, index: usize) -> bool {
+        let at = self.received - self.pending.len() + index;
+        self.controls.binary_search(&at).is_ok()
+    }
+
+    /// The first `</tool_call>` at or after `from` that may close a call frame.
+    fn call_close(&self, from: usize) -> Option<usize> {
+        let mut from = from;
+        loop {
+            let end = find_from(&self.pending, b"</tool_call>", from)?;
+            if !self.control_tokens || self.control_at(end) {
+                return Some(end);
+            }
+            from = end + 1;
+        }
     }
 
     /// The recorded error text; empty unless the status is `Error`.
@@ -868,7 +909,7 @@ impl ResponseParser {
                 self.call_in_parameter = false;
             } else {
                 let parameter = find_from(&self.pending, b"<parameter=", self.call_search);
-                let end = find_from(&self.pending, b"</tool_call>", self.call_search);
+                let end = self.call_close(self.call_search);
                 if let Some(end) = end
                     && parameter.is_none_or(|parameter| end < parameter)
                 {
@@ -898,15 +939,16 @@ impl ResponseParser {
     fn process_token_framed(&mut self, final_input: bool) -> Result<(), ResponseError> {
         while !self.pending.is_empty() || self.mode == Mode::PossibleCall {
             if self.mode == Mode::PossibleCall {
-                require(
-                    self.pending.len() <= self.limits.call_bytes,
-                    "response call byte limit",
-                )?;
                 while self.call_search < self.pending.len()
                     && matches!(self.pending[self.call_search], b' ' | b'\t' | b'\r' | b'\n')
                 {
                     self.call_search += 1;
                 }
+                // Bound only the undecided whitespace. The pending tail may already hold later calls when a whole response is fed at once; the call frame has its own bound.
+                require(
+                    self.call_search <= self.limits.call_bytes,
+                    "response call byte limit",
+                )?;
                 let rest = &self.pending[self.call_search..];
                 if rest.starts_with(b"<function=") {
                     self.mode = Mode::Call;
@@ -954,7 +996,13 @@ impl ResponseParser {
             let mut token: &[u8] = b"";
             let mut held = false;
             for (i, &c) in self.pending.iter().enumerate() {
-                if state.controls(c) {
+                let outside_literal = state.controls(c);
+                let eligible = if self.control_tokens {
+                    self.control_at(i)
+                } else {
+                    outside_literal
+                };
+                if eligible {
                     let candidates: &[&[u8]] = if self.mode == Mode::Thinking {
                         &[b"</think>"]
                     } else if !self.thought && !visible && !self.had_calls {

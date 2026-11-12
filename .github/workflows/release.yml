@@ -98,6 +98,13 @@ jobs:
       - name: Check publication sources
         run: '"$PYTHON" scripts/check_sources.py --publication'
 
+      # Install third-party Python code before any signing secret is on the runner.
+      - name: Create the hash-pinned Python environment
+        run: |
+          "$PYTHON" -m venv .venv
+          .venv/bin/python -m pip install --require-hashes --only-binary :all: --no-deps -r requirements.lock
+          .venv/bin/python -m pip install --no-build-isolation --no-deps --no-index -e .
+
       - name: Load the signing certificate into a temporary keychain
         env:
           CERTIFICATE: ${{ secrets.TOKSPUR_SIGNING_CERTIFICATE }}
@@ -118,7 +125,7 @@ jobs:
         env:
           IDENTITY: ${{ secrets.TOKSPUR_SIGNING_IDENTITY }}
         run: |
-          "$PYTHON" scripts/bootstrap.py --install-venv --codesign-identity "$IDENTITY" --codesign-keychain "$KEYCHAIN"
+          "$PYTHON" scripts/bootstrap.py --codesign-identity "$IDENTITY" --codesign-keychain "$KEYCHAIN"
           test -z "$(git status --porcelain --untracked-files=no)"
 
       - name: Package

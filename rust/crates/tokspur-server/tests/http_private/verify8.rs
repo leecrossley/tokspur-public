@@ -1951,6 +1951,7 @@ pub fn encode_text(text: &[u8]) -> Vec<u32> {
 
 pub fn session_codec() -> ServeCodec {
     ServeCodec {
+        control_ids: Vec::new(),
         render: Box::new(|request: &Json| {
             let messages = array(request, "messages");
             let last = messages.last().expect("fixture chat has a message");

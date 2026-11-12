@@ -1056,6 +1056,52 @@ struct TextStack::Impl {
         g.prepare_verify_nax(moe_layouts);
         if (g.verify_hc_gdn_fused_enabled()) g.prepare_verify_hc_gdn_fused();
     }
+    struct Verify8BoundaryFusion {
+        bool enabled = false;
+        GpuView next_gains{};
+        float next_epsilon = 0.0f;
+    };
+    Verify8BoundaryFusion verify8_boundary_fusion(size_t i, uint32_t steps) const {
+        if (!verification8 || !g.verify_nax() || steps < 2 || steps > 8 || weights.layers.empty() || i >= weights.layers.size()) {
+            return {};
+        }
+#ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
+        if (g.carrier_diagnostic_active() || g.carrier_capture_enabled()) return {};
+#endif
+#if defined(TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS) && defined(TOKSPUR_PRIVATE_GDN_PORTED)
+        if (g.gdn_route_attribution_enabled()) return {};
+#endif
+#if defined(TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS) && defined(TOKSPUR_PRIVATE_QSA_SPARSE)
+        if (g.qsa_route_attribution_enabled()) return {};
+#endif
+        const auto& v = *verification8;
+        const auto layer_uses_verify_nax = [&](size_t idx) -> bool {
+            if (std::holds_alternative<RecurrentWeights>(weights.layers[idx])) return true;
+#ifdef TOKSPUR_PRIVATE_VERIFY_QSA_ROWS
+            return v.qsa_rows_memory.config.mode == QsaVerifyRowsMode::core_and_q8;
+#else
+            return false;
+#endif
+        };
+        if (!layer_uses_verify_nax(i)) return {};
+        if (i + 1 < weights.layers.size()) {
+            if (i + 1 == shape.memory_layer || !layer_uses_verify_nax(i + 1)) return {};
+            if (const auto* nw = std::get_if<RecurrentWeights>(&weights.layers[i + 1])) {
+                if (!verify_nax_hc_write_rms_gains_supported(g, nw->attention_read.gains, shape.residual)) return {};
+                return {true, nw->attention_read.gains, policy.recurrent.rms_epsilon};
+            }
+            const auto& naw = std::get<AttentionLayerWeights>(weights.layers[i + 1]);
+            if (!verify_nax_hc_write_rms_gains_supported(g, naw.attention_read.gains, shape.residual)) return {};
+            return {true, naw.attention_read.gains, policy.attention.rms_epsilon};
+        }
+        if (!verify_nax_final_supported(g, weights.mixer, weights.output, v.recurrent.residual, shape.residual, shape.vocabulary)) {
+            return {};
+        }
+        if (!verify_nax_hc_write_rms_gains_supported(g, weights.mixer.gains, shape.residual)) {
+            return {};
+        }
+        return {true, weights.mixer.gains, policy.attention.rms_epsilon};
+    }
     uint64_t verify_nax_batch_dispatches(uint32_t steps) const {
         const auto& v = *verification8;
         uint64_t count = verify_nax_ple_supported(g, weights.memory, v.recurrent, shape.memory)
@@ -1087,14 +1133,17 @@ struct TextStack::Impl {
 #if defined(TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS) && defined(TOKSPUR_PRIVATE_QSA_SPARSE)
                     if (g.qsa_route_attribution_enabled()) count += tile_count - 2;
 #endif
+                    if (i + 1 < weights.layers.size() && verify8_boundary_fusion(i, steps).enabled) --count;
                     continue;
                 }
 #endif
                 for (uint32_t t = 0; t < steps; ++t) count += layer_dispatches(i, prefix + t);
             }
+            if (i + 1 < weights.layers.size() && verify8_boundary_fusion(i, steps).enabled) --count;
         }
         if (verify_nax_final_supported(g, weights.mixer, weights.output, v.recurrent.residual, shape.residual, shape.vocabulary)) {
-            count += verify_nax_final_dispatches(g, weights.mixer, weights.output, v.recurrent.residual, shape.residual, shape.vocabulary, steps);
+            const bool final_prenorm = !weights.layers.empty() && verify8_boundary_fusion(weights.layers.size() - 1, steps).enabled;
+            count += verify_nax_final_dispatches(g, weights.mixer, weights.output, v.recurrent.residual, shape.residual, shape.vocabulary, steps, final_prenorm);
         } else {
             count += uint64_t(steps) * (final_dispatches() - 1ull) + g.q8_many_chunks(steps);
         }
@@ -1413,6 +1462,10 @@ struct TextStack::Impl {
             }
             input = v.memory_streams;
         }
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
+        const bool in_prenorm = g.verify_nax_active() && i > 0 && verify8_boundary_fusion(i - 1, steps).enabled;
+        const auto out_fuse = g.verify_nax_active() ? verify8_boundary_fusion(i, steps) : Verify8BoundaryFusion{};
+#endif
         if (const auto* w = std::get_if<RecurrentWeights>(&weights.layers[i])) {
             const auto& state = std::get<RecurrentPair>(states[i]);
             auto scratch = v.recurrent; scratch.gdn = bind_gdn_core_tape(scratch.gdn, v.tapes[i]);
@@ -1424,7 +1477,8 @@ struct TextStack::Impl {
                     , nullptr, false
 #endif
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
-                    , g.verify_nax_active() ? &v.nax_moe : nullptr
+                    , g.verify_nax_active() ? &v.nax_moe : nullptr,
+                    in_prenorm, out_fuse.next_gains, out_fuse.next_epsilon
 #endif
                     );
             };
@@ -1454,7 +1508,8 @@ struct TextStack::Impl {
                         {shape.residual, shape.attention, shape.experts}, policy.attention, policy.router,
                         policy.normalize_selected, attn_mode, AttentionTileHcMode::combined
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
-                        , (g.verify_nax_active() && attn_mode == AttentionTileMode::core_and_q8) ? &v.nax_moe : nullptr
+                        , (g.verify_nax_active() && attn_mode == AttentionTileMode::core_and_q8) ? &v.nax_moe : nullptr,
+                        in_prenorm, out_fuse.next_gains, out_fuse.next_epsilon
 #endif
                         );
                 };
@@ -2656,6 +2711,11 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
                 if (p.dflash_tap) p.encode_dflash_tap_layer(i, i % 2 ? v.streams : v.second, p.dflash_tap->verify_gpu, steps);
 #endif
+#ifdef TOKSPUR_PRIVATE_VERIFY_EARLY_COMMIT
+                // The GPU starts on these layers while the host encodes the remaining ones. Same dispatches, in the same order; only the physical command boundary moves.
+                if (use_verify_nax && i + 1 == size_t(TOKSPUR_PRIVATE_VERIFY_EARLY_COMMIT) && i + 1 < p.weights.layers.size())
+                    static_cast<void>(p.g.commit_partial());
+#endif
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
                 // Wide correctness captures are not timing evidence. Keep each
                 // recorded batch bounded without changing the serving schedule.
@@ -2672,8 +2732,9 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
             }
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
             if (p.g.verify_nax_active() && verify_nax_final_supported(p.g, p.weights.mixer, p.weights.output, v.recurrent.residual, p.shape.residual, vocabulary)) {
+                const bool final_prenorm = !p.weights.layers.empty() && p.verify8_boundary_fusion(p.weights.layers.size() - 1, steps).enabled;
                 encode_verify_nax_final_logits(p.g, p.weights.mixer, p.weights.output, v.recurrent.residual,
-                    streams, v.mixed, v.logits, p.shape.residual, vocabulary, steps, p.policy.attention.rms_epsilon);
+                    streams, v.mixed, v.logits, p.shape.residual, vocabulary, steps, p.policy.attention.rms_epsilon, final_prenorm);
                 gpu_checked_final = true;
             } else
 #endif
@@ -3097,8 +3158,9 @@ StackVerificationResult8 TextStack::verify_greedy8(std::span<const uint32_t> tok
             }
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
             if (p.g.verify_nax_active() && verify_nax_final_supported(p.g, p.weights.mixer, p.weights.output, v.recurrent.residual, p.shape.residual, vocabulary)) {
+                const bool final_prenorm = !p.weights.layers.empty() && p.verify8_boundary_fusion(p.weights.layers.size() - 1, steps).enabled;
                 encode_verify_nax_final_logits(p.g, p.weights.mixer, p.weights.output, v.recurrent.residual,
-                    streams, v.mixed, v.logits, p.shape.residual, vocabulary, steps, p.policy.attention.rms_epsilon);
+                    streams, v.mixed, v.logits, p.shape.residual, vocabulary, steps, p.policy.attention.rms_epsilon, final_prenorm);
                 used_nax_final = true;
             } else
 #endif

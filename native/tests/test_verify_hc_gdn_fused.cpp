@@ -363,6 +363,65 @@ void test_sticky_nonfinite_guards(const char* metallib) {
         static_cast<void>(g.submit());
     }, "verify_fused_gdn_alpha_beta_f32 accepted Inf weight");
 
+    // 3. 0-ULP parity and sticky NaN guards for verify_fused_expert_gate_f32 & verify_fused_shared_logit_f32.
+    for (uint32_t sp : {1u, 16u}) {
+        g.configure_small_gemv(sp);
+        auto w_exp = make_f32_vector(512u * 2560u, 0x905u, 0.05f);
+        auto w_sh = make_f32_vector(2560u, 0x906u, 0.05f);
+        auto x8 = make_f32_vector(8u * 2560u, 0x907u, 0.5f);
+        const auto w_exp_gpu = g.upload(std::as_bytes(std::span(w_exp)), "moe.router", true);
+        const auto w_sh_gpu = g.upload(std::as_bytes(std::span(w_sh)), "moe.srouter", true);
+        const auto x8_gpu = g.upload(std::as_bytes(std::span(x8)), "moe.x8", false);
+        const auto ref_exp_gpu = g.zeros(8u * 512u * 4u, "moe.ref_exp");
+        const auto fus_exp_gpu = g.zeros(8u * 512u * 4u, "moe.fus_exp");
+        const auto ref_sh_gpu = g.zeros(8u * 4u, "moe.ref_sh");
+        const auto fus_sh_gpu = g.zeros(8u * 4u, "moe.fus_sh");
+        for (uint32_t m : {2u, 3u, 5u, 8u}) {
+            const GpuRowsF32 in_m{g.slice(x8_gpu, 0, uint64_t(m) * 2560u * 4u), m, 2560u, 2560ull * 4u};
+            const GpuRowsF32 re_m{g.slice(ref_exp_gpu, 0, uint64_t(m) * 512u * 4u), m, 512u, 512ull * 4u};
+            const GpuRowsF32 fe_m{g.slice(fus_exp_gpu, 0, uint64_t(m) * 512u * 4u), m, 512u, 512ull * 4u};
+            const GpuRowsF32 rs_m{g.slice(ref_sh_gpu, 0, uint64_t(m) * 4u), m, 1u, 4ull};
+            const GpuRowsF32 fs_m{g.slice(fus_sh_gpu, 0, uint64_t(m) * 4u), m, 1u, 4ull};
+            g.begin();
+            g.gemv_rows(0u, w_exp_gpu, in_m, re_m);
+            g.gemv_rows(0u, w_sh_gpu, in_m, rs_m);
+            g.verify_fused_expert_gate_f32(w_exp_gpu, in_m, fe_m);
+            g.verify_fused_shared_logit_f32(w_sh_gpu, in_m, fs_m);
+            static_cast<void>(g.submit());
+            std::vector<float> re(size_t(m) * 512u), fe(size_t(m) * 512u), rs(m), fs(m);
+            g.read(re_m.view, std::as_writable_bytes(std::span(re)));
+            g.read(fe_m.view, std::as_writable_bytes(std::span(fe)));
+            g.read(rs_m.view, std::as_writable_bytes(std::span(rs)));
+            g.read(fs_m.view, std::as_writable_bytes(std::span(fs)));
+            assert_exact_f32(re, fe, "verify_fused_expert_gate_f32 0-ULP parity failed");
+            assert_exact_f32(rs, fs, "verify_fused_shared_logit_f32 0-ULP parity failed");
+        }
+        if (sp == 16u) {
+            x8[3u * 2560u + 111u] = std::numeric_limits<float>::quiet_NaN();
+            g.write(x8_gpu, std::as_bytes(std::span(x8)));
+            rejects([&] {
+                g.begin();
+                g.verify_fused_expert_gate_f32(w_exp_gpu, GpuRowsF32{x8_gpu, 8u, 2560u, 2560ull * 4u},
+                                               GpuRowsF32{fus_exp_gpu, 8u, 512u, 512ull * 4u});
+                static_cast<void>(g.submit());
+            }, "verify_fused_expert_gate_f32 accepted NaN input");
+            rejects([&] {
+                g.begin();
+                g.verify_fused_shared_logit_f32(w_sh_gpu, GpuRowsF32{x8_gpu, 8u, 2560u, 2560ull * 4u},
+                                                GpuRowsF32{fus_sh_gpu, 8u, 1u, 4ull});
+                static_cast<void>(g.submit());
+            }, "verify_fused_shared_logit_f32 accepted NaN input");
+        }
+        g.release(fus_sh_gpu);
+        g.release(ref_sh_gpu);
+        g.release(fus_exp_gpu);
+        g.release(ref_exp_gpu);
+        g.release(x8_gpu);
+        g.release(w_sh_gpu);
+        g.release(w_exp_gpu);
+    }
+    g.configure_small_gemv(0u);
+
     g.release(ob_gpu);
     g.release(oa_gpu);
     g.release(wb_gpu);

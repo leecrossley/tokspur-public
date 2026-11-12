@@ -123,15 +123,24 @@ void encode_gdn_core_tile(MetalGraph& g, const GdnWeights& w, const GdnScratch& 
             return;
         }
 #endif
-        if constexpr (gdn_core_batch_elementwise) {
-            const auto active = g.slice(s.convolved, 0, uint64_t(tile.steps) * raw * 4);
-            g.activate(active, active, Activation::silu);
-        }
-        for (uint32_t step = 0; step < tile.steps; ++step) {
-            const auto t = token(g, s, shape, step);
-            if constexpr (!gdn_core_batch_elementwise) g.activate(t.convolved, t.convolved, Activation::silu);
-            g.gdn_prepare(t.convolved, t.query, t.key, t.value, shape, policy);
-            g.gdn_gates(t.alpha, t.beta, w.negative_rates, w.dt_bias, t.decay, t.write_gate);
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
+        if (verify_gdn_row_batch && gdn_core_batch_elementwise && use_verify_nax) {
+            g.gdn_gates_verify_rows(s.alpha, s.beta, w.negative_rates, w.dt_bias,
+                s.decay, s.write_gate, shape.value_heads, tile);
+            g.gdn_silu_prepare_verify_rows(s.convolved, s.query, s.key, s.value, shape, policy, tile);
+        } else
+#endif
+        {
+            if constexpr (gdn_core_batch_elementwise) {
+                const auto active = g.slice(s.convolved, 0, uint64_t(tile.steps) * raw * 4);
+                g.activate(active, active, Activation::silu);
+            }
+            for (uint32_t step = 0; step < tile.steps; ++step) {
+                const auto t = token(g, s, shape, step);
+                if constexpr (!gdn_core_batch_elementwise) g.activate(t.convolved, t.convolved, Activation::silu);
+                g.gdn_prepare(t.convolved, t.query, t.key, t.value, shape, policy);
+                g.gdn_gates(t.alpha, t.beta, w.negative_rates, w.dt_bias, t.decay, t.write_gate);
+            }
         }
         TOKSPUR_OPERATOR_CHECKPOINT(g,"gdn","verify_projections_convolution_activation_prepare",{tile.steps,shape.channels,shape.value_heads,shape.value_width});
         g.gdn_delta_tile(accepted.matrix, s.query, s.key, s.value, s.decay, s.write_gate,
@@ -141,8 +150,15 @@ void encode_gdn_core_tile(MetalGraph& g, const GdnWeights& w, const GdnScratch& 
             const auto active = [&](GpuView v) { return g.slice(v, 0, uint64_t(tile.steps) * value * 4); };
             // RMS groups share the same per-channel gains. Slice only committed
             // input rows; inactive scratch/tape tails remain untouched.
-            g.rms(active(s.raw), w.gains, active(s.normalized), shape.value_width, policy.rms_epsilon);
-            g.multiply(active(s.normalized), active(s.gate), active(s.gated), true);
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
+            if (verify_gdn_row_batch && use_verify_nax) {
+                g.rms_sigmoid_gate(active(s.raw), w.gains, active(s.gate), active(s.gated), shape.value_width, policy.rms_epsilon);
+            } else
+#endif
+            {
+                g.rms(active(s.raw), w.gains, active(s.normalized), shape.value_width, policy.rms_epsilon);
+                g.multiply(active(s.normalized), active(s.gate), active(s.gated), true);
+            }
         } else {
             for (uint32_t step = 0; step < tile.steps; ++step) {
                 const auto t = token(g, s, shape, step);

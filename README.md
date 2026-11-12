@@ -35,6 +35,12 @@ tokspur serve
 
 Connect to `http://127.0.0.1:18081/v1` with model `tokspur` and the generated API key.
 
+### Pack formats
+
+`tokspur pack build` writes the planar Pack v3 from the adopted target and MTP sidecar, and `tokspur serve` loads it. Allow about **130 GiB free** for this model's 80 GiB pack and the default 50 GiB reserve.
+
+`tokspur serve` falls back to an installed Pack v2 when no v3 pack is present. Pass `--format v2` to `pack plan` and `pack build` for the older layout, or `--pack-v3` to `serve` to refuse the fallback. You can keep both formats. The server reports the loaded format at startup.
+
 ## Build
 
 Install Xcode with the Metal toolchain, Git, Python 3.12 and Rust 1.99.1. Run these commands from the checkout root.

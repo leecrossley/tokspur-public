@@ -180,7 +180,7 @@ std::vector<SparseTokenMass> target_sparse_grid_units(const SamplingDistribution
     require(probs.size() == support.size(), "sampled path target support probabilities");
 #endif
     std::vector<SparseTokenMass> masses;
-    const bool dense = prepared_sampling() && support.size() == distribution.vocabulary();
+    const bool dense = support.size() == distribution.vocabulary();
     if (dense) masses.resize(support.size());
     else masses.reserve(support.size());
     Cumulative cumulative;

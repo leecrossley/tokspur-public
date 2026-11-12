@@ -547,6 +547,11 @@ impl NativeText {
         Ok(self.bpe.decode_text(ids, skip_special)?)
     }
 
+    /// The ID of the added token whose content is exactly `content`, if there is one.
+    pub fn added_token(&self, content: &[u8]) -> Option<u32> {
+        self.bpe.added_token(content)
+    }
+
     pub fn vocabulary_size(&self) -> usize {
         self.bpe.vocabulary_size()
     }

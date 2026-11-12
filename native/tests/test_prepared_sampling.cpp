@@ -1,5 +1,6 @@
 #include "tokspur/prepared_sampling.hpp"
 #include "tokspur/mtp_sampling.hpp"
+#include "tokspur/sampled_path_detail.hpp"
 #include <array>
 #include <bit>
 #include <functional>
@@ -55,6 +56,23 @@ int main() {
                 check(old.acceptance_words == now.acceptance_words && old.terminal_words == now.terminal_words);
                 for (uint32_t i = 0; i < old.count; ++i) check(old.tokens[i].id == now.tokens[i].id &&
                     std::bit_cast<uint32_t>(old.tokens[i].source_logit) == std::bit_cast<uint32_t>(now.tokens[i].source_logit));
+            }
+        }
+        // Ordinary serving places a complete support's integer masses directly and sorts a filtered one. Either way they are the dense reference's masses in ascending token order.
+        configure_prepared_sampling(false);
+        for (const auto policy : {SamplingPolicy{1, 0, 1, 0}, SamplingPolicy{.7, 0, .95, 0}, SamplingPolicy{1, 0, 1, .01}, SamplingPolicy{1, 20, .95, 0}}) {
+            for (const auto* row : {&wide, &other}) {
+                const auto distribution = sampling_distribution(*row, policy);
+                const auto dense = sampled_path_detail::target_grid_units(distribution);
+                const auto sparse = sampled_path_detail::target_sparse_grid_units(distribution);
+                check(dense.size() == vocabulary && sparse.size() == distribution.support().size());
+                uint64_t total = 0;
+                for (size_t i = 0; i < sparse.size(); ++i) {
+                    check((i == 0 || sparse[i - 1].token_id < sparse[i].token_id) && sparse[i].token_id < vocabulary &&
+                        sparse[i].mass == dense[sparse[i].token_id] && distribution.probability(sparse[i].token_id) > 0);
+                    total += sparse[i].mass;
+                }
+                check(total == sampled_path_grid_size);
             }
         }
         std::array<float, 3> invalid{std::numeric_limits<float>::denorm_min(), 1, std::numeric_limits<float>::quiet_NaN()};

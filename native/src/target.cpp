@@ -11,11 +11,14 @@
 #include "tokspur/carrier_phase.hpp"
 #include "tokspur/carrier_cost_replay.hpp"
 #include "tokspur/target.hpp"
+#include "tokspur/gdn_tile.hpp"
+#include "tokspur/gdn_core_tile.hpp"
 #include <exception>
 #include "tokspur/worker_identity.hpp"
 #include "tokspur/stack.hpp"
 #include "tokspur/shared_prefix_restore.hpp"
 #include "tokspur/memory_guard.hpp"
+#include "tokspur/shared_prefix_eviction.hpp"
 #if defined(TOKSPUR_PRIVATE_CACHE_PRESSURE_RECLAIM) && TOKSPUR_PRIVATE_CACHE_PRESSURE_RECLAIM
 #include <malloc/malloc.h>
 #endif
@@ -126,6 +129,12 @@
 #if TOKSPUR_PRIVATE_M5_RESOURCE_SCREEN != 0 && TOKSPUR_PRIVATE_M5_RESOURCE_SCREEN != 1
 #error "TOKSPUR_PRIVATE_M5_RESOURCE_SCREEN must be 0 or 1"
 #endif
+#ifndef TOKSPUR_PRIVATE_PLE_CACHE_MIB
+#define TOKSPUR_PRIVATE_PLE_CACHE_MIB 0
+#endif
+#if TOKSPUR_PRIVATE_PLE_CACHE_MIB != 0 && TOKSPUR_PRIVATE_PLE_CACHE_MIB != 256 && TOKSPUR_PRIVATE_PLE_CACHE_MIB != 512
+#error "TOKSPUR_PRIVATE_PLE_CACHE_MIB must be 0 (automatic), 256 or 512"
+#endif
 
 namespace tokspur {
 namespace {
@@ -133,7 +142,9 @@ namespace {
 [[gnu::used]] const char carrier_diagnostic_build_marker[] = "tokspur-carrier-diagnostic-v1";
 #endif
 constexpr uint64_t gib = uint64_t(1024) * 1024 * 1024, native_limit = 96 * gib;
-constexpr uint64_t cache_budget = TOKSPUR_PRIVATE_M5_RESOURCE_SCREEN ? gib / 4 : gib / 2;
+constexpr uint64_t cache_budget = TOKSPUR_PRIVATE_PLE_CACHE_MIB
+    ? uint64_t(TOKSPUR_PRIVATE_PLE_CACHE_MIB) * 1024 * 1024
+    : (TOKSPUR_PRIVATE_M5_RESOURCE_SCREEN ? gib / 4 : gib / 2);
 constexpr uint64_t gpu_budget = native_limit - gib / 2 - 2 * gib;
 using Clock = std::chrono::steady_clock;
 double milliseconds(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
@@ -142,6 +153,47 @@ Json number(double v) {
     require(std::isfinite(v), "nonfinite target diagnostic"); std::array<char, 64> data{};
     const auto r = std::to_chars(data.data(), data.data() + data.size(), v); require(r.ec == std::errc{}, "target JSON number encoding failed");
     return parse_json({data.data(), size_t(r.ptr - data.data())});
+}
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM
+Json verify_nax_batch_metadata(Json value, const MetalGraph& gpu) {
+    const auto* event = value.find("event");
+    if (!event || (event->string() != "ready" && event->string() != "done")) return value;
+    auto fields = value.object();
+    const auto t = gpu.verify_nax_top10_mixture_telemetry();
+    fields.emplace_back("native_verify_nax_batch_top10_mixture_enabled", Json(verify_nax_batch_top10_mixture_enabled));
+    fields.emplace_back("native_verify_nax_ops_counter_scope", Json("worker-lifetime completed verification operator encodings; includes subsequently aborted submissions; excludes prefill and drafter"));
+    fields.emplace_back("native_verify_top10_batched_calls", Json::integer(t.top10_batched_calls));
+    fields.emplace_back("native_verify_top10_batched_rows", Json::integer(t.top10_batched_rows));
+    fields.emplace_back("native_verify_top10_scalar_calls", Json::integer(t.top10_scalar_calls));
+    fields.emplace_back("native_verify_mixture_batched_calls", Json::integer(t.mixture_batched_calls));
+    fields.emplace_back("native_verify_mixture_batched_rows", Json::integer(t.mixture_batched_rows));
+    fields.emplace_back("native_verify_mixture_scalar_calls", Json::integer(t.mixture_scalar_calls));
+    return Json(std::move(fields));
+}
+#endif
+Json cache_memory_metadata(Json value, const MetalGraph& gpu) {
+    const auto* event = value.find("event");
+    if (!event || (event->string() != "ready" && event->string() != "done")) return value;
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM
+    value = verify_nax_batch_metadata(std::move(value), gpu);
+#endif
+    auto fields = value.object();
+    // The selected limit remains stable if pressure reclamation releases the cache.
+    fields.emplace_back("host_row_cache_budget_bytes", Json::integer(cache_budget));
+    const auto tile64 = gpu.q8_tile64_cache_stats();
+    fields.emplace_back("q8_tile64_cache_enabled", Json(tile64.enabled));
+    fields.emplace_back("q8_tile64_registered_candidates", Json::integer(tile64.registered_candidates));
+    fields.emplace_back("q8_tile64_registered_source_bytes", Json::integer(tile64.registered_source_bytes));
+    fields.emplace_back("q8_tile64_candidate_repack_logical_bytes", Json::integer(tile64.candidate_repack_logical_bytes));
+    fields.emplace_back("q8_tile64_covered_candidates", Json::integer(tile64.covered_candidates));
+    fields.emplace_back("q8_tile64_omitted_candidates", Json::integer(tile64.omitted_candidates));
+    fields.emplace_back("q8_tile64_omitted_repack_logical_bytes", Json::integer(tile64.omitted_repack_logical_bytes));
+    fields.emplace_back("q8_tile64_owning_allocations", Json::integer(tile64.owning_allocations));
+    fields.emplace_back("q8_tile64_owned_logical_bytes", Json::integer(tile64.owned_logical_bytes));
+    fields.emplace_back("q8_tile64_owned_charged_bytes", Json::integer(tile64.owned_charged_bytes));
+    fields.emplace_back("q8_tile64_aliases", Json::integer(tile64.aliases));
+    fields.emplace_back("q8_tile64_candidate_scope", Json("raw registered matrices; sums may overlap; omissions checked per source key; allocation bytes count distinct live owners only"));
+    return Json(std::move(fields));
 }
 #ifdef TOKSPUR_PRIVATE_PLE_GATE_COMPAT
 Json ple_gate_metadata(Json value, std::optional<PleGateTransform> transform) {
@@ -4682,6 +4734,9 @@ int target_cli(int argc, char** argv) {
         std::vector<uint32_t> active_tokens;
         bool active_valid = false;
         uint64_t tick = 0, occupied_bytes = 0, captures = 0, hits = 0, restored_tokens = 0;
+#if defined(TOKSPUR_PRIVATE_SHARED_PREFIX_EVICTION_COUNTERS) && TOKSPUR_PRIVATE_SHARED_PREFIX_EVICTION_COUNTERS
+        SharedPrefixEvictionCounters evictions{};
+#endif
     } shared_prefix_cache;
     if (shared_prefix_cache_enabled) {
         shared_prefix_cache.active_tokens.reserve(SharedPrefixCacheState::max_prefix_tokens);
@@ -4802,6 +4857,28 @@ int target_cli(int argc, char** argv) {
     std::vector<std::byte> concurrent_state_scratch(concurrent_state_proof ? 1000000 : 0);
 #endif
     const auto math_envelope = [&](Json value) {
+#if defined(TOKSPUR_PRIVATE_MEMORY_PLAN_REPORT) && TOKSPUR_PRIVATE_MEMORY_PLAN_REPORT
+        // Report-only: computed from readings the events already take; no budget reads it.
+        if (const auto* event = value.find("event"); event && (event->string() == "ready" || event->string() == "done")) {
+            const auto now = memory();
+            const auto plan = memory_plan_room(native_limit, now.current, memory_plan_reserve_bytes);
+            const uint64_t staging = ssd_manager && ssd_manager->enabled() ? uint64_t(staging_slab_bytes) : 0;
+            auto fields = value.object();
+            fields.emplace_back("memory_plan", Json(Json::Object{{"schema", Json::integer(1)}, {"applied", Json(false)},
+                {"engine_limit_bytes", Json::integer(native_limit)}, {"physical_footprint_bytes", Json::integer(now.current)},
+                {"lifetime_peak_footprint_bytes", Json::integer(now.peak)},
+                {"gpu_ledger_live_bytes", Json::integer(gpu.memory().live_bytes)},
+                {"gpu_ledger_peak_bytes", Json::integer(gpu.memory().peak_bytes)},
+                {"imported_weight_backing_bytes", Json::integer(gpu.memory().imported_backing_bytes)},
+                {"row_cache_charged_bytes", Json::integer(cache.charged_bytes())},
+                {"shared_prefix_anchor_bytes", Json::integer(shared_prefix_cache.occupied_bytes)},
+                {"ssd_staging_bytes", Json::integer(staging)}, {"reserve_bytes", Json::integer(memory_plan_reserve_bytes)},
+                {"room_bytes", Json::integer(plan.room)}, {"rule", Json(std::string("half_of_room"))},
+                {"would_allow_cache_bytes", Json::integer(plan.would_allow_cache_bytes)},
+                {"unavailable", Json(Json::Array{Json(std::string("session_state_bytes")), Json(std::string("drafter_state_bytes"))})}}));
+            value = Json(std::move(fields));
+        }
+#endif
 #if defined(TOKSPUR_PRIVATE_CACHE_PRESSURE_RECLAIM) && TOKSPUR_PRIVATE_CACHE_PRESSURE_RECLAIM
         if (const auto* event = value.find("event"); event && (event->string() == "ready" || event->string() == "done")) {
             auto fields = value.object(); fields.emplace_back("native_cache_pressure_reclaim", Json(true));
@@ -4914,6 +4991,7 @@ int target_cli(int argc, char** argv) {
                 fields.emplace_back("derived_pack_file_bytes", Json::integer(pack_v3->plan.file_bytes));
                 fields.emplace_back("derived_pack_payload_bytes", Json::integer(pack_v3->plan.payload_bytes));
                 fields.emplace_back("derived_pack_auth_workers", Json::integer(pack_v3->authentication_workers));
+                fields.emplace_back("derived_pack_auth_source_read_mode", Json(std::string(pack_v3->authentication_source_read_mode)));
             }
             value = Json(std::move(fields));
         }
@@ -5295,6 +5373,12 @@ int target_cli(int argc, char** argv) {
                 fields.emplace_back("shared_prefix_cache_captures", Json::integer(shared_prefix_cache.captures));
                 fields.emplace_back("shared_prefix_cache_hits", Json::integer(shared_prefix_cache.hits));
                 fields.emplace_back("shared_prefix_cache_restored_tokens", Json::integer(shared_prefix_cache.restored_tokens));
+#if defined(TOKSPUR_PRIVATE_SHARED_PREFIX_EVICTION_COUNTERS) && TOKSPUR_PRIVATE_SHARED_PREFIX_EVICTION_COUNTERS
+                fields.emplace_back("shared_prefix_cache_evictions", Json(Json::Object{
+                    {"bytes", Json::integer(shared_prefix_cache.evictions.bytes)},
+                    {"count", Json::integer(shared_prefix_cache.evictions.count)},
+                    {"both", Json::integer(shared_prefix_cache.evictions.both)}}));
+#endif
                 value = Json(std::move(fields));
             }
         }
@@ -5423,6 +5507,12 @@ int target_cli(int argc, char** argv) {
 #endif
 #endif
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
+            fields.emplace_back("native_gdn_cooperative4", Json(gdn_cooperative4_enabled));
+            fields.emplace_back("native_verify_gdn_row_batch", Json(verify_gdn_row_batch));
+#ifdef TOKSPUR_PRIVATE_VERIFY_EARLY_COMMIT
+            // The build's selection only: a batch that is not a plain NAX verification still uses one command buffer.
+            fields.emplace_back("native_verify_early_commit", Json::integer(TOKSPUR_PRIVATE_VERIFY_EARLY_COMMIT));
+#endif
             if (native_verify_nax.has_value()) {
                 fields.emplace_back("native_verify_nax", Json(gpu.verify_nax()));
             }
@@ -5457,6 +5547,7 @@ int target_cli(int argc, char** argv) {
         return value;
     };
     const auto decorate = [&](Json value) {
+        value = cache_memory_metadata(std::move(value), gpu);
         value = math_envelope(std::move(value));
 #ifdef TOKSPUR_PRIVATE_HTTP_QSA_STAGE_V8
         value = stage_envelope(std::move(value));
@@ -5490,6 +5581,12 @@ int target_cli(int argc, char** argv) {
         {"verification_cost_sealed_source_sha256", verification_cost_manifest ? Json(verification_cost_manifest->sealed_source_sha256) : Json()},
 #endif
         {"policy", options}, {"weight_setup_ms", number(milliseconds(start))}, {"tracked_metal_buffer_bytes", Json::integer(gpu.memory().live_bytes)},
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM
+        {"prefill_batch_top10_enabled", Json(gpu.prefill_batch_top10())},
+        {"prefill_batch_mixture_enabled", Json(gpu.prefill_batch_mixture())},
+        {"prefill_top10_kernel", Json(gpu.prefill_batch_top10() ? "graph_route_batch" : "graph_route")},
+        {"prefill_mixture_kernel", Json(gpu.prefill_batch_mixture() ? "graph_mixture_batch" : "graph_mixture")},
+#endif
         {"peak_metal_buffer_bytes", Json::integer(gpu.memory().peak_bytes)}, {"gpu_allocation_count", Json::integer(gpu.memory().allocations)},
         {"gpu_buffer_limit_bytes", Json::integer(gpu.memory().budget)}, {"live_captures", Json::integer(gpu.memory().live_captures)},
         {"imported_weight_backing_bytes", Json::integer(gpu.memory().imported_backing_bytes)}, {"imported_regions", Json::integer(imported_region_count)}, {"weight_copy", Json(false)},
@@ -6308,24 +6405,15 @@ int target_cli(int argc, char** argv) {
         while ((shared_prefix_cache.occupied_bytes + needed_ram > SharedPrefixCacheState::max_ram_bytes ||
                 shared_prefix_cache.anchors.size() >= SharedPrefixCacheState::max_anchors) &&
                !shared_prefix_cache.anchors.empty()) {
-            size_t victim = shared_prefix_cache.anchors.size();
-            for (size_t idx = 0; idx < shared_prefix_cache.anchors.size(); ++idx) {
-                const auto& item = shared_prefix_cache.anchors[idx];
-                const bool is_own_prefix = item.tokens.size() < prefix_tokens.size() &&
-                    std::equal(item.tokens.begin(), item.tokens.end(), prefix_tokens.begin());
-                if (!is_own_prefix && (victim == shared_prefix_cache.anchors.size() ||
-                    item.last_access_tick < shared_prefix_cache.anchors[victim].last_access_tick)) {
-                    victim = idx;
-                }
-            }
-            if (victim == shared_prefix_cache.anchors.size()) {
-                victim = 0;
-                for (size_t idx = 1; idx < shared_prefix_cache.anchors.size(); ++idx) {
-                    if (shared_prefix_cache.anchors[idx].last_access_tick < shared_prefix_cache.anchors[victim].last_access_tick) {
-                        victim = idx;
-                    }
-                }
-            }
+#if defined(TOKSPUR_PRIVATE_SHARED_PREFIX_EVICTION_COUNTERS) && TOKSPUR_PRIVATE_SHARED_PREFIX_EVICTION_COUNTERS
+            shared_prefix_cache.evictions.record(shared_prefix_eviction_cause(
+                shared_prefix_cache.occupied_bytes + needed_ram > SharedPrefixCacheState::max_ram_bytes,
+                shared_prefix_cache.anchors.size() >= SharedPrefixCacheState::max_anchors));
+#endif
+            const size_t victim = shared_prefix_victim(SharedPrefixEvictionPolicy::lru, shared_prefix_cache.anchors,
+                std::span<const uint32_t>(prefix_tokens.data(), prefix_tokens.size()),
+                [](const SharedPrefixAnchor& item) -> const std::vector<uint32_t>& { return item.tokens; },
+                [](const SharedPrefixAnchor& item) { return item.last_access_tick; });
             shared_prefix_cache.occupied_bytes -= shared_prefix_cache.anchors[victim].ram_bytes();
             shared_prefix_cache.anchors.erase(shared_prefix_cache.anchors.begin() + ptrdiff_t(victim));
         }
@@ -6415,6 +6503,11 @@ int target_cli(int argc, char** argv) {
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
     bool carrier_component_needs_reset = false, carrier_preparation_sealed = false;
     std::vector<float> carrier_component_rows(carrier_forced_input ? 8 * 2560 : 0), carrier_component_memory(carrier_forced_input ? 8 * 2560 : 0);
+#endif
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM
+    double last_prefill_wall_ms = 0.0;
+    uint64_t last_prefill_dispatches = 0;
+    PrefillTop10MixtureTelemetry last_prefill_top10_mixture_stats{};
 #endif
     std::string line;
     while (true) {
@@ -6718,9 +6811,9 @@ int target_cli(int argc, char** argv) {
                 for (const auto token : job.tokens) advance(token);
                 if (!carrier_capture_path.empty()) carrier_state_record(stack, "carrier_diagnostic_preparation_state", 0);
                 carrier_preparation_sealed = true;
-                std::cout << Json(Json::Object{{"event", Json("done")}, {"carrier_preparation", Json(true)}, {"component_kind", Json("ordinary-history")},
+                std::cout << cache_memory_metadata(Json(Json::Object{{"event", Json("done")}, {"carrier_preparation", Json(true)}, {"component_kind", Json("ordinary-history")},
                     {"base", Json::integer(position)}, {"steps", Json::integer(steps)}, {"committed_prefix", Json::integer(stack.position())},
-                    {"continuation_allowed", Json(true)}, {"timings_qualified", Json(false)}}).dump() << std::endl;
+                    {"continuation_allowed", Json(true)}, {"timings_qualified", Json(false)}}), gpu).dump() << std::endl;
                 continue;
             }
             const auto carrier_prefix = carrier_component ? carrier_component_prefix(*carrier_component, uint32_t(job.tokens.size())) : 0u;
@@ -6757,10 +6850,10 @@ int target_cli(int argc, char** argv) {
                     sampler.invalidate(); retained.clear(); carrier_component_needs_reset = true;
                 }
                 { TOKSPUR_CARRIER_PHASE(publication);
-                std::cout << Json(Json::Object{{"event", Json("done")}, {"carrier_component", Json(true)}, {"component_kind", Json("target-rows")},
+                std::cout << cache_memory_metadata(Json(Json::Object{{"event", Json("done")}, {"carrier_component", Json(true)}, {"component_kind", Json("target-rows")},
                     {"base", Json::integer(position)}, {"rows", Json::integer(count)}, {"accepted_prefix", Json::integer(carrier_prefix)},
                     {"committed_prefix", Json::integer(stack.position())}, {"continuation_allowed", Json(count == 1)},
-                    {"wall_ms", number(milliseconds(component_started))}, {"timings_qualified", Json(false)}}).dump() << std::endl; }
+                    {"wall_ms", number(milliseconds(component_started))}, {"timings_qualified", Json(false)}}), gpu).dump() << std::endl; }
                 continue;
             }
 #endif
@@ -6887,6 +6980,12 @@ int target_cli(int argc, char** argv) {
             require(!job.lookup || !job.branch || (lookup_active && lookup->matches(position)), "branch lookup restore requires coherent current ancestry; use explicit cold reset");
             if (broker) broker->started(*ticket);
             const auto started = Clock::now();
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM
+            const uint64_t dispatches_before_prefill = gpu.lifetime_dispatches();
+            if (!job.tokens.empty() || job.reset) {
+                gpu.reset_prefill_top10_mixture_telemetry();
+            }
+#endif
 #ifdef TOKSPUR_PRIVATE_PREFILL_HC_DOWN_F32
             hc_down_f32_request_before = gpu.prefill_hc_down_f32_encoded_calls();
 #endif
@@ -7379,6 +7478,20 @@ int target_cli(int argc, char** argv) {
             }
 #endif
             const auto prefill_ms = milliseconds(started); Json::Array generated; double batch_wall = 0, batch_gpu = 0;
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM
+            const uint64_t prefill_dispatches = gpu.lifetime_dispatches() - dispatches_before_prefill;
+            if (!job.tokens.empty()) {
+                last_prefill_wall_ms = prefill_ms;
+                last_prefill_dispatches = prefill_dispatches;
+                last_prefill_top10_mixture_stats = gpu.prefill_top10_mixture_telemetry();
+            } else if (job.reset) {
+                last_prefill_wall_ms = 0.0;
+                last_prefill_dispatches = 0;
+                last_prefill_top10_mixture_stats = {};
+            }
+            const auto prefill_top10_mixture_stats = !job.tokens.empty() ? gpu.prefill_top10_mixture_telemetry() : last_prefill_top10_mixture_stats;
+            const uint64_t effective_prefill_dispatches = !job.tokens.empty() ? prefill_dispatches : last_prefill_dispatches;
+#endif
 #ifdef TOKSPUR_PRIVATE_VERIFICATION_COST
             if (verification_cost_manifest) run_verification_cost(verification_cost_manifest->prefixes[verification_cost_prefix++]);
 #endif
@@ -7911,7 +8024,28 @@ int target_cli(int argc, char** argv) {
             std::cout << decorate(lookup_report(Json(Json::Object{{"event", Json("done")}, {"generated_ids", Json(std::move(generated))}, {"committed_prefix", Json::integer(stack.position())},
                 {"status", Json(stop_id ? "stopped" : job.generate ? "length" : "prefilled")}, {"finish_reason", stop_id ? Json("stop") : job.generate ? Json("length") : Json()},
                 {"stop_id", stop_id ? Json::integer(*stop_id) : Json()}, {"continuation_allowed", Json(retained.continuable(stack.position()))},
-                {"prefill_wall_ms", number(prefill_ms)}, {"request_wall_ms", number(milliseconds(started))}, {"generation_batch_wall_ms", number(batch_wall)}, {"generation_batch_gpu_ms", number(batch_gpu)},
+                {"prefill_wall_ms", number(prefill_ms)},
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM
+                {"last_prefill_wall_ms", number(last_prefill_wall_ms)},
+#endif
+                {"request_wall_ms", number(milliseconds(started))}, {"generation_batch_wall_ms", number(batch_wall)}, {"generation_batch_gpu_ms", number(batch_gpu)},
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM
+                {"prefill_batch_top10_enabled", Json(gpu.prefill_batch_top10())},
+                {"prefill_batch_mixture_enabled", Json(gpu.prefill_batch_mixture())},
+                {"prefill_dispatches", Json::integer(effective_prefill_dispatches)},
+                {"prefill_moe_batch_calls", Json::integer(prefill_top10_mixture_stats.moe_batch_calls)},
+                {"prefill_moe_batch_rows", Json::integer(prefill_top10_mixture_stats.moe_batch_rows)},
+                {"prefill_moe_batch_min_rows", Json::integer(prefill_top10_mixture_stats.moe_batch_min_rows)},
+                {"prefill_moe_batch_max_rows", Json::integer(prefill_top10_mixture_stats.moe_batch_max_rows)},
+                {"prefill_top10_batched_calls", Json::integer(prefill_top10_mixture_stats.top10_batched_calls)},
+                {"prefill_top10_batched_rows", Json::integer(prefill_top10_mixture_stats.top10_batched_rows)},
+                {"prefill_top10_scalar_calls", Json::integer(prefill_top10_mixture_stats.top10_scalar_calls)},
+                {"prefill_top10_fallbacks", Json::integer(prefill_top10_mixture_stats.top10_fallbacks)},
+                {"prefill_mixture_batched_calls", Json::integer(prefill_top10_mixture_stats.mixture_batched_calls)},
+                {"prefill_mixture_batched_rows", Json::integer(prefill_top10_mixture_stats.mixture_batched_rows)},
+                {"prefill_mixture_scalar_calls", Json::integer(prefill_top10_mixture_stats.mixture_scalar_calls)},
+                {"prefill_mixture_fallbacks", Json::integer(prefill_top10_mixture_stats.mixture_fallbacks)},
+#endif
                 {"prefill_generation_overlap", Json(request_overlap_pipelined ? "16_token_b10_pipelined" : "none")},
 #ifdef TOKSPUR_PRIVATE_QSA_STAGE_V8
                 {"qsa_stage_v8_prepared", Json(qsa_stage_policy.prepared)}, {"qsa_stage_v8_enabled", Json(qsa_stage_policy.enabled)},

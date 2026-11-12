@@ -300,6 +300,7 @@ pub const EEXIST: c_int = 17;
 pub const ERANGE: c_int = 34;
 pub const EAGAIN: c_int = 35;
 pub const EINPROGRESS: c_int = 36;
+pub const ENOTSUP: c_int = 45;
 pub const EADDRINUSE: c_int = 48;
 pub const ECONNREFUSED: c_int = 61;
 

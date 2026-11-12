@@ -95,19 +95,22 @@ void encode_moe_q8_three_rows(MetalGraph& g, const MoeWeights& w, const MoeScrat
         }
         const auto token=[&](uint32_t t){std::array<GpuView,10> x{};for(size_t i=0;i<x.size();++i)x[i]=row(g,v[i],n[i],t);return MoeScratch{x[0],x[1],x[2],x[3],x[4],x[5],x[6],x[7],x[8],x[9]};};
         const bool planar = is_planar_moe(g, w, shape);
-        for(uint32_t t=0;t<3;++t){const auto r=token(t);const auto x=row(g,input,shape.channels,t);
-            g.gemv(w.router.encoding,w.router.view,x,r.logits,shape.channels,shape.experts);g.route(r.logits,r.indices,r.weights,shape.selected,mode,normalize);
-            TOKSPUR_OPERATOR_CHECKPOINT(g,"moe","three_row_router_topk",{1,shape.channels,shape.experts,shape.selected});
+        // Rows are independent: every projection, then every top-k, so a concurrent batch needs one barrier here instead of one per row.
+        const auto rows3=[&](GpuView x,uint32_t width){return GpuRowsF32{active(x,width),3,width,uint64_t(width)*4};};
+        g.gemv_rows(w.router.encoding,w.router.view,rows3(input,shape.channels),rows3(s.logits,shape.experts));
+        for(uint32_t t=0;t<3;++t){const auto r=token(t);g.route(r.logits,r.indices,r.weights,shape.selected,mode,normalize);}
+        TOKSPUR_OPERATOR_CHECKPOINT(g,"moe","three_row_router_topk",{3,shape.channels,shape.experts,shape.selected});
 #ifdef TOKSPUR_PRIVATE_ROUTE_LOCK
-            g.route_lock_rows(r.logits,r.indices,r.weights,1,shape.channels,shape.experts,shape.selected,t);
+        for(uint32_t t=0;t<3;++t){const auto r=token(t);g.route_lock_rows(r.logits,r.indices,r.weights,1,shape.channels,shape.experts,shape.selected,t);}
 #endif
-            if (!planar) {
+        if (!planar) {
+            // The same per-row dispatches, stage by stage: each stage reads only its own row's earlier results.
+            for(uint32_t t=0;t<3;++t){const auto r=token(t);const auto x=row(g,input,shape.channels,t);
                 g.routed_gemv(w.gate.encoding,w.gate.view,r.indices,x,r.gate,shape.channels,shape.hidden,shape.experts,true);
-                g.routed_gemv(w.up.encoding,w.up.view,r.indices,x,r.up,shape.channels,shape.hidden,shape.experts,true);
-                g.swiglu(r.gate,r.up,r.gate);
-                g.routed_gemv(w.down.encoding,w.down.view,r.indices,r.gate,r.down,shape.hidden,shape.channels,shape.experts,false);
-                TOKSPUR_OPERATOR_CHECKPOINT(g,"moe","three_row_routed_experts",{1,shape.channels,shape.hidden,shape.selected});
-            }
+                g.routed_gemv(w.up.encoding,w.up.view,r.indices,x,r.up,shape.channels,shape.hidden,shape.experts,true);}
+            for(uint32_t t=0;t<3;++t){const auto r=token(t);g.swiglu(r.gate,r.up,r.gate);}
+            for(uint32_t t=0;t<3;++t){const auto r=token(t);g.routed_gemv(w.down.encoding,w.down.view,r.indices,r.gate,r.down,shape.hidden,shape.channels,shape.experts,false);}
+            TOKSPUR_OPERATOR_CHECKPOINT(g,"moe","three_row_routed_experts",{3,shape.channels,shape.hidden,shape.selected});
         }
         if (planar) {
             g.planar_moe_routed_m8(
@@ -127,8 +130,8 @@ void encode_moe_q8_three_rows(MetalGraph& g, const MoeWeights& w, const MoeScrat
         }
         g.q8_matvec_many(w.shared_down.view,active(s.shared_gate,shape.hidden),active(s.shared_down,shape.channels),shape.hidden,shape.channels,3);
         TOKSPUR_OPERATOR_CHECKPOINT(g,"dense_q8","three_row_shared_experts",{3,shape.channels,shape.hidden,8});
-        for(uint32_t t=0;t<3;++t){const auto r=token(t);g.gemv(w.shared_router.encoding,w.shared_router.view,row(g,input,shape.channels,t),r.shared_logit,shape.channels,1);
-            g.mixture(r.down,r.weights,r.shared_down,r.shared_logit,row(g,output,shape.channels,t));}
+        g.gemv_rows(w.shared_router.encoding,w.shared_router.view,rows3(input,shape.channels),rows3(s.shared_logit,1));
+        for(uint32_t t=0;t<3;++t){const auto r=token(t);g.mixture(r.down,r.weights,r.shared_down,r.shared_logit,row(g,output,shape.channels,t));}
         TOKSPUR_OPERATOR_CHECKPOINT(g,"moe","three_row_shared_router_mixture",{3,shape.channels,shape.selected,0});
     } catch(...) { try {g.abort();}catch(const FormatError&){}throw; }
 }

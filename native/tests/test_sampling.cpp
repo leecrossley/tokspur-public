@@ -264,6 +264,51 @@ int main() {
                 require(a == b, "dtype changes complete entropy state");
             }
         }
+        // A request without top_k ranks the whole vocabulary on every row. Float
+        // rows rank it by radix and double rows by comparison sort, so exact
+        // agreement checks the order, its ties and every mass against the sort.
+        std::mt19937 ranked_fixture(0x72616e6b);
+        for (const uint32_t count : {65U, 2047U, 2049U, 4099U, 248320U}) {
+            for (uint32_t shape = 0; shape < 5; ++shape) {
+                std::vector<float> values(count);
+                for (uint32_t i = 0; i < count; ++i) {
+                    const uint32_t word = ranked_fixture();
+                    if (shape == 0) values[i] = std::ldexp(float(int32_t(word >> 8) - (1 << 23)), -19); // dense in [-16, 16)
+                    else if (shape == 1) values[i] = (word & 1) ? -0.0f : 0.0f;                        // signed zeros only
+                    else if (shape == 2) values[i] = float(int(word % 7) - 3) * 1e30f;                 // both signs, far apart
+                    else if (shape == 3) values[i] = -std::ldexp(float(word >> 8) + 1, -120);          // negative, near zero
+                    else values[i] = word % 4099 ? std::ldexp(float(int32_t(word >> 8) - (1 << 23)), -21) : 12 + float(word % 5); // peaked head
+                }
+                const std::vector<double> wide(values.begin(), values.end());
+                // A min-p of one keeps exactly the tokens tied with the maximum: the cut's equality boundary.
+                std::vector<SamplingPolicy> policies{{1, 0, 1, 0}, {0.7, 0, 0.95, 0}, {1, count - 1, 1, 0}, {1, 0, 1, 1}};
+                if (count < 248320U) policies.insert(policies.end(),
+                    {{1, 0, 0.9, 0.01}, {0.02, 0, 1, 0}, {1, 65, 1, 0}, {1.3, 1000, 0.5, 0.001}, {1e30, 0, 1, 0}});
+                for (const auto& policy : policies) {
+                    const auto ranked = sampling_distribution(values, policy);
+                    const auto sorted = sampling_distribution(wide, policy);
+                    require(std::ranges::equal(ranked.support(), sorted.support()), "radix ranking differs from comparison sort");
+                    require(std::ranges::equal(ranked.support_probabilities(), sorted.support_probabilities()),
+                            "radix-ranked masses differ from comparison sort");
+                    require(std::ranges::equal(ranked.probabilities(), sorted.probabilities()),
+                            "radix-ranked dense masses differ from comparison sort");
+                    tokspur::SamplingRng a(45), b(45);
+                    for (uint32_t draw = 0; draw < 9; ++draw)
+                        require(tokspur::sample(ranked, a) == tokspur::sample(sorted, b), "radix ranking changes sampled token");
+                    require(a == b, "radix ranking changes entropy state");
+                }
+            }
+        }
+        for (const float value : {std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::infinity(),
+                                  -std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::denorm_min()}) {
+            // An invalid entry is refused before a wide ranking, wherever it sits.
+            for (const size_t position : {size_t(0), size_t(2048), size_t(4098)}) {
+                std::vector<float> bad(4099, -1); bad[position] = value;
+                rejected([&] { static_cast<void>(sampling_distribution(bad, {1, 0, 1, 0})); });
+                rejected([&] { static_cast<void>(sampling_distribution(bad, {1, 100, 0.9, 0})); });
+            }
+        }
         for (const float value : {std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::infinity(),
                                   -std::numeric_limits<float>::infinity()}) {

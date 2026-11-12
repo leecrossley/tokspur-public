@@ -331,7 +331,8 @@ Connection Listener::accept(Deadline deadline, Limits limits) {
         const auto accepted = ::accept(fd_, reinterpret_cast<sockaddr*>(&peer), &bytes);
         if (accepted < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue; system_error("Accept loopback HTTP connection"); }
         if (bytes != sizeof(peer) || peer.sin_family != AF_INET || (ntohl(peer.sin_addr.s_addr) >> 24) != 127) {
-            ::close(accepted); throw Error(0, "Refused non-loopback HTTP peer");
+            // A local client can bind any host address before connecting to 127.0.0.1; drop it and keep listening.
+            ::close(accepted); continue;
         }
         return Connection(accepted, limits);
     }

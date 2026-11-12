@@ -268,8 +268,9 @@ size_t ResponseParser::token_framed_call_end() {
 void ResponseParser::process_token_framed(bool final) {
     while (!pending_.empty() || mode_ == Mode::possible_call) {
         if (mode_ == Mode::possible_call) {
-            require(pending_.size() <= limits_.call_bytes, "response call byte limit");
             while (call_search_ < pending_.size() && (pending_[call_search_] == ' ' || pending_[call_search_] == '\t' || pending_[call_search_] == '\r' || pending_[call_search_] == '\n')) ++call_search_;
+            // Bound only the undecided whitespace. The pending tail may already hold later calls when a whole response is fed at once; the call frame has its own bound.
+            require(call_search_ <= limits_.call_bytes, "response call byte limit");
             const auto rest = std::string_view(pending_).substr(call_search_);
             if (rest.starts_with("<function=")) { mode_ = Mode::call; call_search_ = 0; call_in_parameter_ = false; continue; }
             if (!final && std::string_view("<function=").starts_with(rest)) return;

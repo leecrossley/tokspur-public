@@ -21,7 +21,7 @@ pub use ffi::{
     POLLNVAL, POLLOUT, PollFd, SIGINT, SIGKILL, SIGTERM, errno,
 };
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The exact libc `strerror` text for `errnum` (`std::strerror` in C++).
 pub fn strerror(errnum: i32) -> String {
@@ -75,23 +75,39 @@ pub fn stop_requested() -> bool {
     STOPPING.load(Ordering::Relaxed)
 }
 
-/// Installs `SIGINT`, `SIGTERM` and `SIGHUP` stop handlers for `tokspur serve`, clearing any prior stop flag first.
+const CLI_STOP_SIGNALS: [std::ffi::c_int; 3] = [ffi::SIGINT, ffi::SIGTERM, ffi::SIGHUP];
+
+/// The dispositions [`install_cli_stop_handlers`] replaced, restored by [`restore_cli_signal_handlers`].
+static CLI_PREVIOUS: [AtomicUsize; 3] = [
+    AtomicUsize::new(ffi::SIG_DFL),
+    AtomicUsize::new(ffi::SIG_DFL),
+    AtomicUsize::new(ffi::SIG_DFL),
+];
+
+/// Installs `SIGINT`, `SIGTERM` and `SIGHUP` stop handlers for `tokspur serve`, clearing any prior stop flag first. A signal the process inherited as ignored stays ignored, so `nohup tokspur serve` survives a hangup and a background job keeps ignoring `SIGINT`.
 pub fn install_cli_stop_handlers() -> bool {
     STOPPING.store(false, Ordering::Relaxed);
     let handler = stop_signal as extern "C" fn(std::ffi::c_int) as usize;
-    [ffi::SIGINT, ffi::SIGTERM, ffi::SIGHUP]
+    CLI_STOP_SIGNALS
         .into_iter()
-        .all(|signal| {
+        .zip(&CLI_PREVIOUS)
+        .all(|(signal, previous)| {
             // SAFETY: async-signal-safe relaxed atomic store with `'static` function pointer.
-            unsafe { ffi::signal(signal, handler) != ffi::SIG_ERR }
+            let replaced = unsafe { ffi::signal(signal, handler) };
+            if replaced == ffi::SIG_ERR {
+                return false;
+            }
+            previous.store(replaced, Ordering::Relaxed);
+            // SAFETY: `SIG_IGN` is a standard kernel disposition with no memory preconditions.
+            replaced != ffi::SIG_IGN || unsafe { ffi::signal(signal, ffi::SIG_IGN) } != ffi::SIG_ERR
         })
 }
 
-/// Restores default `SIGINT`, `SIGTERM` and `SIGHUP` dispositions after `tokspur serve` completes.
+/// Restores the `SIGINT`, `SIGTERM` and `SIGHUP` dispositions that [`install_cli_stop_handlers`] replaced after `tokspur serve` completes.
 pub fn restore_cli_signal_handlers() {
-    for signal in [ffi::SIGINT, ffi::SIGTERM, ffi::SIGHUP] {
-        // SAFETY: `SIG_DFL` is a standard kernel disposition with no memory preconditions.
-        unsafe { ffi::signal(signal, ffi::SIG_DFL) };
+    for (signal, previous) in CLI_STOP_SIGNALS.into_iter().zip(&CLI_PREVIOUS) {
+        // SAFETY: the value is `SIG_DFL`, `SIG_IGN` or a disposition this process installed earlier; each stays valid for the whole program.
+        unsafe { ffi::signal(signal, previous.load(Ordering::Relaxed)) };
     }
 }
 
@@ -114,6 +130,7 @@ pub mod sdk_layout {
     pub const LINGER_SIZE: usize = size_of::<ffi::Linger>();
     pub const RENAME_EXCL: u32 = ffi::RENAME_EXCL;
     pub const F_NOCACHE: i32 = ffi::F_NOCACHE;
+    pub const ENOTSUP: i32 = ffi::ENOTSUP;
     pub const AT_FDCWD: i32 = ffi::AT_FDCWD;
     pub const AT_SYMLINK_NOFOLLOW: i32 = ffi::AT_SYMLINK_NOFOLLOW;
     pub const AT_REMOVEDIR: i32 = ffi::AT_REMOVEDIR;

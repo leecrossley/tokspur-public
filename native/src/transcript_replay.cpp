@@ -35,7 +35,7 @@ void response_arguments(const Json& message, const AdmittedChat& admitted, ToolE
             const auto at = std::find(admitted.names.begin(), admitted.names.end(), name);
             need(at != admitted.names.end(), "unknown recorded response tool");
             const auto& value = field(function, "arguments");
-            const auto arguments = value.kind() == Json::Kind::string ? parse_json(value.string(), {65536, 16384, 32}) : value;
+            const auto arguments = value.kind() == Json::Kind::string ? parse_json(value.string(), {6 * 65536, 65536, 33}) : value;
             validate_tool_value(admitted.schemas.at(size_t(at - admitted.names.begin())), arguments, tool_enums);
         }
     }

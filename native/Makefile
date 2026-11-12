@@ -4,6 +4,19 @@ CPPFLAGS = -Iinclude
 CXXFLAGS ?= -std=c++20 -O2 -g -Wall -Wextra -Wpedantic -Werror
 M5_HEADLINE_SCREEN ?= 0
 VERIFY_NARROW_ROWS ?= 0
+GDN_COOPERATIVE4 ?= 0
+ifeq ($(GDN_COOPERATIVE4),1)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_GDN_COOPERATIVE4=1
+override METALFLAGS += -DTOKSPUR_PRIVATE_GDN_COOPERATIVE4=1
+else ifneq ($(GDN_COOPERATIVE4),0)
+$(error GDN_COOPERATIVE4 must be 0 or 1)
+endif
+VERIFY_GDN_ROW_BATCH ?= 1
+ifeq ($(VERIFY_GDN_ROW_BATCH),1)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_VERIFY_GDN_ROW_BATCH=1
+else ifneq ($(VERIFY_GDN_ROW_BATCH),0)
+$(error VERIFY_GDN_ROW_BATCH must be 0 or 1)
+endif
 ifeq ($(M5_HEADLINE_SCREEN),1)
 override M5_CPU_CANDIDATES := 1
 override CXXFLAGS += -DTOKSPUR_PRIVATE_M5_RESOURCE_SCREEN=1
@@ -17,14 +30,74 @@ override METALFLAGS += -DTOKSPUR_PRIVATE_VERIFY_NARROW_ROWS=1
 else ifneq ($(VERIFY_NARROW_ROWS),0)
 $(error VERIFY_NARROW_ROWS must be 0 or 1)
 endif
+# Commit this many target layers of a NAX verification batch before the rest is encoded (0 uses one command buffer).
+VERIFY_EARLY_COMMIT ?= 2
+ifeq ($(VERIFY_EARLY_COMMIT),0)
+else ifeq ($(VERIFY_EARLY_COMMIT),2)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_VERIFY_EARLY_COMMIT=2
+else ifeq ($(VERIFY_EARLY_COMMIT),4)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_VERIFY_EARLY_COMMIT=4
+else ifeq ($(VERIFY_EARLY_COMMIT),8)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_VERIFY_EARLY_COMMIT=8
+else
+$(error VERIFY_EARLY_COMMIT must be 0 (one command buffer), 2, 4 or 8)
+endif
+PARALLEL_PLANAR_UNION ?= 0
+ifeq ($(PARALLEL_PLANAR_UNION),1)
+override METALFLAGS += -DTOKSPUR_PRIVATE_PARALLEL_PLANAR_UNION=1
+else ifneq ($(PARALLEL_PLANAR_UNION),0)
+$(error PARALLEL_PLANAR_UNION must be 0 or 1)
+endif
 M5_CPU_CANDIDATES ?= 0
 Q8_IMPORT_ISOLATION ?= 0
-PACK_SHARED_MAPPING ?= 0
-PACK_AUTH_RECLAIM ?= 0
+PACK_SHARED_MAPPING ?= 1
+# Bounded original-source reads and clean-page hints during v2/v3 authentication.
+PACK_AUTH_RECLAIM ?= 1
 CACHE_PRESSURE_RECLAIM ?= 0
-PIPELINE_LOOKUP ?= 0
+MEMORY_PLAN_REPORT ?= 0
+SHARED_PREFIX_EVICTION_COUNTERS ?= 0
+# Optional host PLE row-cache limit; 0 preserves 512 MiB (256 MiB in the M5 screen).
+PLE_CACHE_MIB ?= 0
+# Optional duplicate Q8 Tile64 storage; original-layout consumers remain available.
+Q8_TILE64_CACHE ?= 1
+PIPELINE_LOOKUP ?= 1
 DFLASH2_CACHE_WORK ?= 0
+# Batched prefill top-10 routing and mixture; 0 dispatches each token row separately.
+PREFILL_BATCH_TOP10 ?= 1
+PREFILL_BATCH_MIXTURE ?= 1
+ifeq ($(PREFILL_BATCH_TOP10):$(PREFILL_BATCH_MIXTURE),1:1)
+VERIFY_NAX_BATCH_TOP10_MIXTURE ?= 1
+else
+VERIFY_NAX_BATCH_TOP10_MIXTURE ?= 0
+endif
 NATIVE_CONFIG ?= carrier
+ifeq ($(Q8_TILE64_CACHE),1)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_Q8_TILE64_CACHE=1
+else ifeq ($(Q8_TILE64_CACHE),0)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_Q8_TILE64_CACHE=0
+else
+$(error Q8_TILE64_CACHE must be 0 or 1)
+endif
+ifeq ($(PREFILL_BATCH_TOP10),1)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_PREFILL_BATCH_TOP10=1
+override METALFLAGS += -DTOKSPUR_PRIVATE_PREFILL_BATCH_TOP10=1
+else ifneq ($(PREFILL_BATCH_TOP10),0)
+$(error PREFILL_BATCH_TOP10 must be 0 or 1)
+endif
+ifeq ($(PREFILL_BATCH_MIXTURE),1)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_PREFILL_BATCH_MIXTURE=1
+override METALFLAGS += -DTOKSPUR_PRIVATE_PREFILL_BATCH_MIXTURE=1
+else ifneq ($(PREFILL_BATCH_MIXTURE),0)
+$(error PREFILL_BATCH_MIXTURE must be 0 or 1)
+endif
+ifeq ($(VERIFY_NAX_BATCH_TOP10_MIXTURE),1)
+ifneq ($(PREFILL_BATCH_TOP10):$(PREFILL_BATCH_MIXTURE),1:1)
+$(error VERIFY_NAX_BATCH_TOP10_MIXTURE requires PREFILL_BATCH_TOP10=1 and PREFILL_BATCH_MIXTURE=1)
+endif
+override CXXFLAGS += -DTOKSPUR_PRIVATE_VERIFY_NAX_BATCH_TOP10_MIXTURE=1
+else ifneq ($(VERIFY_NAX_BATCH_TOP10_MIXTURE),0)
+$(error VERIFY_NAX_BATCH_TOP10_MIXTURE must be 0 or 1)
+endif
 ifeq ($(Q8_IMPORT_ISOLATION),1)
 override CXXFLAGS += -DTOKSPUR_PRIVATE_Q8_IMPORT_ISOLATION=1
 else ifneq ($(Q8_IMPORT_ISOLATION),0)
@@ -44,6 +117,24 @@ ifeq ($(CACHE_PRESSURE_RECLAIM),1)
 override CXXFLAGS += -DTOKSPUR_PRIVATE_CACHE_PRESSURE_RECLAIM=1
 else ifneq ($(CACHE_PRESSURE_RECLAIM),0)
 $(error CACHE_PRESSURE_RECLAIM must be 0 or 1)
+endif
+ifeq ($(SHARED_PREFIX_EVICTION_COUNTERS),1)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_SHARED_PREFIX_EVICTION_COUNTERS=1
+else ifneq ($(SHARED_PREFIX_EVICTION_COUNTERS),0)
+$(error SHARED_PREFIX_EVICTION_COUNTERS must be 0 or 1)
+endif
+ifeq ($(MEMORY_PLAN_REPORT),1)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_MEMORY_PLAN_REPORT=1
+else ifneq ($(MEMORY_PLAN_REPORT),0)
+$(error MEMORY_PLAN_REPORT must be 0 or 1)
+endif
+ifeq ($(PLE_CACHE_MIB),0)
+else ifeq ($(PLE_CACHE_MIB),256)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_PLE_CACHE_MIB=256
+else ifeq ($(PLE_CACHE_MIB),512)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_PLE_CACHE_MIB=512
+else
+$(error PLE_CACHE_MIB must be 0 (automatic), 256 or 512)
 endif
 ifeq ($(PIPELINE_LOOKUP),1)
 override CXXFLAGS += -DTOKSPUR_PRIVATE_PIPELINE_LOOKUP=1
@@ -69,12 +160,12 @@ CI_SANITIZE_BUILD ?= ../build/ci-sanitize
 HTTP_FAST_MATH_BUILD ?= ../build/http-fast-math
 OBJ_ROOT = $(BUILD)/obj
 OBJDIR = $(OBJ_ROOT)/$(NATIVE_CONFIG)
-COMMON = measured_controller gguf numeric tokenizer unicode json chat operators model routing gdn_math recurrent_reference attention_math attention_reference memory ple_math sampling response response_protocol q8_layout q8_many gdn_tile serve_protocol http owned_worker prompt_lookup transcript_replay mtp_wire serve_verify8 expert_lanes lane_sidecar derived_pack planar_pack_v3 ssd_checkpoint
+COMMON = measured_controller gguf numeric tokenizer unicode json chat operators model routing gdn_math recurrent_reference attention_math attention_reference memory ple_math sampling response response_protocol q8_layout q8_many gdn_tile serve_protocol http owned_worker prompt_lookup transcript_replay mtp_wire serve_verify8 expert_lanes lane_sidecar derived_pack planar_pack_v3 pack_v3_cli ssd_checkpoint
 OBJECTS = $(addprefix $(OBJDIR)/,$(addsuffix .o,$(COMMON)))
 # The CPU-only host telemetry collector links only into its own test and diagnostic.
 TELEMETRY_OBJECTS = $(OBJDIR)/host_telemetry.o
 CPU_TESTS = pipeline_key dflash2_checkpoint shared_prefix_restore speculative_controls gguf numeric tokenizer unicode json chat operators model routing gdn reference attention_math memory sampling response response_protocol q8_layout q8_many gdn_tile recurrent_timing_protocol recurrent_replay_timing_protocol serve_protocol http owned_worker prompt_lookup transcript_replay derived_pack host_telemetry
-CPU_TESTS += carrier_diagnostic measured_controller nax_split_policy ssd_checkpoint literal_markers
+CPU_TESTS += carrier_diagnostic measured_controller nax_split_policy ssd_checkpoint literal_markers shared_prefix_eviction
 PATTERN_TESTS = $(filter-out host_telemetry speculative_controls ssd_checkpoint,$(CPU_TESTS))
 TEST_BINS = $(addprefix $(BUILD)/test-,$(CPU_TESTS))
 UNAME_S := $(shell uname -s)
@@ -204,6 +295,9 @@ TRACKED_METALFLAGS := $(NATIVE_CONFIG) : metal3.2 : metal4.0 : $(METALFLAGS)
 # Decide before rewriting the stamp. FORCE also handles rapid flag changes on
 # Apple's make, whose timestamp comparisons can have one-second resolution.
 OBJECT_POLICY_PREREQUISITE := $(shell echo '$(TRACKED_CFLAGS)' | cmp -s - '$(OBJDIR)/.cflags' 2>/dev/null || echo FORCE)
+# These targets can be built in separate invocations. Compare each artifact's
+# last successful policy even if another target has updated the shared stamp.
+metal_policy_prerequisite = $(shell echo '$(TRACKED_METALFLAGS)' | cmp -s - '$(1).metalflags' 2>/dev/null || echo FORCE)
 
 $(BUILD)/.cflags: FORCE | $(BUILD)
 	@echo '$(TRACKED_CFLAGS)' | cmp -s - $@ 2>/dev/null || echo '$(TRACKED_CFLAGS)' > $@
@@ -288,6 +382,7 @@ $(addprefix $(BUILD)/test-,$(PATTERN_TESTS)): $(BUILD)/test-%: tests/test_%.cpp 
 
 $(BUILD)/test-pipeline_key: include/tokspur/pipeline_key.hpp
 $(BUILD)/test-dflash2_checkpoint: include/tokspur/dflash2_checkpoint.hpp
+$(BUILD)/test-derived_pack: tests/grouped_mm_fixture.hpp
 
 $(BUILD)/test-host_telemetry: tests/test_host_telemetry.cpp $(OBJECTS) $(TELEMETRY_OBJECTS) $(BUILD)/.cflags | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -pthread "$<" $(OBJECTS) $(TELEMETRY_OBJECTS) -o "$@"
@@ -302,8 +397,9 @@ $(BUILD)/tokspur-host-telemetry: $(OBJDIR)/host_telemetry_main.o $(TELEMETRY_OBJ
 $(BUILD)/gemv.air: kernels/gemv.metal $(BUILD)/.metalflags | $(BUILD)
 	xcrun metal $(METALFLAGS) -std=metal3.2 -fno-fast-math $(if $(filter native-plain-loads,$(NATIVE_CONFIG)),-DTOKSPUR_PRIVATE_NATIVE_PLAIN_LOADS=1) -c "$<" -o "$@"
 
-$(BUILD)/graph.air: kernels/graph.metal $(BUILD)/.metalflags | $(BUILD)
+$(BUILD)/graph.air: kernels/graph.metal $(BUILD)/.metalflags $(call metal_policy_prerequisite,$(BUILD)/graph.air) | $(BUILD)
 	xcrun metal $(METALFLAGS) -std=metal3.2 -fno-fast-math -c "$<" -o "$@"
+	@echo '$(TRACKED_METALFLAGS)' > "$@.metalflags"
 
 $(BUILD)/attention.air: kernels/attention.metal $(BUILD)/.metalflags | $(BUILD)
 	xcrun metal $(METALFLAGS) -std=metal3.2 -fno-fast-math -c "$<" -o "$@"
@@ -417,8 +513,9 @@ $(BUILD)/nax_prefill.air: kernels/nax_prefill.metal $(BUILD)/.metalflags | $(BUI
 $(BUILD)/dflash2.air: kernels/dflash2.metal $(BUILD)/.metalflags | $(BUILD)
 	xcrun metal $(METALFLAGS) -std=metal4.0 -mmacosx-version-min=27.0 -fno-fast-math -ffp-contract=off -c "$<" -o "$@"
 
-$(BUILD)/planar_moe_v3.air: kernels/planar_moe_v3.metal $(BUILD)/.metalflags | $(BUILD)
+$(BUILD)/planar_moe_v3.air: kernels/planar_moe_v3.metal $(BUILD)/.metalflags $(call metal_policy_prerequisite,$(BUILD)/planar_moe_v3.air) | $(BUILD)
 	xcrun metal $(METALFLAGS) -std=metal4.0 -mmacosx-version-min=27.0 -fno-fast-math -ffp-contract=off -c "$<" -o "$@"
+	@echo '$(TRACKED_METALFLAGS)' > "$@.metalflags"
 
 $(BUILD)/raw_decode.air: kernels/raw_decode.metal $(BUILD)/.metalflags | $(BUILD)
 	xcrun metal $(METALFLAGS) -std=metal3.2 -fno-fast-math -ffp-contract=off -c "$<" -o "$@"
@@ -430,6 +527,22 @@ $(BUILD)/moe_router_f32_batch.air: kernels/moe_router_f32_batch.metal $(BUILD)/.
 # Active Carrier Extensions: Recurrence
 $(BUILD)/gdn_chunk.air: kernels/gdn_chunk.metal $(BUILD)/.metalflags | $(BUILD)
 	xcrun metal $(METALFLAGS) -std=metal3.2 -fno-fast-math -c "$<" -o "$@"
+
+$(BUILD)/gdn-cs64-reference.air: kernels/gdn_chunk.metal $(BUILD)/.metalflags | $(BUILD)
+	xcrun metal $(METALFLAGS) -std=metal3.2 -fno-fast-math -DTOKSPUR_TEST_GDN_CS64_REFERENCE=1 -c "$<" -o "$@"
+
+$(BUILD)/gdn-cs64-reference.metallib: $(BUILD)/gdn-cs64-reference.air
+	xcrun metallib "$<" -o "$@"
+
+$(BUILD)/gdn-cs64-reuse.metallib: $(BUILD)/gdn_chunk.air
+	xcrun metallib "$<" -o "$@"
+
+$(BUILD)/test-gdn_cs64_reuse: tests/test_gdn_cs64_reuse.mm include/tokspur/gdn_chunk.hpp $(BUILD)/.cflags | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fobjc-arc "$<" -framework Foundation -framework Metal -o "$@"
+
+.PHONY: gdn-cs64-reuse-check
+gdn-cs64-reuse-check: $(BUILD)/test-gdn_cs64_reuse $(BUILD)/gdn-cs64-reference.metallib $(BUILD)/gdn-cs64-reuse.metallib
+	MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 MTL_SHADER_VALIDATION_ABORT_ON_FAULT=1 "$(BUILD)/test-gdn_cs64_reuse" "$(BUILD)/gdn-cs64-reference.metallib" "$(BUILD)/gdn-cs64-reuse.metallib" --validate
 
 $(BUILD)/gdn_legacy_batch.air: kernels/gdn_legacy_batch.metal $(BUILD)/.metalflags | $(BUILD)
 	xcrun metal $(METALFLAGS) -std=metal3.2 -fno-fast-math -c "$<" -o "$@"
@@ -465,8 +578,9 @@ $(BUILD)/carrier_routes.air: diagnostics/carrier_routes.metal $(BUILD)/.metalfla
 	xcrun metal $(METALFLAGS) -std=metal3.2 -fno-fast-math -c "$<" -o "$@"
 endif
 
-$(BUILD)/tokspur-owned.metallib: Makefile $(ALL_AIR) | $(BUILD)
+$(BUILD)/tokspur-owned.metallib: Makefile $(ALL_AIR) $(call metal_policy_prerequisite,$(BUILD)/tokspur-owned.metallib) | $(BUILD)
 	xcrun metallib $(ALL_AIR) -o "$@"
+	@echo '$(TRACKED_METALFLAGS)' > "$@.metalflags"
 
 GPU_TEST_BINS = $(addprefix $(BUILD)/test-,metal graph moe recurrent attention ple stack profile small_gemv block_gemv layout_gemv many_gemv gdn_tile_gpu gdn_core_tile recurrent_tile graph_replay hc_q8_gemv q8_split_gemv)
 $(GPU_TEST_BINS): $(BUILD)/test-%: tests/test_%.cpp $(OBJECTS) $(METAL_OBJECTS) $(BUILD)/.cflags | $(BUILD)
@@ -508,7 +622,11 @@ $(BUILD)/test-challenger_m2_3: tests/test_stack.cpp
 $(BUILD)/test-source_retirement: tests/test_source_retirement.mm | $(BUILD)
 	$(CXX) $(CXXFLAGS) "$<" -framework Foundation -framework Metal -o "$@"
 
-carrier-test-metal: $(CARRIER_GPU_TEST_BINS) $(BUILD)/test-source_retirement $(METAL_LIBRARY)
+$(BUILD)/test-planar_union_metadata: tests/test_planar_union_metadata.mm $(BUILD)/.cflags | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fobjc-arc "$<" -framework Foundation -framework Metal -o "$@"
+
+carrier-test-metal: $(CARRIER_GPU_TEST_BINS) $(BUILD)/test-planar_union_metadata $(BUILD)/test-source_retirement $(BUILD)/test-gdn_cs64_reuse $(BUILD)/gdn-cs64-reference.metallib $(METAL_LIBRARY)
+	MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 MTL_SHADER_VALIDATION_ABORT_ON_FAULT=1 "$(BUILD)/test-gdn_cs64_reuse" "$(BUILD)/gdn-cs64-reference.metallib" "$(METAL_LIBRARY)" --validate
 	"$(BUILD)/test-source_retirement" "$(METAL_LIBRARY)" third_party/sources.json
 	"$(BUILD)/test-qsa_sparse_attention" "$(METAL_LIBRARY)"
 	"$(BUILD)/test-qsa_verify_rows_core" "$(METAL_LIBRARY)"
@@ -522,6 +640,7 @@ carrier-test-metal: $(CARRIER_GPU_TEST_BINS) $(BUILD)/test-source_retirement $(M
 	"$(BUILD)/test-challenger_m2_3" "$(METAL_LIBRARY)"
 	"$(BUILD)/test-planar_pack_v3" "$(METAL_LIBRARY)"
 	"$(BUILD)/test-planar_union_profile" "$(METAL_LIBRARY)"
+	"$(BUILD)/test-planar_union_metadata" "$(METAL_LIBRARY)"
 	"$(BUILD)/test-logit_topk" "$(METAL_LIBRARY)"
 	"$(BUILD)/test-mtp_head" "$(METAL_LIBRARY)"
 	"$(BUILD)/test-sampled_stack" "$(METAL_LIBRARY)"
@@ -558,6 +677,7 @@ test: $(TEST_BINS)
 	"$(BUILD)/test-reference"
 	"$(BUILD)/test-attention_math"
 	"$(BUILD)/test-memory"
+	"$(BUILD)/test-shared_prefix_eviction"
 	"$(BUILD)/test-sampling"
 	"$(BUILD)/test-response"
 	"$(BUILD)/test-response_protocol"
@@ -694,7 +814,7 @@ rust-check:
 -include $(wildcard $(OBJDIR)/*.d)
 
 clean:
-	rm -rf $(BUILD)/obj $(BUILD)/*.air $(BUILD)/*.metallib $(BUILD)/tokspur-* $(BUILD)/scalar-channel-target $(BUILD)/test-* $(BUILD)/fuzz-* $(BUILD)/.cflags $(BUILD)/.metalflags "$(SANITIZE_BUILD)" "$(CI_SANITIZE_BUILD)" "$(HTTP_FAST_MATH_BUILD)" ../build/native-plain-loads-component
+	rm -rf $(BUILD)/obj $(BUILD)/*.air $(BUILD)/*.metallib $(BUILD)/*.air.metalflags $(BUILD)/tokspur-* $(BUILD)/scalar-channel-target $(BUILD)/test-* $(BUILD)/fuzz-* $(BUILD)/.cflags $(BUILD)/.metalflags "$(SANITIZE_BUILD)" "$(CI_SANITIZE_BUILD)" "$(HTTP_FAST_MATH_BUILD)" ../build/native-plain-loads-component
 
 # Deliberately excluded from all, serving libraries, staging and package manifests.
 PROBE_BUILD ?= ../build/runtime-check-probe

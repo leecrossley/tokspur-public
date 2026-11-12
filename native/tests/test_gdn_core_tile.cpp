@@ -1,6 +1,9 @@
 #include "tokspur/gdn_core_compare.hpp"
 #include "tokspur/gguf.hpp"
 #include "tokspur/q8_many.hpp"
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
+#include "tokspur/verify_nax.hpp"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -63,6 +66,84 @@ GdnCoreTileComparison exercise(MetalGraph& g, GdnShape shape, StateTile tile, bo
     require(g.memory().live_bytes == before, "connected GDN diagnostic leaked buffers");
     return result;
 }
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
+void verify_nax_integration(const char* library, bool concurrent) {
+    MetalGraph g(library, 256 * 1024 * 1024);
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+    g.configure_concurrent_dispatch(concurrent);
+#else
+    require(!concurrent, "concurrent integration requires its build feature");
+#endif
+    g.configure_block_gemv(1); g.configure_verify_nax(true); g.configure_verify_nax_m8(true);
+    g.prepare_q8_matvec_many_all(); g.prepare_gdn_tiles(128); g.prepare_verify_nax({});
+    const auto initial = g.memory().live_bytes;
+    constexpr uint32_t capacity = 8;
+    constexpr float sentinel = -12345.25f;
+    const GdnPolicy policy{0.088388346f, 1e-6f, L2Mode::add_squared_epsilon, 1e-6f};
+    for (const GdnShape shape : {GdnShape{32, 1, 2, 128, 16, 4}, GdnShape{2560, 16, 48, 128, 128, 4}}) {
+        Fixture f{g, {}, {}, {}}; const auto weights = f.weights(shape).first;
+        auto x = values(uint64_t(capacity) * shape.channels, 0.05f);
+        const auto input = f.floats(x, false);
+        const auto output = f.floats(std::vector<float>(x.size(), sentinel), false);
+        const GdnState accepted{f.floats(values(gdn_state_count(shape))), f.floats(values(gdn_qkv_count(shape) * 3))};
+        const auto candidate = allocate_gdn_state(g, shape);
+        for (auto view : candidate.views()) f.owned.push_back(view);
+        const auto scratch = allocate_gdn_core_tile_scratch(g, shape, capacity);
+        const auto scalar = allocate_gdn_core_tile_scratch(g, shape, capacity);
+        for (const auto& state : {scratch, scalar}) for (auto view : state.views()) f.owned.push_back(view);
+        const auto saved_matrix = g.read(accepted.matrix), saved_history = g.read(accepted.convolution);
+        const auto row = [&](GpuView view, uint32_t step) {
+            return g.slice(view, view.bytes / capacity * step, view.bytes / capacity);
+        };
+        for (uint32_t steps = 2; steps <= capacity; ++steps) {
+            auto active_input = x;
+            std::fill(active_input.begin() + uint64_t(steps) * shape.channels, active_input.end(), std::numeric_limits<float>::quiet_NaN());
+            g.write(input, std::as_bytes(std::span(active_input)));
+            for (const auto& state : {scratch, scalar}) for (auto view : state.views()) {
+                const std::vector<float> cleared(view.bytes / 4, sentinel);
+                g.write(view, std::as_bytes(std::span(cleared)));
+            }
+            const std::vector<float> cleared_output(x.size(), sentinel);
+            g.write(output, std::as_bytes(std::span(cleared_output)));
+            const auto ledger = g.memory();
+            const uint64_t expected = verify_nax_gdn_core_dispatches(g, weights, shape, steps, false);
+            g.set_verify_nax_scope(true);
+            require(g.verify_nax_active(), "integration did not activate NAX verification");
+            g.begin();
+            encode_gdn_core_tile(g, weights, scratch, accepted, candidate, input, output, shape, policy, {capacity, steps});
+            const auto tiled = g.submit(); ++batches;
+            g.set_verify_nax_scope(false);
+            require(tiled.dispatches == expected, "active NAX core dispatch predictor differs");
+            require(g.read(accepted.matrix) == saved_matrix && g.read(accepted.convolution) == saved_history,
+                "active NAX core modified accepted state");
+            // Replay only the changed stages with their original row operators,
+            // using the projections actually produced by the NAX core.
+            g.begin();
+            for (uint32_t step = 0; step < steps; ++step) {
+                g.activate(row(scratch.convolved, step), row(scalar.convolved, step), Activation::silu);
+                g.gdn_prepare(row(scalar.convolved, step), row(scalar.query, step), row(scalar.key, step), row(scalar.value, step), shape, policy);
+                g.gdn_gates(row(scratch.alpha, step), row(scratch.beta, step), weights.negative_rates, weights.dt_bias,
+                    row(scalar.decay, step), row(scalar.write_gate, step));
+                g.rms(row(scratch.raw, step), weights.gains, row(scalar.normalized, step), shape.value_width, policy.rms_epsilon);
+                g.multiply(row(scalar.normalized, step), row(scratch.gate, step), row(scalar.gated, step), true);
+            }
+            require(g.submit().dispatches == uint64_t(steps) * 5, "scalar integration control dispatches differ"); ++batches;
+            for (const auto pair : {std::pair{scratch.query, scalar.query}, std::pair{scratch.key, scalar.key},
+                                   std::pair{scratch.value, scalar.value}, std::pair{scratch.decay, scalar.decay},
+                                   std::pair{scratch.write_gate, scalar.write_gate}, std::pair{scratch.gated, scalar.gated}})
+                require(g.read(pair.first) == g.read(pair.second), "active NAX row stages or inactive tails differ");
+            const auto raw = g.read(output);
+            std::vector<float> actual(raw.size() / 4); std::memcpy(actual.data(), raw.data(), raw.size());
+            for (size_t i = 0; i < actual.size(); ++i)
+                require(i < uint64_t(steps) * shape.channels ? std::isfinite(actual[i]) : actual[i] == sentinel,
+                    "active NAX output is nonfinite or touched inactive rows");
+            require(g.memory().live_bytes == ledger.live_bytes && g.memory().allocations == ledger.allocations,
+                "active NAX integration changed buffer ledger");
+        }
+    }
+    require(g.memory().live_bytes == initial, "active NAX integration leaked buffers");
+}
+#endif
 void refusal(MetalGraph& g) {
     const GdnShape shape{32, 1, 2, 128, 16, 4}; constexpr StateTile tile{4, 3};
     constexpr uint64_t expected_dispatches = gdn_core_batch_elementwise ? 23 : 29;
@@ -103,14 +184,19 @@ void refusal(MetalGraph& g) {
         g.write(input, std::as_bytes(std::span(input_data))); g.begin(); invoke(weights, scratch, candidate, output); require(g.submit().dispatches == expected_dispatches, "valid core reuse failed"); ++batches;
         require(g.read(output) == correct_output && g.read(candidate.matrix) == correct_matrix && g.read(candidate.convolution) == correct_history, "core recovery changed valid output/state bits");
     }
-    for (auto destination : base.views()) for (uint64_t position : {uint64_t(0), destination.bytes / 8, destination.bytes - 4}) {
-        const auto original = g.read(destination); auto invalid = original; const float nan = std::numeric_limits<float>::quiet_NaN();
-        std::memcpy(invalid.data() + position, &nan, 4); g.write(destination, invalid);
-        const auto invalid_matrix = g.read(base.matrix), invalid_history = g.read(base.convolution);
-        g.begin(); invoke(weights, scratch, candidate, output); reject([&] { static_cast<void>(g.submit()); });
-        require(g.read(base.matrix) == invalid_matrix && g.read(base.convolution) == invalid_history, "nonfinite accepted core state was modified");
-        g.write(destination, original); g.begin(); invoke(weights, scratch, candidate, output); require(g.submit().dispatches == expected_dispatches, "core state recovery failed"); ++batches;
-        require(g.read(output) == correct_output && g.read(candidate.matrix) == correct_matrix && g.read(candidate.convolution) == correct_history, "accepted-state recovery changed core bits");
+    for (auto destination : base.views()) {
+        std::vector<uint64_t> positions{uint64_t(0), destination.bytes / 8, destination.bytes - 4};
+        if (destination.slot == base.matrix.slot) for (uint32_t key : {32u, 64u, 96u})
+            positions.push_back(uint64_t(key) * shape.value_width * sizeof(float));
+        for (uint64_t position : positions) {
+            const auto original = g.read(destination); auto invalid = original; const float nan = std::numeric_limits<float>::quiet_NaN();
+            std::memcpy(invalid.data() + position, &nan, 4); g.write(destination, invalid);
+            const auto invalid_matrix = g.read(base.matrix), invalid_history = g.read(base.convolution);
+            g.begin(); invoke(weights, scratch, candidate, output); reject([&] { static_cast<void>(g.submit()); });
+            require(g.read(base.matrix) == invalid_matrix && g.read(base.convolution) == invalid_history, "nonfinite accepted core state was modified");
+            g.write(destination, original); g.begin(); invoke(weights, scratch, candidate, output); require(g.submit().dispatches == expected_dispatches, "core state recovery failed"); ++batches;
+            require(g.read(output) == correct_output && g.read(candidate.matrix) == correct_matrix && g.read(candidate.convolution) == correct_history, "accepted-state recovery changed core bits");
+        }
     }
     const auto replay = allocate_gdn_core_replay_scratch(g, shape, tile.capacity);
     f.owned.push_back(replay.convolution_output); f.owned.push_back(replay.delta_output);
@@ -166,11 +252,101 @@ void refusal(MetalGraph& g) {
     reject([&] { static_cast<void>(g.zeros(256 * 1024 * 1024, "must exceed core budget")); });
     require(g.memory().live_bytes == ledger.live_bytes, "core budget refusal leaked allocation");
 }
+// The row scheduler must preserve every intermediate, final state and poisoned
+// tail, including after a device error. Compare against the existing row calls.
+void verify_row_primitives(MetalGraph& g) {
+    const GdnShape shape{32, 16, 48, 128, 128, 4};
+    constexpr uint32_t capacity = 8;
+    const auto raw = gdn_qkv_count(shape), qk = uint64_t(shape.value_heads) * shape.key_width;
+    for (uint32_t steps = 2; steps <= 8; ++steps)
+    for (auto mode : {L2Mode::add_squared_epsilon, L2Mode::floor_squared_epsilon}) {
+        Fixture f{g, {}, {}, {}};
+        const GdnPolicy policy{0.088388346f, 1e-6f, mode, 1e-6f};
+        auto input = values(capacity * raw, .1f), alpha = values(capacity * shape.value_heads, .2f);
+        auto logits = values(capacity * shape.value_heads, .3f);
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        std::fill(input.begin() + steps * raw, input.end(), nan);
+        std::fill(alpha.begin() + steps * shape.value_heads, alpha.end(), nan);
+        std::fill(logits.begin() + steps * shape.value_heads, logits.end(), nan);
+        const auto x = f.floats(input), a = f.floats(alpha, false), b = f.floats(logits);
+        const auto rates = f.floats(std::vector<float>(shape.value_heads, -.25f));
+        const auto bias = f.floats(values(shape.value_heads));
+        const auto accepted = f.floats(values(gdn_state_count(shape)));
+        const auto make = [&](uint64_t n) { return f.floats(std::vector<float>(n, nan), false); };
+        const auto q = make(capacity*qk), k = make(capacity*qk), v = make(capacity*qk);
+        const auto d = make(capacity*shape.value_heads), beta = make(capacity*shape.value_heads);
+        const auto candidate = make(gdn_state_count(shape)), output = make(capacity*qk);
+        const std::array writes{q,k,v,d,beta,candidate,output};
+        const auto before = g.read(accepted);
+        const auto row = [&](GpuView view, uint64_t width, uint32_t t) {
+            return g.slice(view, uint64_t(t)*width*4, width*4);
+        };
+        const auto poison = [&] {
+            for (auto view : writes) {
+                const std::vector<float> data(view.bytes/4,nan);
+                g.write(view,std::as_bytes(std::span(data)));
+            }
+        };
+        const auto read = [&] {
+            std::vector<std::vector<std::byte>> data;
+            for (auto view : writes) data.push_back(g.read(view));
+            return data;
+        };
+        const auto encode = [&](bool batched) {
+            if (batched) {
+                g.gdn_prepare_verify_rows(x,q,k,v,shape,policy,{capacity,steps});
+                g.gdn_gates_verify_rows(a,b,rates,bias,d,beta,shape.value_heads,{capacity,steps});
+            } else for (uint32_t t=0;t<steps;++t) {
+                g.gdn_prepare(row(x,raw,t),row(q,qk,t),row(k,qk,t),row(v,qk,t),shape,policy);
+                g.gdn_gates(row(a,shape.value_heads,t),row(b,shape.value_heads,t),rates,bias,
+                    row(d,shape.value_heads,t),row(beta,shape.value_heads,t));
+            }
+            g.gdn_delta_tile(accepted,q,k,v,d,beta,candidate,output,
+                shape.value_heads,shape.value_width,{capacity,steps});
+        };
+        g.begin(); encode(false); require(g.submit().dispatches == 2*steps+1,"scalar row dispatch count");
+        ++batches; const auto reference = read(); poison();
+        g.begin(); encode(true); require(g.submit().dispatches == 3,"batched row dispatch count"); ++batches;
+        require(read() == reference && g.read(accepted) == before,"batched GDN rows changed intermediate/state/tail bits");
+        for (auto view : {q,k,v,d,beta,output}) {
+            const auto bytes = g.read(view); const auto stride = bytes.size()/capacity;
+            for (uint64_t at=steps*stride;at<bytes.size();at+=4) {
+                float value; std::memcpy(&value,bytes.data()+at,4);
+                require(std::isnan(value),"batched GDN rows wrote an inactive tail");
+            }
+        }
+        auto invalid_alpha = alpha; invalid_alpha[(steps-1)*shape.value_heads] = nan;
+        g.write(a,std::as_bytes(std::span(invalid_alpha))); g.begin(); encode(true);
+        reject([&] { static_cast<void>(g.submit()); });
+        require(g.read(accepted) == before,"failed GDN row gates changed accepted state");
+        g.write(a,std::as_bytes(std::span(alpha))); poison(); g.begin(); encode(true);
+        require(g.submit().dispatches == 3 && read() == reference,"GDN row device-error recovery differs"); ++batches;
+        g.begin(); reject([&] { g.gdn_prepare_verify_rows(x,q,q,v,shape,policy,{capacity,steps}); }); g.abort();
+        g.begin(); reject([&] { g.gdn_gates_verify_rows(a,b,rates,bias,d,d,shape.value_heads,{capacity,steps}); }); g.abort();
+        g.begin(); reject([&] { g.gdn_gates_verify_rows(a,b,rates,bias,d,beta,shape.value_heads,{capacity,1}); }); g.abort();
+        g.begin(); reject([&] { g.gdn_prepare_verify_rows(x,q,k,v,shape,policy,{16,9}); }); g.abort();
+        require(read() == reference && g.read(accepted) == before,"GDN row host refusal changed state");
+    }
+}
 }
 int main(int argc, char** argv) {
     try {
         if (argc != 2) throw std::runtime_error("expected owned Metal library");
+#ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
+        verify_nax_integration(argv[1], false);
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+        verify_nax_integration(argv[1], true);
+#endif
+#endif
         MetalGraph g(argv[1], 256 * 1024 * 1024); const auto initial = g.memory().live_bytes;
+        g.prepare_gdn_tiles(128); verify_row_primitives(g);
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+        {
+            MetalGraph concurrent(argv[1], 256 * 1024 * 1024);
+            concurrent.configure_concurrent_dispatch(true); concurrent.prepare_gdn_tiles(128);
+            verify_row_primitives(concurrent);
+        }
+#endif
         g.configure_block_gemv(1); for (uint32_t width : {1, 2, 4, 8}) g.prepare_q8_matvec_many(width);
         for (uint32_t group : {32, 64, 128}) {
             try { g.prepare_gdn_tiles(group); } catch (const FormatError& e) { std::cout << "GDN core group refused: " << group << " (" << e.what() << ")\n"; continue; }
@@ -182,7 +358,8 @@ int main(int argc, char** argv) {
         for (auto mode : {L2Mode::add_squared_epsilon, L2Mode::floor_squared_epsilon}) for (float scale : {1.0f, 0.088388346f})
             exercise(g, {32, 2, 4, 128, 16, 4}, {4, 3}, true, false, {scale, 1e-6f, mode, 1e-6f});
         for (uint32_t steps : {3, 7, 9, 15, 17, 31}) exercise(g, {32, 2, 4, 128, 16, 4}, {32, steps}, false, false);
-        exercise(g, {32, 1, 32, 128, 127, 4}, {4, 3}, true, false);
+        for (uint32_t width : {1u, 7u, 8u, 9u, 127u})
+            exercise(g, {32, 1, 32, 128, width, 4}, {4, 3}, true, false);
         // Actual head geometry with small generated projections, partial rows,
         // all intermediate bytes, inactive tails and every rollback prefix.
         exercise(g, {32, 16, 48, 128, 128, 4}, {8, 7}, true, false);

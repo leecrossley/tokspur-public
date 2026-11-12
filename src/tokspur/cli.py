@@ -46,6 +46,22 @@ def adopt(target: Path, draft: Path) -> None:
     print("Existing weights verified in place. No model files copied or downloaded.")
 
 
+def valid_api_key(path: Path) -> bool:
+    """Whether `path` holds a key the server admits: 64 hex digits and a newline."""
+    try:
+        status = path.lstat()
+        text = path.read_bytes()
+    except FileNotFoundError:
+        return False
+    return (
+        (status.st_mode & 0o170777) == 0o100600
+        and status.st_nlink == 1
+        and len(text) == 65
+        and text.endswith(b"\n")
+        and all(c in b"0123456789abcdef" for c in text[:64])
+    )
+
+
 def configure(port: int) -> None:
     if type(port) is not int or not 1024 <= port <= 65535:
         raise ValueError("Use an unprivileged local port")
@@ -62,24 +78,29 @@ def configure(port: int) -> None:
         raise ValueError("Unknown state owner")
     write_json(state / "owner.json", {"project": "tokspur", "schema": 1})
 
-    # Prepare private API key if not present (64 hex characters + newline)
+    # Keep a key only if the server would admit it (64 hex characters + newline,
+    # 0600, one link); replace anything else atomically so an interrupted write
+    # cannot leave an empty key behind.
     key_file = state / "api-key"
-    if not key_file.is_symlink() and not key_file.exists():
+    if key_file.is_symlink():
+        raise ValueError("state/api-key must not be a symlink")
+    if not valid_api_key(key_file):
+        temporary = state / f".api-key.{os.getpid()}.tmp"
         fd = os.open(
-            key_file,
+            temporary,
             os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY | os.O_CLOEXEC,
             0o600,
         )
-        with os.fdopen(fd, "w") as stream:
-            stream.write(secrets.token_hex(32) + "\n")
-            stream.flush()
-            os.fchmod(stream.fileno(), 0o600)
-            os.fsync(stream.fileno())
-
-    key_json = state / "api-key.json"
-    if not key_json.is_symlink() and not key_json.exists():
-        write_json(key_json, {"api_key": secrets.token_urlsafe(36)})
-        os.chmod(key_json, 0o600)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                stream.write(secrets.token_hex(32) + "\n")
+                stream.flush()
+                os.fchmod(stream.fileno(), 0o600)
+                os.fsync(stream.fileno())
+            os.replace(temporary, key_file)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
 
     target_dir = Path(data["target"]["directory"])
     if target_dir.is_dir():
@@ -119,6 +140,12 @@ def default_derived_pack_path(
             v3_path = derived_dir / v3_name
             if v3_path.is_file():
                 return v3_path.resolve()
+        # With neither format installed, name the default format (v3) in the refusal.
+        if not any(
+            (derived_dir / name).is_file()
+            for name in ("tokspur-pack-v2.asa.gguf", "tokspur-pack-v2.gguf")
+        ):
+            return (derived_dir / "tokspur-pack-v3.asa.gguf").resolve()
     asa_name = "tokspur-pack-v3.asa.gguf" if pack_v3 else "tokspur-pack-v2.asa.gguf"
     legacy_name = "tokspur-pack-v3.gguf" if pack_v3 else "tokspur-pack-v2.gguf"
     asa_path = derived_dir / asa_name
@@ -136,7 +163,7 @@ def serve(
     derived_pack: Path | str | None = None,
     gdn_prefill_only: bool = False,
     derived_pack_trust_mode: str = "full",
-    output_packet: int = 8,
+    output_packet: int | None = None,
     first_output_packet: int | None = None,
     prefill_dense: str | None = None,
     prefill_grouped: str | None = None,
@@ -157,6 +184,7 @@ def serve(
     native_verify_hc_gdn_fused: str | None = None,
     native_dflash2_defer_context: str | None = None,
     native_dflash2_verify_rows: str | None = None,
+    native_prepared_validation: str | None = None,
     native_verify_nax: str | None = None,
     drafter: str = "mtp",
     dflash2_dir: Path | str | None = None,
@@ -193,6 +221,7 @@ def serve(
         ("native_prefill_router_fast", native_prefill_router_fast),
         ("native_verify_hc_gdn_fused", native_verify_hc_gdn_fused),
         ("native_dflash2_defer_context", native_dflash2_defer_context),
+        ("native_prepared_validation", native_prepared_validation),
         ("native_verify_nax", native_verify_nax),
     ):
         if value not in (None, "off", "on"):
@@ -205,6 +234,8 @@ def serve(
         raise ValueError(
             "--native-prefill-router-fast requires the removed router-window implementation"
         )
+    if output_packet is None:
+        output_packet = 64 if speed_preset else 8
     if prefill_dense is None:
         prefill_dense = "nax" if speed_preset else "f32-staged"
     if prefill_grouped is None:
@@ -217,9 +248,7 @@ def serve(
         verify_nax_enabled = bool(speed_preset)
     verify_nax_enabled = verify_nax_enabled or verify_nax_m8
     if speed_preset:
-        if native_verify_hc_gdn_fused is None and (
-            verify_nax_enabled or drafter == "dflash2"
-        ):
+        if native_verify_hc_gdn_fused is None and verify_nax_enabled:
             native_verify_hc_gdn_fused = "on"
         if native_host_logit_views is None:
             native_host_logit_views = "on"
@@ -227,17 +256,25 @@ def serve(
             native_logit_topk = "on"
         if native_ple_async_gather is None:
             native_ple_async_gather = "on"
+        if native_prepared_validation is None:
+            native_prepared_validation = "on"
         if drafter == "mtp":
             if mtp_depth is None:
                 mtp_depth = 3
             mtp_draft_slice = True
         elif drafter == "dflash2":
+            if verify_nax_enabled:
+                verify_nax_m8 = True
+            if dflash2_precision is None:
+                dflash2_precision = "q8_0"
             if native_dflash2_defer_context is None:
                 native_dflash2_defer_context = "on"
             if dflash2_max_drafts is None:
-                dflash2_max_drafts = 4
+                dflash2_max_drafts = 7
             if dflash2_vocab_slice is None:
                 dflash2_vocab_slice = 32768
+            if native_dflash2_verify_rows is None:
+                native_dflash2_verify_rows = "auto"
         if output_packet == 64 and first_output_packet is None:
             first_output_packet = 8
     if tool_enum_validation is None:
@@ -411,14 +448,8 @@ def serve(
             [sys.executable, str(ROOT / "scripts/bootstrap.py"), "--verify-only"],
             check=True,
         )
+        # The server reads and checks state/api-key itself.
         env = isolated_environment()
-        api_key_path = state / "api-key"
-        if api_key_path.is_file():
-            env["TOKSPUR_API_KEY"] = api_key_path.read_text().strip()
-        elif (state / "api-key.json").is_file():
-            env["TOKSPUR_API_KEY"] = read_json(state / "api-key.json").get(
-                "api_key", ""
-            )
 
         server_bin = None
         for candidate in (
@@ -478,9 +509,7 @@ def serve(
             dp = Path(derived_pack)
             pack_file = dp if dp.is_absolute() else (Path.cwd() / dp).resolve()
         else:
-            pack_file = default_derived_pack_path(
-                ROOT, pack_v3=pack_v3, prefer_v3=speed_preset
-            )
+            pack_file = default_derived_pack_path(ROOT, pack_v3=pack_v3, prefer_v3=True)
         shards = [asset["path"] for asset in target_info.get("assets", [])]
 
         if not allow_raw_gguf:
@@ -614,6 +643,11 @@ def serve(
             *(
                 ["--native-dflash2-verify-rows", native_dflash2_verify_rows]
                 if native_dflash2_verify_rows is not None
+                else []
+            ),
+            *(
+                ["--native-prepared-validation", "on"]
+                if native_prepared_validation == "on"
                 else []
             ),
             *(
@@ -856,7 +890,7 @@ def main() -> None:
             "tokspur: invalid TOKSPUR_CLI_IMPL (expected rust or python)\n"
         )
         raise SystemExit(2)
-    if mode == "rust":
+    if mode == "rust" or sys.argv[1:2] == ["check-model-config"]:
         rust_bin = ROOT / "build/rust-fast-math/release/tokspur"
         if not rust_bin.is_file():
             sys.stderr.write(
@@ -869,6 +903,10 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor", help="Read-only readiness summary; never loads a model")
+    sub.add_parser(
+        "check-model-config",
+        help="Compare a local config.json with the Flash-Next text profile",
+    )
     a = sub.add_parser("adopt", help="Fully hash existing weights without copying them")
     a.add_argument("--target", type=Path, required=False, default=None)
     a.add_argument("--draft", type=Path, required=False, default=None)
@@ -897,7 +935,7 @@ def main() -> None:
         "--pack-v3",
         action="store_true",
         default=False,
-        help="Opt-in to planar derived pack v3 (tokspur-pack-v3.asa.gguf)",
+        help="Require planar derived pack v3 (the default when installed; v2 is the fallback)",
     )
     s.add_argument(
         "--derived-pack",
@@ -920,7 +958,7 @@ def main() -> None:
     s.add_argument(
         "--output-packet",
         type=int,
-        default=8,
+        default=None,
         choices=[8, 64],
         help="MTP output packet size (8 or 64)",
     )

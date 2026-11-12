@@ -51,7 +51,8 @@ void encode_attention_layer_tile(MetalGraph& graph, const AttentionLayerWeights&
     AttentionLayerShape shape, QsaPolicy policy, RouterMode router, bool normalize_selected,
     AttentionTileMode mode, AttentionTileHcMode hc = AttentionTileHcMode::combined
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
-    , const VerifyNaxMoeScratch* verify_nax_moe = nullptr
+    , const VerifyNaxMoeScratch* verify_nax_moe = nullptr,
+    bool input_prenormalized = false, GpuView next_rms_gains = {}, float next_rms_epsilon = 0.0f
 #endif
     );
 } // namespace tokspur

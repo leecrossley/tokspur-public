@@ -424,6 +424,124 @@ void operator_checkpoint_controls(const char* library) {
     std::cout<<"Generated operator checkpoint controls "<<checks<<" pass; Metal required, no model or timing admission\n";
 }
 #endif
+
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+// gemv_rows is gemv() per row to the byte in either dispatch mode. Its staged form keeps independent rows in one barrier scope.
+void row_gemv_cases(const std::filesystem::path& library, std::mt19937& rng) {
+    constexpr uint32_t columns = 1024, count = 300, splits = 16;
+    constexpr uint64_t stride = uint64_t(columns) * 4 + 32;
+    const auto values = random_values(count * stride / 4, rng, 1.0f), matrix_values = random_values(size_t(columns) * 80, rng);
+    for (const bool concurrent : {false, true}) {
+        tokspur::MetalGraph gpu(library, 64 * 1024 * 1024);
+        gpu.configure_small_gemv(splits); gpu.configure_concurrent_dispatch(concurrent);
+        Arena arena{gpu, {}};
+        const auto input = arena.upload(values);
+        // One and three outputs share partial-sum regions freely, 64 leaves two regions, and 80 is an ordinary single-stage GEMV.
+        for (const uint32_t rows : {1u, 3u, 64u, 80u}) {
+            const auto matrix = arena.upload(std::span(matrix_values).first(size_t(columns) * rows));
+            const auto expected = arena.zero(size_t(count) * rows), actual = arena.zero(size_t(count) * rows);
+            const auto allocations = gpu.memory().allocations;
+            const uint64_t dispatches = uint64_t(count) * gpu.gemv_dispatches(0, columns, rows);
+            gpu.begin();
+            for (uint32_t t = 0; t < count; ++t)
+                gpu.gemv(0, matrix, gpu.slice(input, t * stride, uint64_t(columns) * 4), gpu.slice(expected, uint64_t(t) * rows * 4, uint64_t(rows) * 4), columns, rows);
+            done(gpu, dispatches, allocations);
+            const auto row_barriers = gpu.concurrent_barriers();
+            gpu.begin();
+            gpu.gemv_rows(0, matrix, {input, count, columns, stride}, {actual, count, rows, uint64_t(rows) * 4});
+            done(gpu, dispatches, allocations);
+            require(gpu.read(actual) == gpu.read(expected), "row GEMV differs from per-row GEMV");
+            if (!concurrent) continue;
+            if (rows > 64) { require(row_barriers == 0 && gpu.concurrent_barriers() == 0, "independent single-stage rows took a barrier"); continue; }
+            // Per row: one barrier before each reduce and one before each reuse of the shared partial sums. Staged: the same two per group of regions.
+            const uint64_t regions = 64 * 32 / (uint64_t(rows) * splits), groups = (count + regions - 1) / regions;
+            require(row_barriers == 2 * uint64_t(count) - 1 && gpu.concurrent_barriers() == 2 * groups - 1, "staged row GEMV barrier count");
+        }
+        // Outputs written into the padding of the input rows: staging would let one row's result precede another row's read, so the per-row order stays.
+        const auto rows_and_padding = arena.upload(values, false), expected = arena.zero(count);
+        const auto matrix = arena.upload(std::span(matrix_values).first(columns));
+        const auto allocations = gpu.memory().allocations;
+        gpu.begin();
+        for (uint32_t t = 0; t < count; ++t) gpu.gemv(0, matrix, gpu.slice(input, t * stride, uint64_t(columns) * 4), gpu.slice(expected, uint64_t(t) * 4, 4), columns, 1);
+        done(gpu, 2 * count, allocations);
+        gpu.begin();
+        gpu.gemv_rows(0, matrix, {rows_and_padding, count, columns, stride}, {gpu.slice(rows_and_padding, uint64_t(columns) * 4, (count - 1) * stride + 4), count, 1, stride});
+        done(gpu, 2 * count, allocations);
+        require(!concurrent || gpu.concurrent_barriers() == 2 * uint64_t(count) - 1, "aliased row GEMV left the per-row order");
+        const auto padded = gpu.read(rows_and_padding), reference = gpu.read(expected);
+        for (uint32_t t = 0; t < count; ++t)
+            require(std::memcmp(padded.data() + t * stride + uint64_t(columns) * 4, reference.data() + uint64_t(t) * 4, 4) == 0, "aliased row GEMV result");
+        gpu.begin();
+        rejected([&] { gpu.gemv_rows(0, matrix, {input, count, columns, stride - 36}, {expected, count, 1, 4}); });
+        rejected([&] { gpu.gemv_rows(0, matrix, {input, count + 1, columns, stride}, {expected, count + 1, 1, 4}); });
+        rejected([&] { gpu.gemv_rows(0, matrix, {input, count, columns, stride}, {expected, count - 1, 1, 4}); });
+        gpu.abort();
+    }
+}
+
+// A barrier exactly where a dispatch touches bytes an earlier one in the same scope wrote, or writes bytes one read: never for bytes that merely lie between them.
+void concurrent_hazard_cases(const std::filesystem::path& library, std::mt19937& rng) {
+    constexpr uint32_t width = 64;
+    const auto a = random_values(width, rng, 1.0f), gate = random_values(width, rng, 1.0f), rows = random_values(width * 3, rng, 1.0f);
+    std::vector<std::byte> serial;
+    for (const bool concurrent : {false, true}) {
+        tokspur::MetalGraph gpu(library, 16 * 1024 * 1024);
+        gpu.configure_concurrent_dispatch(concurrent);
+        Arena arena{gpu, {}};
+        const auto x = arena.upload(a), g = arena.upload(gate), b = arena.upload(rows, false), c = arena.zero(width * 2);
+        const auto row = [&](tokspur::GpuView view, uint32_t at) { return gpu.slice(view, uint64_t(at) * width * 4, uint64_t(width) * 4); };
+        const auto allocations = gpu.memory().allocations;
+        // Each batch touches rows 0 and 2 of one buffer, then makes one more access. Only the last three accesses conflict.
+        struct Access { bool write; uint32_t at; };
+        const auto batch = [&](std::array<Access, 3> accesses, uint64_t barriers, const char* why) {
+            gpu.begin();
+            uint32_t reads = 0;
+            for (const auto access : accesses) {
+                if (access.write) gpu.multiply(x, g, row(b, access.at)); else gpu.multiply(row(b, access.at), g, row(c, reads++));
+            }
+            done(gpu, 3, allocations);
+            require(gpu.concurrent_barriers() == (concurrent ? barriers : 3u), why);
+        };
+        batch({{{true, 0}, {true, 2}, {false, 1}}}, 0, "read between two written rows took a barrier");
+        batch({{{false, 0}, {false, 2}, {true, 1}}}, 0, "write between two read rows took a barrier");
+        batch({{{true, 0}, {true, 2}, {false, 2}}}, 1, "read of a written row took no barrier");
+        batch({{{false, 0}, {false, 2}, {true, 2}}}, 1, "write of a read row took no barrier");
+        batch({{{true, 0}, {true, 2}, {true, 0}}}, 1, "rewrite of a written row took no barrier");
+        auto bytes = gpu.read(b); const auto more = gpu.read(c); bytes.insert(bytes.end(), more.begin(), more.end());
+        if (!concurrent) serial = bytes; else require(bytes == serial, "concurrent hazard scope changed results");
+    }
+}
+#endif
+
+#ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
+// Only whole registered matrices and bytes outside every matrix may be bound from packed weight storage.
+void packed_storage_cases(const std::filesystem::path& library) {
+    tokspur::MetalGraph gpu(library, 16 * 1024 * 1024);
+    Arena arena{gpu, {}};
+    constexpr uint64_t lane = 4 * 34; // Q8, 32 columns, four rows
+    const auto storage = arena.bytes(std::vector<std::byte>(1024));
+    for (const uint64_t at : {640u, 64u, 320u}) gpu.register_lane_matrix(gpu.slice(storage, at, lane), {8, 32, 4, 1});
+    require(gpu.lane_matrix_count() == 3, "lane fixture registration");
+    const auto bound = [&](uint64_t offset, uint64_t bytes) {
+        const auto view = gpu.slice(storage, offset, bytes), gate = arena.zero(bytes / 4), output = arena.zero(bytes / 4);
+        gpu.begin(); gpu.multiply(view, gate, output); static_cast<void>(gpu.submit()); ++batches; ++checks;
+    };
+    const auto refused = [&](uint64_t offset, uint64_t bytes) {
+        const auto view = gpu.slice(storage, offset, bytes), gate = arena.zero(bytes / 4), output = arena.zero(bytes / 4);
+        gpu.begin(); rejected([&] { gpu.multiply(view, gate, output); }); gpu.abort();
+    };
+    bound(0, 64); bound(200, 120); bound(456, 184); bound(776, 248); // before, between and after the matrices
+    bound(200, 4); bound(316, 4);                                    // touching a matrix end and a matrix start
+    refused(196, 8);   // across the end of the first matrix
+    refused(316, 8);   // across the start of the second
+    refused(324, 8);   // inside the second
+    refused(636, 144); // around the whole third
+    refused(64, 8);    // the first bytes of the first
+    refused(768, 8);   // the last bytes of the third
+    refused(64, lane); // a whole matrix, but not through a layout-aware consumer
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -440,6 +558,13 @@ int main(int argc, char** argv) {
         delta_cases(gpu, rng);
         convolution_cases(gpu, rng);
         safety_cases(gpu, argv[1]);
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+        row_gemv_cases(argv[1], rng);
+        concurrent_hazard_cases(argv[1], rng);
+#endif
+#ifdef TOKSPUR_PRIVATE_LANE_LAYOUT
+        packed_storage_cases(argv[1]);
+#endif
         require(gpu.memory().live_bytes == base, "graph allocation leak");
         std::cout << "Persistent Metal graph checks passed: " << checks << ", batches: " << batches
                   << ", max scaled error: " << worst << ", peak allocated bytes: " << gpu.memory().peak_bytes

@@ -12,6 +12,7 @@
 #include <exception>
 #include <fcntl.h>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -20,6 +21,49 @@
 #include <utility>
 
 namespace tokspur {
+uint64_t q8_tile64_repack_bytes(uint64_t columns, uint64_t rows) {
+    if (!columns || columns % 32 || !rows) throw FormatError("invalid Q8 Tile64 geometry");
+    const auto tiles = checked_add(rows, 63) / 64;
+    return checked_mul(checked_mul(tiles, columns / 32), 2176);
+}
+Q8Tile64CacheStats summarize_q8_tile64_cache(bool enabled,
+    std::span<const Q8Tile64CacheCandidate> candidates, std::span<const Q8Tile64CacheAllocation> entries) {
+    Q8Tile64CacheStats out; out.enabled = enabled;
+    std::map<size_t, std::pair<uint64_t, uint64_t>> owners;
+    for (const auto& entry : entries) {
+        if (!entry.live || entry.alias) continue;
+        if (!enabled || !entry.logical_bytes || entry.charged_bytes < entry.logical_bytes)
+            throw FormatError("invalid live Q8 Tile64 cache allocation");
+        const auto sizes = std::pair{entry.logical_bytes, entry.charged_bytes};
+        const auto [it, added] = owners.emplace(entry.slot, sizes);
+        if (!added) {
+            if (it->second != sizes) throw FormatError("inconsistent Q8 Tile64 owner accounting");
+            continue;
+        }
+        out.owning_allocations = checked_add(out.owning_allocations, 1);
+        out.owned_logical_bytes = checked_add(out.owned_logical_bytes, entry.logical_bytes);
+        out.owned_charged_bytes = checked_add(out.owned_charged_bytes, entry.charged_bytes);
+    }
+    for (const auto& entry : entries) if (entry.live && entry.alias) {
+        if (!owners.contains(entry.slot)) throw FormatError("Q8 Tile64 alias lacks a live owner");
+        out.aliases = checked_add(out.aliases, 1);
+    }
+    for (const auto& candidate : candidates) {
+        if (!candidate.source_bytes || !candidate.repack_logical_bytes)
+            throw FormatError("invalid registered Q8 Tile64 candidate");
+        out.registered_candidates = checked_add(out.registered_candidates, 1);
+        out.registered_source_bytes = checked_add(out.registered_source_bytes, candidate.source_bytes);
+        out.candidate_repack_logical_bytes = checked_add(out.candidate_repack_logical_bytes, candidate.repack_logical_bytes);
+        if (candidate.cached_allocation_slot && owners.contains(*candidate.cached_allocation_slot)) {
+            out.covered_candidates = checked_add(out.covered_candidates, 1);
+        } else {
+            out.omitted_candidates = checked_add(out.omitted_candidates, 1);
+            out.omitted_repack_logical_bytes = checked_add(out.omitted_repack_logical_bytes, candidate.repack_logical_bytes);
+        }
+    }
+    return out;
+}
+
 void validate_ngram(const NgramSpec& s, NgramPolicy p) {
     if (s.order < 2 || s.order > 8 || !s.heads || s.heads > 32 || !s.row_width || s.row_width > 65536 ||
         !s.token_limit || s.eos >= s.token_limit || s.image >= s.token_limit || s.multipliers.size() != s.order ||

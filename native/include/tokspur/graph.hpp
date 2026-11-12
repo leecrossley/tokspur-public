@@ -34,6 +34,7 @@
 #include "tokspur/task4_profile.hpp"
 #endif
 #include "tokspur/routing.hpp"
+#include "tokspur/memory.hpp"
 #include "tokspur/gdn_math.hpp"
 #include "tokspur/gdn_tile.hpp"
 #include "tokspur/attention_math.hpp"
@@ -72,6 +73,18 @@
 #endif
 
 namespace tokspur {
+#ifdef TOKSPUR_PRIVATE_VERIFY_NAX_BATCH_TOP10_MIXTURE
+static_assert(TOKSPUR_PRIVATE_VERIFY_NAX_BATCH_TOP10_MIXTURE == 0 || TOKSPUR_PRIVATE_VERIFY_NAX_BATCH_TOP10_MIXTURE == 1,
+    "verify NAX top10/mixture batch policy must be 0 or 1");
+inline constexpr bool verify_nax_batch_top10_mixture_enabled = TOKSPUR_PRIVATE_VERIFY_NAX_BATCH_TOP10_MIXTURE == 1;
+#else
+inline constexpr bool verify_nax_batch_top10_mixture_enabled = false;
+#endif
+#if defined(TOKSPUR_PRIVATE_VERIFY_NAX_BATCH_TOP10_MIXTURE) && TOKSPUR_PRIVATE_VERIFY_NAX_BATCH_TOP10_MIXTURE == 1
+#if !defined(TOKSPUR_PRIVATE_PREFILL_BATCH_TOP10) || TOKSPUR_PRIVATE_PREFILL_BATCH_TOP10 != 1 || !defined(TOKSPUR_PRIVATE_PREFILL_BATCH_MIXTURE) || TOKSPUR_PRIVATE_PREFILL_BATCH_MIXTURE != 1
+#error "verify NAX top10/mixture batching requires both existing batch kernels"
+#endif
+#endif
 class ModelFiles;
 enum class PrefillWeightLayout : uint32_t;
 enum class QsaPrefillOp : uint32_t;
@@ -350,6 +363,26 @@ struct KernelTiming {
     bool task4_grid_is_threadgroups = true;
 #endif
 };
+struct PrefillTop10MixtureTelemetry {
+    uint64_t moe_batch_calls = 0;
+    uint64_t moe_batch_rows = 0;
+    uint32_t moe_batch_min_rows = 0;
+    uint32_t moe_batch_max_rows = 0;
+    uint64_t top10_batched_calls = 0;
+    uint64_t top10_batched_rows = 0;
+    uint64_t top10_scalar_calls = 0;
+    uint64_t top10_fallbacks = 0;
+    uint64_t mixture_batched_calls = 0;
+    uint64_t mixture_batched_rows = 0;
+    uint64_t mixture_scalar_calls = 0;
+    uint64_t mixture_fallbacks = 0;
+};
+// Lifetime completed operator-group encodings (before submission), including later aborts.
+// Partial groups that fail during CPU encoding are not counted; prefill/drafter are excluded.
+struct VerifyNaxTop10MixtureTelemetry {
+    uint64_t top10_batched_calls = 0, top10_batched_rows = 0, top10_scalar_calls = 0;
+    uint64_t mixture_batched_calls = 0, mixture_batched_rows = 0, mixture_scalar_calls = 0;
+};
 struct GraphProfile {
 #ifdef TOKSPUR_PRIVATE_TASK4_PROFILE
     uint64_t task4_calibration_gpu_start = 0, task4_calibration_gpu_end = 0;
@@ -461,6 +494,8 @@ public:
     void copy(std::span<const GraphCopy> copies);
     void release(GpuView full_buffer);
     [[nodiscard]] GraphMemory memory() const;
+    // Allocates a telemetry snapshot only; never called on encoding paths.
+    [[nodiscard]] Q8Tile64CacheStats q8_tile64_cache_stats() const;
     [[nodiscard]] std::string device_name() const;
     // Opt-in diagnostic only. Stage-only devices use one encoder per operation;
     // this deliberately perturbs timing and is never an uninstrumented benchmark.
@@ -677,6 +712,8 @@ public:
     void begin_indirect_compatible();
     void abort(); // Discards an unsubmitted batch; not rollback after execution.
     [[nodiscard]] BatchResult submit(); // Waits once, checks completion/error flag.
+    // Commits the dispatches encoded so far without waiting and continues the same logical batch in a new physical command buffer, so the GPU starts while the host encodes the rest. Returns false and changes nothing for an empty, recorded, profiled or diagnostic batch. submit() and abort() wait for every part.
+    bool commit_partial();
 
     // Explicit static-command experiment. Recording performs no GPU execution;
     // normal owned composite encoders supply all bindings and copied constants.
@@ -691,6 +728,9 @@ public:
     void release_capture(GraphCapture capture); // Idle only; stale handles refuse.
 
     void gemv(uint32_t encoding, GpuView matrix, GpuView input, GpuView output, uint32_t columns, uint32_t rows);
+    // gemv() once per row: input.columns matrix columns in, output.columns matrix rows out. Each row keeps gemv()'s kernels, arguments and arithmetic.
+    // In a concurrent batch a two-stage small GEMV runs stage by stage over separate partial-sum regions, so its rows need no barrier between them.
+    void gemv_rows(uint32_t encoding, GpuView matrix, GpuRowsF32 input, GpuRowsF32 output);
     // Token-major Q8 projections reuse decoded weights without scratch or conversion. Widths 1/2/4/8 retain their arithmetic. Private width three requires explicit startup selection. Prepare every selected width while idle.
     // Fixed before any batch or many-width preparation. Off in every ordinary build.
     void configure_q8_three_rows(bool enabled);
@@ -806,6 +846,16 @@ public:
     void prepare_hc_down_window();
     void hc_down_q8_window(GpuView weights, GpuRowsF32 input, GpuRowsF32 output);
 #endif
+    [[nodiscard]] bool prefill_batch_top10() const;
+    [[nodiscard]] bool prefill_batch_mixture() const;
+    void prepare_prefill_top10_mixture();
+    void prefill_route_batch(GpuView logits, GpuView indices, GpuView weights, uint32_t experts, uint32_t selected, uint32_t tokens, RouterMode mode, bool normalize_selected);
+    void prefill_mixture_batch(GpuView experts, GpuView weights, GpuView shared, GpuView shared_logit, GpuRowsF32 output, uint32_t selected);
+    void record_prefill_moe_chunk(uint32_t rows, bool used_batch_top10, bool top10_fallback, bool used_batch_mixture, bool mixture_fallback);
+    [[nodiscard]] PrefillTop10MixtureTelemetry prefill_top10_mixture_telemetry() const;
+    void reset_prefill_top10_mixture_telemetry();
+    void record_verify_nax_moe_ops(uint32_t rows, bool top10, bool batched);
+    [[nodiscard]] VerifyNaxTop10MixtureTelemetry verify_nax_top10_mixture_telemetry() const;
     void prepare_dense_mm_q8(PrefillWeightLayout layout);
     void dense_mm_q8(PrefillWeightLayout layout, GpuView matrix, GpuRowsF32 input, GpuRowsF32 output, bool reuse_bf16 = false);
     void nax_dense_bf16(GpuView matrix, GpuRowsF32 input, GpuRowsF32 output, bool reuse_bf16 = false);
@@ -916,6 +966,14 @@ public:
     // Capacity-sized buffers, steps 1..capacity; unused output rows stay untouched.
     // Candidates must be disjoint. Publish only after the whole batch succeeds.
     void prepare_gdn_tiles(uint32_t delta_group_threads);
+    // Same per-row arithmetic and head order as gdn_prepare/gdn_gates, one
+    // dispatch per operation. Capacity-sized tapes, active steps 2..8 only.
+    void gdn_prepare_verify_rows(GpuView input, GpuView query, GpuView key,
+        GpuView value, GdnShape shape, GdnPolicy policy, StateTile tile);
+    void gdn_silu_prepare_verify_rows(GpuView input, GpuView query, GpuView key,
+        GpuView value, GdnShape shape, GdnPolicy policy, StateTile tile);
+    void gdn_gates_verify_rows(GpuView alpha, GpuView beta_logits, GpuView rates,
+        GpuView bias, GpuView decay, GpuView beta, uint32_t heads, StateTile tile);
     void gdn_convolution_tile(GpuView accepted_history, GpuView projected, GpuView weights,
                               GpuView candidate_history, GpuView output,
                               uint32_t channels, StateTile tile);
@@ -923,6 +981,7 @@ public:
                         GpuView decay, GpuView beta, GpuView candidate_state,
                         GpuView output, uint32_t heads, uint32_t value_width, StateTile tile);
     void rms(GpuView input, GpuView effective_gains, GpuView output, uint32_t group_width, float epsilon);
+    void rms_sigmoid_gate(GpuView input, GpuView effective_gains, GpuView gate, GpuView output, uint32_t group_width, float epsilon);
     void activate(GpuView input, GpuView output, Activation kind, float scale = 1);
     void multiply(GpuView input, GpuView gate, GpuView output, bool sigmoid_gate = false);
     void configure_swiglu_fused(bool enabled);
@@ -976,6 +1035,9 @@ public:
     [[nodiscard]] bool verify_hc_gdn_fused_enabled() const;
     void prepare_verify_hc_gdn_fused();
     void verify_fused_hc_q8(GpuView matrix, GpuRowsF32 input, GpuRowsF32 output, bool silu = false, float scale = 1.0f);
+    void verify_fused_hc_inject_scales_rows(GpuView weights, GpuView normalized,
+                                            GpuView inject_logits, GpuView scales,
+                                            uint32_t branches, uint32_t channels, uint32_t tokens);
     void verify_fused_hc_inject_read_rows(GpuView weights, GpuView normalized, GpuView scores,
                                           GpuView inject_logits, GpuView output, GpuView scales,
                                           uint32_t branches, uint32_t channels, uint32_t tokens);
@@ -989,6 +1051,8 @@ public:
                                         float epsilon, bool shared_gains);
     void verify_fused_gdn_alpha_beta_f32(GpuView w_alpha, GpuView w_beta, GpuRowsF32 input,
                                          GpuRowsF32 out_alpha, GpuRowsF32 out_beta);
+    void verify_fused_expert_gate_f32(GpuView weights, GpuRowsF32 input, GpuRowsF32 output);
+    void verify_fused_shared_logit_f32(GpuView weights, GpuRowsF32 input, GpuRowsF32 output);
     void residual_read(GpuView normalized, GpuView scores, GpuView inject_logits, GpuView output,
                        GpuView scales, uint32_t branches, uint32_t channels);
     void residual_write(GpuView streams, GpuView output, GpuView scales, GpuView destination);

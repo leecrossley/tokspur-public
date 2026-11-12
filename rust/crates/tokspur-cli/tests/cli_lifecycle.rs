@@ -22,6 +22,170 @@ use tokspur_sys::process::kill;
 use tokspur_sys::{ESRCH, SIGINT, SIGTERM};
 use tokspur_text::sha256::{Sha256, hex};
 
+/// The packaged CLI can inspect config metadata on a machine with no Tokspur
+/// state, target shards, draft sidecar, or built worker.
+#[test]
+fn check_model_config_before_adoption() {
+    let dir = TempDir::new("model-config");
+    let path = dir.0.join("config.json");
+    let layers: Vec<_> = (0..48)
+        .map(|i| {
+            if i % 4 == 3 {
+                "full_attention"
+            } else {
+                "linear_attention"
+            }
+        })
+        .collect();
+    let text = format!(
+        r#"{{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,
+        "vocab_size":248320,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,
+        "num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,
+        "shared_expert_intermediate_size":640,"full_attention_interval":4,"linear_conv_kernel_dim":4,
+        "linear_num_key_heads":16,"linear_num_value_heads":48,"linear_key_head_dim":128,
+        "linear_value_head_dim":128,"hc_count":4,"hc_lowrank":320,"indexer_n_heads":4,
+        "indexer_kv_heads":1,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4,
+        "ngram_size":3,"heads_per_ngram":8,"ple_conv_kernel_size":4,"ple_embed_dim":2560,
+        "rms_norm_eps":1e-6,"partial_rotary_factor":0.25,"rope_parameters":{{"rope_theta":10000000,"partial_rotary_factor":0.25,"mrope_section":[11,11,10]}},
+        "max_position_embeddings":262144,"layer_types":{layers:?},"ple_layer_ids":[2]}}"#
+    );
+    let check = |config: &str| {
+        fs::write(&path, config).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_tokspur"))
+            .current_dir(&dir.0)
+            .env("TOKSPUR_STATE_ROOT", dir.0.join("unused-state"))
+            .arg("check-model-config")
+            .arg(&path)
+            .output()
+            .unwrap()
+    };
+    let nested = format!(
+        r#"{{"model_type":"qwen4_exp","vision_config":{{"hidden_size":64}},"text_config":{text}}}"#
+    );
+    let duplicate = nested.replace(r#""vision_config":"#, r#""hidden_size":2560,"rms_norm_eps":0.000001,"rope_scaling":{"rope_theta":1e7},"vision_config":"#);
+    let valid_bounds = nested.replace("1e-6", "0.01").replace("10000000", "1.01");
+    for config in [&text, &nested, &duplicate, &valid_bounds] {
+        let output = check(config);
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("checked fields match")
+        );
+    }
+    for invalid_rope in [
+        nested.replace("[11,11,10]", "[12,10,10]"),
+        nested.replacen("0.25", "0.5", 1),
+        nested.replace(
+            "\"vision_config\":",
+            "\"partial_rotary_factor\":0.5,\"vision_config\":",
+        ),
+    ] {
+        let output = check(&invalid_rope);
+        assert_eq!(output.status.code(), Some(1));
+        let report = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            report.contains("partial_rotary_factor expected")
+                || report.contains("mrope_section expected")
+        );
+    }
+    for (field, replacement, expected) in [
+        (
+            r#""indexer_kv_heads":1"#,
+            r#""indexer_kv_heads":2"#,
+            "indexer_kv_heads expected 1",
+        ),
+        (
+            r#""rms_norm_eps":1e-6"#,
+            r#""rms_norm_eps":0"#,
+            "rms_norm_eps expected",
+        ),
+        (
+            r#""rms_norm_eps":1e-6"#,
+            r#""rms_norm_eps":0.011"#,
+            "rms_norm_eps expected",
+        ),
+        (
+            r#""rope_theta":10000000"#,
+            r#""rope_theta":1"#,
+            "rope_theta expected",
+        ),
+        (
+            r#""rope_theta":10000000"#,
+            r#""rope_theta":"10000000""#,
+            "rope_theta expected",
+        ),
+        (
+            r#""vision_config":"#,
+            r#""hidden_size":1536,"vision_config":"#,
+            "root.hidden_size conflicts",
+        ),
+        (
+            r#""vision_config":"#,
+            r#""max_position_embeddings":131072,"vision_config":"#,
+            "root.max_position_embeddings conflicts",
+        ),
+        (
+            r#""vision_config":"#,
+            r#""rope_theta":1000,"vision_config":"#,
+            "conflicts with the other rope_theta",
+        ),
+        (
+            r#""vision_config":"#,
+            r#""rms_norm_eps":0.001,"vision_config":"#,
+            "conflicts with the other rms_norm_eps",
+        ),
+    ] {
+        let output = check(&nested.replace(field, replacement));
+        assert_eq!(output.status.code(), Some(1), "{field}");
+        assert!(
+            String::from_utf8(output.stdout).unwrap().contains(expected),
+            "{expected}"
+        );
+    }
+    for (declaration, expected) in [
+        (r#""indexer_kv_heads":1,"#, "indexer_kv_heads"),
+        (r#""rms_norm_eps":1e-6,"#, "rms_norm_eps"),
+        (r#""rope_theta":10000000,"#, "rope_theta"),
+    ] {
+        let output = check(&nested.replace(declaration, ""));
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains(&format!("Unverified fields: {expected}"))
+        );
+    }
+    let changed = nested
+        .replace("\"num_experts_per_tok\":10", "\"num_experts_per_tok\":4")
+        .replace("262144", "8192")
+        .replace("linear_attention", "full_attention");
+    let output = check(&changed);
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("num_experts_per_tok expected 10, found 4"));
+    assert!(text.contains("max_position_embeddings requires at least 65536"));
+    assert!(text.contains("layer_types expected"));
+    let missing = check(r#"{"model_type":"future_flash","hidden_size":2560}"#);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        String::from_utf8(missing.stdout)
+            .unwrap()
+            .contains("insufficient evidence")
+    );
+    for invalid in [
+        "[]",
+        "{}",
+        r#"{"text_config":null,"num_hidden_layers":48}"#,
+        r#"{"hidden_size":true}"#,
+        r#"{"hidden_size":2560,"hidden_size":1}"#,
+        "not json",
+    ] {
+        assert_eq!(check(invalid).status.code(), Some(1), "{invalid}");
+    }
+    assert!(!dir.0.join("unused-state").exists());
+}
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static SERVE_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -103,7 +267,57 @@ static void write_pid_file(const char *env_key, pid_t pid) {
     }
 }
 
-int main(void) {
+// A model-free stand-in for the verified native pack protocol. Exercise
+// argv conversion here, including absolute paths with spaces and all four shards.
+static int pack_command(int argc, char **argv) {
+    const char *name = strrchr(argv[0], '/');
+    if (!name || strcmp(name + 1, "tokspur-native") != 0) return 5;
+    const char *out = NULL, *mtp = NULL, *reserve = NULL, *chunk = NULL;
+    int shards = 0;
+    for (int i = 2; i < argc; i += 2) {
+        if (i + 1 >= argc) return 6;
+        const char *value = argv[i + 1];
+        if (!strcmp(argv[i], "--output")) out = value;
+        else if (!strcmp(argv[i], "--mtp")) mtp = value;
+        else if (!strcmp(argv[i], "--reserve-bytes")) reserve = value;
+        else if (!strcmp(argv[i], "--chunk-bytes")) chunk = value;
+        else if (!strcmp(argv[i], "--gguf") && value[0] == '/' && access(value, R_OK) == 0) ++shards;
+        else return 6;
+    }
+    if (!out || out[0] != '/' || !mtp || mtp[0] != '/' || access(mtp, R_OK) != 0 || shards != 4 || !reserve)
+        return 6;
+    if (strstr(out, "cancel-pending")) {
+        signal(SIGTERM, on_stop);
+        FILE *f = fopen(out, "w");
+        if (!f) return 9;
+        fputs("streaming", f);
+        fclose(f);
+        while (!got_stop) usleep(1000);
+        unlink(out);
+        return 10;
+    }
+    if (strstr(out, "native-refusal")) {
+        fputs("native fixture refused output\n", stderr);
+        return 7;
+    }
+    if (!strcmp(argv[1], "pack-v3-plan")) {
+        if (!chunk || strcmp(chunk, "16777216")) return 8;
+        printf("{\"recipe\":\"tokspur-pack-v3\",\"version\":3,\"tensor_count\":1254,\"payload_bytes\":4096,"
+               "\"file_bytes\":8192,\"available_bytes\":999999,\"reserve_bytes\":%s,"
+               "\"disk_ok\":%s,\"streaming_buffer_bytes\":4096,\"streaming_ceiling_bytes\":8192,\"ram_ok\":%s}\n",
+               reserve, strstr(out, "disk-fail") ? "false" : "true", strstr(out, "ram-fail") ? "false" : "true");
+    } else {
+        if (!chunk || strcmp(chunk, "2097152") || strcmp(reserve, "1610612736")) return 8;
+        printf("{\"status\":\"verified-existing\",\"recipe\":\"tokspur-pack-v3\",\"version\":3,"
+               "\"tensor_count\":1254,\"payload_bytes\":4096,\"file_bytes\":8192,"
+               "\"manifest_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}\n");
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && (!strcmp(argv[1], "pack-v3-plan") || !strcmp(argv[1], "pack-v3-build")))
+        return pack_command(argc, argv);
     const char *mode = getenv("FAKE_SERVER_MODE");
     if (!mode) {
         mode = "sleep_sigterm";
@@ -382,12 +596,19 @@ impl SyntheticCheckout {
     }
 
     fn refresh_build_manifest(&mut self) {
-        let rel_artifacts = [
+        let mut rel_artifacts = vec![
             ("build/owned-native/tokspur-native", false),
             ("build/owned-native/tokspur-owned.metallib", true),
             ("build/rust-fast-math/release/tokspur-server", false),
             ("build/rust-fast-math/release/tokspur", false),
         ];
+        if self
+            .root
+            .join("build/owned-native/scalar-channel-target")
+            .is_file()
+        {
+            rel_artifacts.push(("build/owned-native/scalar-channel-target", false));
+        }
         let mut artifacts_obj = Vec::new();
         let mut sys_deps_obj = Vec::new();
         for (rel, is_metallib) in rel_artifacts {
@@ -878,6 +1099,176 @@ fn checkout_doctor_plan_adopt_legacy_compat_and_configure_succeed() {
         "legacy_dflash2_draft check failed: {}",
         String::from_utf8_lossy(&legacy_check.stderr)
     );
+    let missing_mtp = Command::new(fixture.cli_bin())
+        .args(["pack", "plan", "--format", "v3"])
+        .output()
+        .unwrap();
+    assert!(!missing_mtp.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_mtp.stderr).contains("adopted draft missing MTP sidecar")
+    );
+}
+
+#[test]
+fn pack_format_controls_verified_native_dispatch_and_budget_failures() {
+    let mut fixture = SyntheticCheckout::create("pack-format");
+    let cli = fixture.cli_bin();
+    let run = |args: &[&str]| Command::new(&cli).args(args).output().unwrap();
+    let native = fixture.root.join("build/owned-native/tokspur-native");
+    fs::copy(
+        &native,
+        fixture
+            .root
+            .join("build/owned-native/scalar-channel-target"),
+    )
+    .unwrap();
+    fixture.refresh_build_manifest();
+
+    // V2's static plan remains available before adoption when it is named explicitly.
+    {
+        let output = run(&["pack", "plan", "--format", "v2", "--json"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = parse_json(&output.stdout).unwrap();
+        assert_eq!(
+            value.find("recipe").unwrap().unwrap().string().unwrap(),
+            b"tokspur-pack-v2"
+        );
+    }
+    // V3 is the default and needs adopted sources; both spellings enter the same implementation.
+    assert!(!run(&["pack", "plan"]).status.success());
+    assert!(!run(&["pack", "plan", "--format", "v3"]).status.success());
+    assert!(
+        Command::new(&cli)
+            .args(["adopt", "--target"])
+            .arg(&fixture.target_dir)
+            .arg("--draft")
+            .arg(&fixture.draft_dir)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let before = fixture.root.join(".tokspur/derived");
+    assert!(!before.exists());
+    let default_plan = run(&["pack", "plan", "--format", "v3", "--check"]);
+    assert!(
+        default_plan.status.success(),
+        "{}",
+        String::from_utf8_lossy(&default_plan.stderr)
+    );
+    assert!(String::from_utf8_lossy(&default_plan.stdout).contains("RAM budget: PASS"));
+    assert!(!before.exists());
+
+    for name in ["disk-fail", "ram-fail"] {
+        let dir = fixture.root.join(name);
+        fs::create_dir(&dir).unwrap();
+        for check in [false, true] {
+            let mut cmd = Command::new(&cli);
+            cmd.args([
+                "pack",
+                "plan",
+                "--format",
+                "v3",
+                "--json",
+                "--reserve-gb",
+                "1.5",
+                "--target-dir",
+            ])
+            .arg(&dir);
+            if check {
+                cmd.arg("--check");
+            }
+            let output = cmd.output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(check)),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let plan = parse_json(&output.stdout).unwrap();
+            assert_eq!(
+                plan.find("reserve_bytes")
+                    .unwrap()
+                    .unwrap()
+                    .unsigned_integer()
+                    .unwrap(),
+                1_610_612_736
+            );
+        }
+    }
+    let options = [
+        "pack",
+        "build",
+        "--format",
+        "v3",
+        "--chunk-mib",
+        "2",
+        "--reserve-gb",
+        "1.5",
+    ];
+    let explicit = fixture.root.join("custom pack.gguf");
+    for path in [None, Some(&explicit)] {
+        let mut cmd = Command::new(&cli);
+        cmd.args(options);
+        if let Some(path) = path {
+            cmd.arg("--output").arg(path);
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt = parse_json(&output.stdout).unwrap();
+        assert_eq!(
+            receipt.find("status").unwrap().unwrap().string().unwrap(),
+            b"verified-existing"
+        );
+        let expected = path
+            .cloned()
+            .unwrap_or_else(|| before.join("tokspur-pack-v3.asa.gguf"));
+        assert_eq!(
+            receipt.find("output").unwrap().unwrap().string().unwrap(),
+            expected.to_str().unwrap().as_bytes()
+        );
+    }
+    let refusal = Command::new(&cli)
+        .args(options)
+        .arg("--output")
+        .arg(fixture.root.join("native-refusal.gguf"))
+        .output()
+        .unwrap();
+    assert!(!refusal.status.success());
+    assert!(refusal.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&refusal.stderr).contains("native fixture refused output"));
+    let pending = fixture.root.join("cancel-pending.gguf");
+    let mut building = Command::new(&cli)
+        .args(options)
+        .arg("--output")
+        .arg(&pending)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let timeout = Instant::now() + Duration::from_secs(10);
+    while !pending.is_file() {
+        assert!(building.try_wait().unwrap().is_none() && Instant::now() < timeout);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(StateLock::acquire(&fixture.root.join(".tokspur")).is_err());
+    kill(building.id() as i32, SIGTERM).unwrap();
+    assert!(!building.wait().unwrap().success());
+    assert!(!pending.exists());
+    assert!(StateLock::acquire(&fixture.root.join(".tokspur")).is_ok());
+    // The selected scalar worker is still valid; this auxiliary executable is not.
+    write_mode(&native, b"modified pack tool", 0o755);
+    let tampered = run(&["pack", "plan", "--format", "v3"]);
+    assert!(!tampered.status.success());
+    assert!(String::from_utf8_lossy(&tampered.stderr).contains("artifact changed"));
 }
 
 #[test]
@@ -1691,6 +2082,109 @@ fn staged_layout_invoked_from_unrelated_working_directory() {
             .success()
     );
 
+    let staged_pack = Command::new(&staged_cli)
+        .current_dir(&ext_cwd)
+        .env("TOKSPUR_STATE_ROOT", &ext_state)
+        .args(["pack", "plan", "--format", "v3", "--json", "--check"])
+        .output()
+        .unwrap();
+    assert!(
+        staged_pack.status.success(),
+        "{}",
+        String::from_utf8_lossy(&staged_pack.stderr)
+    );
+    assert_eq!(
+        parse_json(&staged_pack.stdout)
+            .unwrap()
+            .find("version")
+            .unwrap()
+            .unwrap()
+            .unsigned_integer()
+            .unwrap(),
+        3
+    );
+    let staged_build = Command::new(&staged_cli)
+        .current_dir(&ext_cwd)
+        .env("TOKSPUR_STATE_ROOT", &ext_state)
+        .args([
+            "pack",
+            "build",
+            "--format",
+            "v3",
+            "--chunk-mib",
+            "2",
+            "--reserve-gb",
+            "1.5",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        staged_build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&staged_build.stderr)
+    );
+    let check_pack_output = |output_dir: &Path, format: &str| {
+        Command::new(&staged_cli)
+            .current_dir(&ext_cwd)
+            .env("TOKSPUR_STATE_ROOT", &ext_state)
+            .args([
+                "pack",
+                "build",
+                "--format",
+                format,
+                "--chunk-mib",
+                "2",
+                "--reserve-gb",
+                "1.5",
+                "--output",
+            ])
+            .arg(output_dir.join("custom.gguf"))
+            .output()
+            .unwrap()
+    };
+    assert!(check_pack_output(&ext_cwd, "v3").status.success());
+    let future = stage_tmp.path().join("future-state");
+    let future_plan = Command::new(&staged_cli)
+        .arg("--state-root")
+        .arg(&future)
+        .arg("plan")
+        .output()
+        .unwrap();
+    assert!(future_plan.status.success());
+    assert!(!future.exists());
+    let case_alias = stage_tmp.path().join("PKG");
+    for internal in [&pkg_dir, &case_alias].into_iter().filter(|p| p.is_dir()) {
+        for format in ["v2", "v3"] {
+            let rejected = check_pack_output(internal, format);
+            assert!(!rejected.status.success());
+            assert!(
+                String::from_utf8_lossy(&rejected.stderr).contains("immutable package directory")
+            );
+        }
+    }
+    if case_alias.is_dir() {
+        let parent = stage_tmp.path();
+        let parent_alias = parent.with_file_name(parent.file_name().unwrap().to_ascii_uppercase());
+        for state in [&case_alias, &case_alias.join("nested-state"), &parent_alias] {
+            let rejected = Command::new(&staged_cli)
+                .arg("--state-root")
+                .arg(state)
+                .args(["pack", "build", "--format", "v3"])
+                .output()
+                .unwrap();
+            assert!(!rejected.status.success());
+            assert!(
+                String::from_utf8_lossy(&rejected.stderr).contains("immutable package directory")
+            );
+            assert!(!state.join(".tokspur").exists());
+        }
+        assert!(!pkg_dir.join("nested-state").exists());
+    }
+    let link = stage_tmp.path().join("link-to-package");
+    symlink(&pkg_dir, &link).unwrap();
+    let rejected = check_pack_output(&link, "v3");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("symlink"));
     let port = free_loopback_port();
     assert!(
         Command::new(&staged_cli)

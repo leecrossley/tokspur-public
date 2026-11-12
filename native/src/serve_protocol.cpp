@@ -323,7 +323,7 @@ void history(const Json& messages, const std::vector<std::string>& tools, const 
                     const auto name = field(function, "name").string();
                     const auto found = std::find(tools.begin(), tools.end(), name); require(found != tools.end(), "historical function absent from admitted tools");
                     const auto& arguments = field(function, "arguments"); require(arguments.kind() == Json::Kind::object || arguments.kind() == Json::Kind::string, "invalid historical tool arguments");
-                    const Json parsed = arguments.kind() == Json::Kind::string ? parse_json(arguments.string(), {65536, 16384, 32}) : arguments;
+                    const Json parsed = arguments.kind() == Json::Kind::string ? parse_json(arguments.string(), {6 * 65536, 65536, 33}) : arguments;
                     if (tool_args == ToolArgValidation::executor) validate_executor_tool_arguments(parsed);
                     else validate_tool_value(schemas.at(size_t(found - tools.begin())), parsed, tool_enums);
                     pending.emplace(id, name);

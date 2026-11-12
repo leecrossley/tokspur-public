@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
 use std::path::{Component, Path, PathBuf};
 
 use tokspur_json::{Json, JsonLimits, parse_json_limited};
@@ -142,10 +142,14 @@ pub fn private_dir(tokspur_base: &Path, relative: &Path) -> Result<PathBuf, CliE
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&current).map_err(|source| CliError::Io {
-                    context: "cannot create private state directory".to_owned(),
-                    source,
-                })?;
+                // Create at 0700 so no other user can open the directory before the fchmod below.
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&current)
+                    .map_err(|source| CliError::Io {
+                        context: "cannot create private state directory".to_owned(),
+                        source,
+                    })?;
             }
             Err(source) => {
                 return Err(CliError::Io {
@@ -838,31 +842,6 @@ pub fn check_adopted_weights(layout: &RuntimeLayout, out: &mut dyn Write) -> Res
     Ok(())
 }
 
-fn random_urlsafe_token(byte_len: usize) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut raw = vec![0u8; byte_len];
-    random_bytes(&mut raw);
-    let mut out = String::with_capacity(byte_len.div_ceil(3) * 4);
-    for chunk in raw.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
-        out.push(char::from(ALPHABET[usize::from(b0 >> 2)]));
-        out.push(char::from(
-            ALPHABET[usize::from(((b0 & 0x03) << 4) | (b1 >> 4))],
-        ));
-        if chunk.len() > 1 {
-            out.push(char::from(
-                ALPHABET[usize::from(((b1 & 0x0f) << 2) | (b2 >> 6))],
-            ));
-        }
-        if chunk.len() > 2 {
-            out.push(char::from(ALPHABET[usize::from(b2 & 0x3f)]));
-        }
-    }
-    out
-}
-
 /// Runs `tokspur configure --port <port>` (`cli.py:48-100`).
 pub fn configure_runtime(
     layout: &RuntimeLayout,
@@ -920,43 +899,44 @@ pub fn configure_runtime(
         &expected_owner,
     )?;
 
+    // Keep a key only if the server would admit it: a single-link 0600 file of 64 lowercase hex digits and a newline. Anything else, such as the empty file an interrupted write could leave, is replaced. The replacement is published atomically, so an interruption leaves the old state.
     let key_file = state.join("api-key");
-    if fs::symlink_metadata(&key_file).is_err() {
-        let dir_fd = open_nofollow_dir(&state, "state directory")?;
+    let key_valid = match fs::symlink_metadata(&key_file) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(CliError::Validation(
+                "state/api-key must not be a symlink".to_owned(),
+            ));
+        }
+        Ok(meta) => {
+            meta.file_type().is_file()
+                && meta.len() == 65
+                && meta.permissions().mode() & 0o777 == 0o600
+                && meta.nlink() == 1
+                && fs::read(&key_file).is_ok_and(|bytes| {
+                    bytes.split_last().is_some_and(|(last, digits)| {
+                        *last == b'\n'
+                            && digits.len() == 64
+                            && digits
+                                .iter()
+                                .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+                    })
+                })
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(source) => {
+            return Err(CliError::Io {
+                context: "cannot inspect state/api-key".to_owned(),
+                source,
+            });
+        }
+    };
+    if !key_valid {
         let mut secret = [0u8; 32];
         random_bytes(&mut secret);
-        let line = format!("{}\n", hex(&secret));
-        let f = openat(
-            dir_fd.as_fd(),
-            c"api-key",
-            O_CREAT | O_EXCL | O_NOFOLLOW | O_WRONLY | O_CLOEXEC,
-            0o600,
-        )
-        .map_err(|source| CliError::Io {
-            context: "cannot create state/api-key".to_owned(),
-            source,
-        })?;
-        pwrite_all(f.as_fd(), line.as_bytes(), 0).map_err(|source| CliError::Io {
-            context: "cannot write state/api-key".to_owned(),
-            source,
-        })?;
-        fchmod(f.as_fd(), 0o600).map_err(|source| CliError::Io {
-            context: "cannot chmod state/api-key".to_owned(),
-            source,
-        })?;
-        fsync(f.as_fd()).map_err(|source| CliError::Io {
-            context: "cannot fsync state/api-key".to_owned(),
-            source,
-        })?;
-    }
-
-    let key_json = state.join("api-key.json");
-    if fs::symlink_metadata(&key_json).is_err() {
-        let token = random_urlsafe_token(36);
-        write_private_json(
+        write_private_bytes(
             &tokspur_base,
-            Path::new("state/api-key.json"),
-            &Json::new_object([("api_key", Json::from(token))]),
+            Path::new("state/api-key"),
+            format!("{}\n", hex(&secret)).as_bytes(),
         )?;
     }
 

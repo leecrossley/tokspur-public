@@ -15,8 +15,12 @@ repository="${TOKSPUR_REPOSITORY:-san-digital/tokspur}"
 releases_url="${TOKSPUR_RELEASES_URL:-https://github.com/$repository/releases}"
 home_dir="${TOKSPUR_HOME:-$HOME/Library/Application Support/tokspur}"
 bin_dir="${TOKSPUR_BIN_DIR:-$HOME/.local/bin}"
-# The release workflow pins the Apple Team ID that signs the executables. A copy from the source tree is unpinned.
-team_id="${TOKSPUR_TEAM_ID:-@TOKSPUR_TEAM_ID@}"
+# The release workflow pins the Apple Team ID that signs the executables. Only a copy from the source tree, which is unpinned, takes TOKSPUR_TEAM_ID, so the environment cannot change the team a published installer trusts.
+pinned_team_id="@TOKSPUR_TEAM_ID@"
+case "$pinned_team_id" in
+    @*) team_id="${TOKSPUR_TEAM_ID:-$pinned_team_id}" ;;
+    *) team_id="$pinned_team_id" ;;
+esac
 mode="${1:-install}"
 
 releases="$home_dir/releases"

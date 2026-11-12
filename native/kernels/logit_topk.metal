@@ -32,18 +32,33 @@ inline bool topk_beats(float va, uint ida, float vb, uint idb) {
     return (ca > cb) || (ca == cb && ida < idb);
 }
 
-inline void simd_best_head(float val, uint id, thread float& out_val, thread uint& out_id) {
+inline void simd_best_head(float val, uint id, ushort lane, thread float& out_val, thread uint& out_id) {
+    const bool valid = (id != 0xffffffffu);
+    if (!simd_any(valid)) {
+        out_val = -INFINITY;
+        out_id = 0xffffffffu;
+        return;
+    }
+    const float clean = valid ? ((val == 0.0f) ? 0.0f : val) : -INFINITY;
+    const float max_clean = simd_max(clean);
+    out_id = simd_min((valid && clean == max_clean) ? id : 0xffffffffu);
+    const ushort win_lane = simd_min((valid && id == out_id) ? lane : ushort(32));
+    out_val = simd_shuffle(val, win_lane);
+}
+
+template <uint Count>
+inline void top_insert_ascending_finite(thread float (&values)[Count], thread uint (&ids)[Count], float raw, uint col) {
+    values[Count - 1u] = raw;
+    ids[Count - 1u] = col;
     #pragma unroll
-    for (ushort offset = 16; offset >= 1; offset >>= 1) {
-        const float other_val = simd_shuffle_xor(val, offset);
-        const uint other_id = simd_shuffle_xor(id, offset);
-        if (topk_beats(other_val, other_id, val, id)) {
-            val = other_val;
-            id = other_id;
+    for (int i = int(Count) - 2; i >= 0; --i) {
+        if (raw > values[i]) {
+            values[i + 1] = values[i];
+            ids[i + 1] = ids[i];
+            values[i] = raw;
+            ids[i] = col;
         }
     }
-    out_val = val;
-    out_id = id;
 }
 
 template <uint Count>
@@ -142,14 +157,18 @@ kernel void logit_topk_stage1(
                 if (exp_bits == 0u && mant_bits != 0u) {
                     local_sn = min(local_sn, col);
                 }
-                if (logit_topk_detail::topk_beats(raw, col, local_vals[MaxPerThread - 1u], local_ids[MaxPerThread - 1u])) {
-                    logit_topk_detail::top_insert<MaxPerThread>(local_vals, local_ids, raw, col);
+                if (raw > local_vals[MaxPerThread - 1u]) {
+                    logit_topk_detail::top_insert_ascending_finite<MaxPerThread>(local_vals, local_ids, raw, col);
                 }
             }
         }
     }
 
     threadgroup uint shared_bad[2][8];
+    threadgroup float sg_vals[8][TopK];
+    threadgroup uint sg_ids[8][TopK];
+    threadgroup uint sg_cnt[8];
+
     const uint sg_nf = simd_min(local_nf);
     const uint sg_sn = simd_min(local_sn);
     if (!lane) {
@@ -157,60 +176,77 @@ kernel void logit_topk_stage1(
         shared_bad[1][sg] = sg_sn;
     }
 
-    threadgroup float round_vals[2][8];
-    threadgroup uint round_ids[2][8];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0u) {
-        uint tile_nf = shared_bad[0][0];
-        uint tile_sn = shared_bad[1][0];
-        #pragma unroll
-        for (uint s = 1u; s < 8u; ++s) {
-            tile_nf = min(tile_nf, shared_bad[0][s]);
-            tile_sn = min(tile_sn, shared_bad[1][s]);
-        }
-        out_part.vocabulary = a.vocabulary;
-        out_part.first_nonfinite_col = tile_nf;
-        out_part.first_subnormal_col = tile_sn;
-    }
-
     const uint target_k = min(TopK, tile_len);
-    uint emitted = 0u;
-    for (uint rank = 0u; rank < target_k; ++rank) {
+    uint sg_emitted = 0u;
+    for (uint r = 0u; r < target_k; ++r) {
         const float cur_val = local_vals[0];
         const uint cur_id = local_ids[0];
         float simd_val;
         uint simd_id;
-        logit_topk_detail::simd_best_head(cur_val, cur_id, simd_val, simd_id);
-        const uint slot = rank & 1u;
+        logit_topk_detail::simd_best_head(cur_val, cur_id, lane, simd_val, simd_id);
+        if (simd_id == 0xffffffffu) break;
         if (!lane) {
-            round_vals[slot][sg] = simd_val;
-            round_ids[slot][sg] = simd_id;
+            sg_vals[sg][r] = simd_val;
+            sg_ids[sg][r] = simd_id;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float best_val = round_vals[slot][0];
-        uint best_id = round_ids[slot][0];
-        #pragma unroll
-        for (uint s = 1u; s < 8u; ++s) {
-            if (logit_topk_detail::topk_beats(round_vals[slot][s], round_ids[slot][s], best_val, best_id)) {
-                best_val = round_vals[slot][s];
-                best_id = round_ids[slot][s];
-            }
-        }
-        if (best_id == 0xffffffffu) break;
-        if (tid == rank) {
-            out_part.ids[rank] = best_id;
-            out_part.logits[rank] = best_val;
-        }
-        if (cur_id == best_id) {
+        if (cur_id == simd_id) {
             logit_topk_detail::top_pop<MaxPerThread>(local_vals, local_ids);
         }
-        ++emitted;
+        ++sg_emitted;
     }
+    if (!lane) {
+        sg_cnt[sg] = sg_emitted;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid == 0u) {
-        out_part.count = emitted;
+    if (sg == 0u) {
+        if (lane == 0u) {
+            uint tile_nf = shared_bad[0][0];
+            uint tile_sn = shared_bad[1][0];
+            #pragma unroll
+            for (uint s = 1u; s < 8u; ++s) {
+                tile_nf = min(tile_nf, shared_bad[0][s]);
+                tile_sn = min(tile_sn, shared_bad[1][s]);
+            }
+            out_part.vocabulary = a.vocabulary;
+            out_part.first_nonfinite_col = tile_nf;
+            out_part.first_subnormal_col = tile_sn;
+        }
+        const uint cnt = (lane < 8u) ? sg_cnt[lane] : 0u;
+        uint cur = 0u;
+        uint emitted = 0u;
+        float out_v0 = -INFINITY, out_v1 = -INFINITY;
+        uint out_i0 = 0u, out_i1 = 0u;
+        for (uint rank = 0u; rank < target_k; ++rank) {
+            const bool active = (cur < cnt);
+            const float v = active ? sg_vals[lane][cur] : -INFINITY;
+            const uint id = active ? sg_ids[lane][cur] : 0xffffffffu;
+            float best_val;
+            uint best_id;
+            logit_topk_detail::simd_best_head(v, id, lane, best_val, best_id);
+            if (best_id == 0xffffffffu) break;
+            if (uint(lane) == rank) {
+                out_i0 = best_id;
+                out_v0 = best_val;
+            }
+            if (uint(lane) + 32u == rank) {
+                out_i1 = best_id;
+                out_v1 = best_val;
+            }
+            if (active && id == best_id) ++cur;
+            ++emitted;
+        }
+        if (uint(lane) < emitted) {
+            out_part.ids[lane] = out_i0;
+            out_part.logits[lane] = out_v0;
+        }
+        if (uint(lane) + 32u < emitted) {
+            out_part.ids[uint(lane) + 32u] = out_i1;
+            out_part.logits[uint(lane) + 32u] = out_v1;
+        }
+        if (lane == 0u) {
+            out_part.count = emitted;
+        }
     }
 }
 
@@ -246,6 +282,10 @@ kernel void logit_topk_stage2(
     const uint tile_count = active_tile ? min(TopK, row_parts[tid].count) : 0u;
 
     threadgroup uint shared_bad[2][8];
+    threadgroup float sg_vals[8][TopK];
+    threadgroup uint sg_ids[8][TopK];
+    threadgroup uint sg_cnt[8];
+
     const uint sg_nf = simd_min(local_nf);
     const uint sg_sn = simd_min(local_sn);
     if (!lane) {
@@ -253,62 +293,73 @@ kernel void logit_topk_stage2(
         shared_bad[1][sg] = sg_sn;
     }
 
-    threadgroup float round_vals[2][8];
-    threadgroup uint round_ids[2][8];
+    const uint target_k = min(TopK, a.vocabulary);
+    uint sg_emitted = 0u;
+    if (uint(sg) * 32u < a.tiles) {
+        uint cursor = 0u;
+        for (uint r = 0u; r < target_k; ++r) {
+            const float cur_val = (cursor < tile_count) ? row_parts[tid].logits[cursor] : -INFINITY;
+            const uint cur_id = (cursor < tile_count) ? row_parts[tid].ids[cursor] : 0xffffffffu;
+            float simd_val;
+            uint simd_id;
+            logit_topk_detail::simd_best_head(cur_val, cur_id, lane, simd_val, simd_id);
+            if (simd_id == 0xffffffffu) break;
+            if (!lane) {
+                sg_vals[sg][r] = simd_val;
+                sg_ids[sg][r] = simd_id;
+            }
+            if (cur_id == simd_id) ++cursor;
+            ++sg_emitted;
+        }
+    }
+    if (!lane) {
+        sg_cnt[sg] = sg_emitted;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid == 0u) {
-        uint row_nf = shared_bad[0][0];
-        uint row_sn = shared_bad[1][0];
-        #pragma unroll
-        for (uint s = 1u; s < 8u; ++s) {
-            row_nf = min(row_nf, shared_bad[0][s]);
-            row_sn = min(row_sn, shared_bad[1][s]);
-        }
-        out_row.vocabulary = a.vocabulary;
-        out_row.first_nonfinite_col = row_nf;
-        out_row.first_subnormal_col = row_sn;
-    }
-
-    const uint target_k = min(TopK, a.vocabulary);
-    uint cursor = 0u;
-    uint emitted = 0u;
-    for (uint rank = 0u; rank < target_k; ++rank) {
-        const float cur_val = (cursor < tile_count) ? row_parts[tid].logits[cursor] : -INFINITY;
-        const uint cur_id = (cursor < tile_count) ? row_parts[tid].ids[cursor] : 0xffffffffu;
-        float simd_val;
-        uint simd_id;
-        logit_topk_detail::simd_best_head(cur_val, cur_id, simd_val, simd_id);
-        const uint slot = rank & 1u;
-        if (!lane) {
-            round_vals[slot][sg] = simd_val;
-            round_ids[slot][sg] = simd_id;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float best_val = round_vals[slot][0];
-        uint best_id = round_ids[slot][0];
-        #pragma unroll
-        for (uint s = 1u; s < 8u; ++s) {
-            if (logit_topk_detail::topk_beats(round_vals[slot][s], round_ids[slot][s], best_val, best_id)) {
-                best_val = round_vals[slot][s];
-                best_id = round_ids[slot][s];
+    if (sg == 0u) {
+        if (lane == 0u) {
+            uint row_nf = shared_bad[0][0];
+            uint row_sn = shared_bad[1][0];
+            #pragma unroll
+            for (uint s = 1u; s < 8u; ++s) {
+                row_nf = min(row_nf, shared_bad[0][s]);
+                row_sn = min(row_sn, shared_bad[1][s]);
             }
+            out_row.vocabulary = a.vocabulary;
+            out_row.first_nonfinite_col = row_nf;
+            out_row.first_subnormal_col = row_sn;
         }
-        if (best_id == 0xffffffffu) break;
-        if (tid == rank) {
-            out_row.ids[rank] = best_id;
-            out_row.logits[rank] = best_val;
+        const uint cnt = (lane < 8u) ? sg_cnt[lane] : 0u;
+        uint cur = 0u;
+        uint emitted = 0u;
+        float out_v0 = -INFINITY, out_v1 = -INFINITY;
+        uint out_i0 = 0u, out_i1 = 0u;
+        for (uint rank = 0u; rank < target_k; ++rank) {
+            const bool active = (cur < cnt);
+            const float v = active ? sg_vals[lane][cur] : -INFINITY;
+            const uint id = active ? sg_ids[lane][cur] : 0xffffffffu;
+            float best_val;
+            uint best_id;
+            logit_topk_detail::simd_best_head(v, id, lane, best_val, best_id);
+            if (best_id == 0xffffffffu) break;
+            if (uint(lane) == rank) {
+                out_i0 = best_id;
+                out_v0 = best_val;
+            }
+            if (uint(lane) + 32u == rank) {
+                out_i1 = best_id;
+                out_v1 = best_val;
+            }
+            if (active && id == best_id) ++cur;
+            ++emitted;
         }
-        if (cur_id == best_id) ++cursor;
-        ++emitted;
-    }
-
-    if (tid == 0u) {
-        out_row.count = emitted;
-        for (uint r = emitted; r < TopK; ++r) {
-            out_row.ids[r] = 0u;
-            out_row.logits[r] = -INFINITY;
+        out_row.ids[lane] = (uint(lane) < emitted) ? out_i0 : 0u;
+        out_row.logits[lane] = (uint(lane) < emitted) ? out_v0 : -INFINITY;
+        out_row.ids[uint(lane) + 32u] = (uint(lane) + 32u < emitted) ? out_i1 : 0u;
+        out_row.logits[uint(lane) + 32u] = (uint(lane) + 32u < emitted) ? out_v1 : -INFINITY;
+        if (lane == 0u) {
+            out_row.count = emitted;
         }
     }
 }

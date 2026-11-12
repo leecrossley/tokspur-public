@@ -7,10 +7,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokspur_json::{Json, JsonError, Kind};
 use tokspur_text::chat::RenderedChat;
-use tokspur_text::response::{ResponseKind, ResponseLimits, ResponseParser, ResponseStatus};
+use tokspur_text::response::{
+    ResponseKind, ResponseLimits, ResponseParser, ResponseRecord, ResponseStatus,
+};
 use tokspur_text::response_protocol::{
     RESPONSE_MAXIMUM_ACCUMULATED_IDS, ResponseAdmission, ResponseProtocolError,
-    parse_native_response,
+    parse_native_response_with_controls,
 };
 
 use crate::admission::{
@@ -20,6 +22,7 @@ use crate::admission::{
     worker_execution,
 };
 use crate::http::HttpError;
+use crate::request_timing::PhaseStamps;
 use tokspur_wire::worker::WorkerError;
 
 #[cfg(feature = "verify8")]
@@ -133,6 +136,8 @@ pub struct ServeCodec {
     pub encode: EncodeFn,
     pub decode: DecodeFn,
     pub admission: ResponseAdmission,
+    /// Added-token IDs of the response frame markers (`<think>`, `</think>`, `<tool_call>`, `</tool_call>`). Empty keeps the byte-spelled framing.
+    pub control_ids: Vec<u32>,
 }
 
 impl fmt::Debug for ServeCodec {
@@ -238,6 +243,9 @@ pub struct ServeSession {
     pub overlap_prefill: bool,
     /// Reasoning this session generated, keyed by the assistant message's ordinal in the request history.
     saved_reasoning: Vec<(usize, Vec<u8>)>,
+    /// Off by default; only the opt-in `request_timing` record reads the stamps.
+    phase_stamps_enabled: bool,
+    phase_stamps: PhaseStamps,
 }
 
 impl fmt::Debug for ServeSession {
@@ -295,6 +303,8 @@ impl ServeSession {
             mtp_stage_a_controller: None,
             overlap_prefill: options.overlap_prefill,
             saved_reasoning: Vec::new(),
+            phase_stamps_enabled: false,
+            phase_stamps: PhaseStamps::default(),
         };
         require(!session.alias.is_empty(), "invalid serving codec")?;
         require(
@@ -395,6 +405,25 @@ impl ServeSession {
         }
     }
 
+    /// Turns on the phase stamps that the opt-in `request_timing` record reads. Off, no stamp is taken.
+    pub fn set_phase_stamps(&mut self, enabled: bool) {
+        self.phase_stamps_enabled = enabled;
+        self.phase_stamps = PhaseStamps::default();
+    }
+
+    /// The latest request's phase stamps; all empty unless [`Self::set_phase_stamps`] turned them on.
+    pub fn phase_stamps(&self) -> &PhaseStamps {
+        &self.phase_stamps
+    }
+
+    /// The first output packet's worker command has returned; `batches` counts packets so far.
+    fn stamp_output_packet(&mut self, batches: u64, tokens: usize) {
+        if self.phase_stamps_enabled && batches == 1 {
+            self.phase_stamps.first_packet_done = Some(std::time::Instant::now());
+            self.phase_stamps.first_packet_tokens = tokens as u64;
+        }
+    }
+
     /// Drops reusable state after any failure.
     pub fn invalidate(&mut self) {
         self.saved_reasoning.clear();
@@ -429,6 +458,7 @@ impl ServeSession {
         };
         let mut list = messages.array()?.clone();
         let mut ordinal = 0;
+        let mut filled = false;
         for message in &mut list {
             if field(message, "role")?.string()? != b"assistant" {
                 continue;
@@ -441,8 +471,13 @@ impl ServeSession {
                 entry.retain(|(name, _)| name != b"reasoning_content");
                 entry.push((b"reasoning_content".to_vec(), Json::String(text.clone())));
                 *message = Json::Object(entry);
+                filled = true;
             }
             ordinal += 1;
+        }
+        // Nothing restored renders the same prompt again, so skip the second render and encode.
+        if !filled {
+            return Ok(None);
         }
         *messages = Json::Array(list);
         Ok(Some(Json::Object(fields)))
@@ -457,6 +492,12 @@ impl ServeSession {
         sink: &mut ServeSink<'_>,
     ) -> Result<Json> {
         let request_start = std::time::Instant::now();
+        if self.phase_stamps_enabled {
+            self.phase_stamps = PhaseStamps {
+                request_start: Some(request_start),
+                ..PhaseStamps::default()
+            };
+        }
         let request =
             admit_chat_with_policies(input, &self.alias, self.tool_enums, self.tool_args)?;
         crate::admission::validate_calibrated_sampling(&request.sampling, &self.mtp_ready)?;
@@ -527,6 +568,11 @@ impl ServeSession {
         )
         .map_err(|error| ServeError::Text(Box::new(error)))?
         .with_token_framing();
+        let parser = if self.codec.control_ids.is_empty() {
+            parser
+        } else {
+            parser.with_control_tokens()
+        };
         let mut completion = Completion {
             request_start,
             maximum_tokens,
@@ -540,6 +586,7 @@ impl ServeSession {
             common,
             cached_prefix,
             parser,
+            cursor: StreamCursor::default(),
             streamed_content: Vec::new(),
             streamed_thinking: Vec::new(),
             generated: Vec::with_capacity(maximum_tokens as usize),
@@ -548,6 +595,11 @@ impl ServeSession {
             counters: Counters::default(),
         };
         let result = completion.run(self, target, sink);
+        if self.phase_stamps_enabled {
+            self.phase_stamps.output_packets = completion.counters.output_batches;
+            self.phase_stamps.max_packet_tokens = completion.counters.output_width as u64;
+            self.phase_stamps.completion_tokens = completion.generated.len() as u64;
+        }
         if result.is_err() && completion.state_touched {
             self.invalidate();
         }
@@ -575,6 +627,48 @@ struct Counters {
     checkpoint_cold_resyncs: u64,
 }
 
+/// How far the parser's text and thinking records have been streamed.
+///
+/// While a response is incomplete the parser only appends: a new record goes on the end and only the last record's text grows (tool records stay withheld until `finish`). The unsent bytes are therefore the tail of the record at `record` plus every record after it, so a token costs its own bytes, not the whole response so far.
+#[derive(Default)]
+struct StreamCursor {
+    record: usize,
+    offset: usize,
+}
+
+/// The bytes one `StreamCursor::advance` found unsent.
+#[derive(Default)]
+struct StreamDelta {
+    thinking: Vec<u8>,
+    content: Vec<u8>,
+}
+
+impl StreamCursor {
+    fn advance(&mut self, records: &[ResponseRecord]) -> Result<StreamDelta> {
+        const NONMONOTONIC: &str = "nonmonotonic response parser";
+        let mut delta = StreamDelta::default();
+        let Some(last) = records.last() else {
+            require(self.record == 0 && self.offset == 0, NONMONOTONIC)?;
+            return Ok(delta);
+        };
+        require(self.record < records.len(), NONMONOTONIC)?;
+        let mut offset = self.offset;
+        for record in &records[self.record..] {
+            require(offset <= record.text.len(), NONMONOTONIC)?;
+            let unsent = &record.text[offset..];
+            match record.kind {
+                ResponseKind::Text => delta.content.extend_from_slice(unsent),
+                ResponseKind::Thinking => delta.thinking.extend_from_slice(unsent),
+                ResponseKind::Tool => {}
+            }
+            offset = 0;
+        }
+        self.record = records.len() - 1;
+        self.offset = last.text.len();
+        Ok(delta)
+    }
+}
+
 /// The per-request state the C++ lambdas capture by reference.
 struct Completion<'r> {
     request_start: std::time::Instant,
@@ -589,6 +683,7 @@ struct Completion<'r> {
     common: usize,
     cached_prefix: usize,
     parser: ResponseParser,
+    cursor: StreamCursor,
     streamed_content: Vec<u8>,
     streamed_thinking: Vec<u8>,
     generated: Vec<u32>,
@@ -635,36 +730,19 @@ impl Completion<'_> {
     }
 
     fn flush(&mut self, session: &ServeSession, sink: &mut ServeSink<'_>) -> Result<()> {
-        let mut content = Vec::new();
-        let mut thinking = Vec::new();
-        for record in self.parser.records() {
-            match record.kind {
-                ResponseKind::Text => content.extend_from_slice(&record.text),
-                ResponseKind::Thinking => thinking.extend_from_slice(&record.text),
-                ResponseKind::Tool => {}
-            }
-        }
-        require(
-            content.starts_with(&self.streamed_content)
-                && thinking.starts_with(&self.streamed_thinking),
-            "nonmonotonic response parser",
-        )?;
-        if thinking.len() != self.streamed_thinking.len() {
-            let delta = Json::new_object([(
-                "reasoning_content",
-                Json::from(&thinking[self.streamed_thinking.len()..]),
-            )]);
+        // The finished response is still checked against everything streamed, in `run`.
+        let unsent = self.cursor.advance(self.parser.records())?;
+        if !unsent.thinking.is_empty() {
+            let delta =
+                Json::new_object([("reasoning_content", Json::from(unsent.thinking.as_slice()))]);
             self.emit(session, sink, delta, Json::Null)?;
         }
-        if content.len() != self.streamed_content.len() {
-            let delta = Json::new_object([(
-                "content",
-                Json::from(&content[self.streamed_content.len()..]),
-            )]);
+        if !unsent.content.is_empty() {
+            let delta = Json::new_object([("content", Json::from(unsent.content.as_slice()))]);
             self.emit(session, sink, delta, Json::Null)?;
         }
-        self.streamed_content = content;
-        self.streamed_thinking = thinking;
+        self.streamed_thinking.extend_from_slice(&unsent.thinking);
+        self.streamed_content.extend_from_slice(&unsent.content);
         Ok(())
     }
 
@@ -918,6 +996,7 @@ impl Completion<'_> {
             self.counters.output_batches += 1;
             let generated = field(&done, "generated_ids")?.array()?;
             self.counters.output_width = self.counters.output_width.max(generated.len());
+            session.stamp_output_packet(self.counters.output_batches, generated.len());
             self.counters.generation_rounds += field(&done, "lookup_rounds")?.unsigned_integer()?;
             self.counters.verified_rounds +=
                 field(&done, "lookup_verified_rounds")?.unsigned_integer()?;
@@ -972,6 +1051,7 @@ impl Completion<'_> {
             let outputs = field(&done, "generated_ids")?.array()?;
             self.counters.output_batches += 1;
             self.counters.output_width = self.counters.output_width.max(outputs.len());
+            session.stamp_output_packet(self.counters.output_batches, outputs.len());
             let done_rounds = field(&done, "native_mtp_rounds")?.unsigned_integer()?;
             let prev_rounds =
                 field(&session.mtp_previous, "native_mtp_rounds")?.unsigned_integer()?;
@@ -1102,7 +1182,12 @@ impl Completion<'_> {
             return Ok(());
         }
         let bytes = (session.codec.decode)(&[id])?;
-        if self.parser.feed(&bytes) == ResponseStatus::Error {
+        let status = if session.codec.control_ids.contains(&id) {
+            self.parser.feed_control(&bytes)
+        } else {
+            self.parser.feed(&bytes)
+        };
+        if status == ResponseStatus::Error {
             return Err(self.response_failure(
                 sink,
                 "feed",
@@ -1111,7 +1196,10 @@ impl Completion<'_> {
                 AdmissionError::Refused("response bytes/frame validation failed").into(),
             ));
         }
-        self.flush(session, sink)
+        if self.request.stream {
+            self.flush(session, sink)?;
+        }
+        Ok(())
     }
 
     /// The C++ `try` block of `complete`.
@@ -1177,6 +1265,9 @@ impl Completion<'_> {
         )?;
         self.state_touched = true;
         let prefill_start = std::time::Instant::now();
+        if session.phase_stamps_enabled {
+            session.phase_stamps.prefill_start = Some(prefill_start);
+        }
         self.position = if self.append {
             session.committed.len()
         } else {
@@ -1353,6 +1444,9 @@ impl Completion<'_> {
             ])
         };
         let generation_start = std::time::Instant::now();
+        if session.phase_stamps_enabled {
+            session.phase_stamps.generation_start = Some(generation_start);
+        }
         let mut stopped = false;
         if session.mtp {
             session.mtp_committed = 0;
@@ -1527,6 +1621,11 @@ impl Completion<'_> {
                 }
             }
         }
+        // Nonstreaming still validates each token above. Assemble its parser
+        // records once for the same final prefix check used by streaming.
+        if !request.stream {
+            self.flush(session, sink)?;
+        }
         let ids = Json::Array(
             self.generated
                 .iter()
@@ -1557,11 +1656,12 @@ impl Completion<'_> {
         }
         let final_request = Json::Object(final_fields);
         let decode = |ids: &[u32]| (session.codec.decode)(ids);
-        let finished = parse_native_response(
+        let finished = parse_native_response_with_controls(
             &final_request,
             admission,
             Some(&decode),
             RESPONSE_MAXIMUM_ACCUMULATED_IDS,
+            &session.codec.control_ids,
         )
         .map_err(|error| {
             if sink.prefix_trace.is_some() && stopped {
@@ -1684,6 +1784,9 @@ impl Completion<'_> {
             session.saved_reasoning.push((ordinal, thinking.clone()));
         }
         let generation_end = std::time::Instant::now();
+        if session.phase_stamps_enabled {
+            session.phase_stamps.generation_end = Some(generation_end);
+        }
         let admission_ns = prefill_start
             .saturating_duration_since(self.request_start)
             .as_nanos() as u64;
@@ -1975,6 +2078,7 @@ mod tests {
 
     fn codec() -> ServeCodec {
         ServeCodec {
+            control_ids: Vec::new(),
             render: Box::new(|_| Err(AdmissionError::Refused("unused").into())),
             encode: Box::new(|_| Ok(Vec::new())),
             decode: Box::new(|_| Ok(Vec::new())),
@@ -2002,6 +2106,62 @@ mod tests {
             "ServeSession { committed_tokens: 3, reusable: false, .. }"
         );
         assert!(!rendered.contains("151644") && !rendered.contains("872"));
+    }
+
+    /// What `flush` did before the cursor: rebuild both streams from every record.
+    fn rebuilt(records: &[ResponseRecord]) -> (Vec<u8>, Vec<u8>) {
+        let mut thinking = Vec::new();
+        let mut content = Vec::new();
+        for record in records {
+            match record.kind {
+                ResponseKind::Text => content.extend_from_slice(&record.text),
+                ResponseKind::Thinking => thinking.extend_from_slice(&record.text),
+                ResponseKind::Tool => {}
+            }
+        }
+        (thinking, content)
+    }
+
+    #[test]
+    fn stream_cursor_emits_the_same_deltas_as_a_full_rebuild() {
+        // Arrange: thinking, text either side of a withheld tool call, multi-byte UTF-8 and a held `<` marker prefix.
+        let response =
+            "plan 日本 <b\n</think>answer 🙂 a<b <tool_call><function=ping></function></tool_call>";
+        let tools = vec![tokspur_text::response::ToolSpec::new("ping", Vec::new())];
+        let mut parser = ResponseParser::new(tools, true, ResponseLimits::default()).unwrap();
+        let mut cursor = StreamCursor::default();
+        let (mut thinking, mut content) = (Vec::new(), Vec::new());
+
+        // Act: one byte per feed, the smallest step the cursor can see.
+        for byte in response.bytes() {
+            assert_eq!(parser.feed(&[byte]), ResponseStatus::Incomplete);
+            let before = (thinking.len(), content.len());
+            let delta = cursor.advance(parser.records()).unwrap();
+            thinking.extend_from_slice(&delta.thinking);
+            content.extend_from_slice(&delta.content);
+
+            // Assert: every step matches the rebuild, byte for byte.
+            let (all_thinking, all_content) = rebuilt(parser.records());
+            assert_eq!(delta.thinking, all_thinking[before.0..]);
+            assert_eq!(delta.content, all_content[before.1..]);
+        }
+        assert!(!thinking.is_empty() && !content.is_empty());
+        assert_eq!(parser.records().len(), 2);
+    }
+
+    #[test]
+    fn stream_cursor_refuses_records_that_shrink() {
+        // Arrange
+        let mut parser = ResponseParser::new(Vec::new(), false, ResponseLimits::default()).unwrap();
+        parser.feed(b"hello world");
+        let mut cursor = StreamCursor::default();
+        cursor.advance(parser.records()).unwrap();
+        let mut shorter = parser.records().to_vec();
+        shorter[0].text.truncate(5);
+
+        // Act + Assert
+        assert!(cursor.advance(&shorter).is_err());
+        assert!(cursor.advance(&[]).is_err());
     }
 
     #[test]

@@ -30,6 +30,7 @@ use crate::admission::{
 };
 use crate::http::{Connection, HttpError, Limits, Listener};
 use crate::native_text::{NativeText, TextError};
+use crate::request_timing::{DeltaKinds, Outcome, RequestTiming, delta_kinds, emits_record};
 use crate::session::{ServeCodec, ServeError, ServeSession, ServeSink, SessionOptions};
 
 const TOKENIZER_PIN: &str = tokspur_text::assets::TOKENIZER_SHA256;
@@ -1568,9 +1569,29 @@ fn print_line(value: &Json) -> Result<()> {
     Ok(())
 }
 
+/// Only report a pack format confirmed by the native worker after it opens the weights.
+fn pack_startup_message(ready: &Json, requested_pack: bool) -> &'static [u8] {
+    const UNAVAILABLE: &[u8] = b"tokspur: weight pack identity unavailable\n";
+    let schema = ready.find("derived_pack_schema");
+    let recipe = ready.find("derived_pack_recipe");
+    match (requested_pack, schema, recipe) {
+        (false, Ok(None), Ok(None)) => b"tokspur: loaded raw GGUF weights\n",
+        (true, Ok(Some(schema)), Ok(Some(recipe))) => {
+            match (schema.unsigned_integer(), recipe.string()) {
+                (Ok(2), Ok(b"tokspur-pack-v2")) => b"tokspur: loaded Pack v2 (tokspur-pack-v2)\n",
+                (Ok(3), Ok(b"tokspur-pack-v3")) => b"tokspur: loaded Pack v3 (tokspur-pack-v3)\n",
+                _ => UNAVAILABLE,
+            }
+        }
+        _ => UNAVAILABLE,
+    }
+}
+
 struct Job {
     connection: Connection,
     request: Json,
+    /// The accept instant; only the opt-in `request_timing` record reads it.
+    arrival: Instant,
     deadline: Instant,
 }
 
@@ -1578,6 +1599,7 @@ struct Job {
 struct Serving<'a> {
     listener: &'a Listener,
     ready_value: &'a Json,
+    telemetry_stdout: bool,
     worker_pid: Option<u32>,
     guardian_pid: Option<u32>,
     alias: &'a str,
@@ -1700,6 +1722,12 @@ pub fn server_cli(args: &[OsString]) -> Result<()> {
         end_of_text: marker(b"<|endoftext|>")?,
         im_start: marker(b"<|im_start|>")?,
     };
+    // Frame markers count only when they arrive as the tokenizer's own added tokens. A tokenizer that lacks any of them keeps the byte-spelled framing.
+    let control_ids = tokspur_text::response::CONTROL_MARKERS
+        .iter()
+        .map(|marker| tokenizer.added_token(marker))
+        .collect::<Option<Vec<u32>>>()
+        .unwrap_or_default();
     // The constructor arms its independent guardian before exec/model loading.
     require(
         !tokspur_sys::stop_requested(),
@@ -1718,6 +1746,7 @@ pub fn server_cli(args: &[OsString]) -> Result<()> {
     let fast_channel = config.worker.fast_channel;
     let has_mtp_sidecar = tokspur_wire::worker::has_speculative(&config.worker);
     let overlap_prefill = config.worker.overlap_prefill;
+    let requested_pack = config.worker.derived_pack.is_some();
     let mut worker = OwnedWorker::new(std::mem::take(&mut config.worker))?;
     let worker_pid = worker.worker_pid();
     let guardian_pid = worker.guardian_pid();
@@ -1731,6 +1760,13 @@ pub fn server_cli(args: &[OsString]) -> Result<()> {
         checkpoint_budget,
     )?;
     let ready_value = worker.ready().clone();
+    // The readiness protocol on stdout is also consumed by supervisors.
+    if std::io::stderr()
+        .write_all(pack_startup_message(&ready_value, requested_pack))
+        .is_err()
+    {
+        // An unavailable diagnostic stream does not prevent serving.
+    }
     let tokenizer = Arc::new(tokenizer);
     let renderer = Arc::new(renderer);
     let (encoder, decoder) = (Arc::clone(&tokenizer), Arc::clone(&tokenizer));
@@ -1751,6 +1787,7 @@ pub fn server_cli(args: &[OsString]) -> Result<()> {
                 .map_err(|error| ServeError::Text(Box::new(error)))
         }),
         admission,
+        control_ids,
     };
     let mut session = ServeSession::new(
         codec,
@@ -1791,6 +1828,7 @@ pub fn server_cli(args: &[OsString]) -> Result<()> {
     let serving = Serving {
         listener: &listener,
         ready_value: &ready_value,
+        telemetry_stdout,
         worker_pid: if telemetry_stdout { worker_pid } else { None },
         guardian_pid: if telemetry_stdout { guardian_pid } else { None },
         alias: &config.alias,
@@ -1969,6 +2007,19 @@ fn run_job(
     let target_started = Cell::new(false);
     let connection = RefCell::new(job.connection);
     let deadline = job.deadline;
+    session.set_phase_stamps(telemetry_stdout);
+    let timing = telemetry_stdout.then(|| {
+        RefCell::new(RequestTiming::new(
+            job.arrival,
+            Instant::now(),
+            job.request
+                .find("stream")
+                .ok()
+                .flatten()
+                .is_some_and(|stream| matches!(stream, Json::Bool(true))),
+        ))
+    });
+    let timed_id = RefCell::new(None::<String>);
     let cancelled = || {
         shutdown.load(Ordering::SeqCst)
             || tokspur_sys::stop_requested()
@@ -1980,6 +2031,9 @@ fn run_job(
             return Err(JobError::Refused("queued request cancelled or expired"));
         }
         let response_id = format!("chatcmpl-{}", random_hex(16)?);
+        if timing.is_some() {
+            *timed_id.borrow_mut() = Some(response_id.clone());
+        }
         let mut target =
             |request: &Json,
              on_token: &mut dyn FnMut(&Json) -> std::result::Result<(), ServeError>| {
@@ -1992,6 +2046,7 @@ fn run_job(
             };
         let mut chunk = |event: &Json| -> std::result::Result<(), ServeError> {
             let mut connection = connection.borrow_mut();
+            let write_start = timing.as_ref().map(|_| Instant::now());
             if !streaming.get() {
                 connection.begin_sse(deadline.min(Instant::now() + Duration::from_secs(5)))?;
                 streaming.set(true);
@@ -2000,6 +2055,11 @@ fn run_job(
                 &event.dump_limited(1024 * 1024)?,
                 deadline.min(Instant::now() + Duration::from_secs(5)),
             )?;
+            if let (Some(timing), Some(start)) = (timing.as_ref(), write_start) {
+                timing
+                    .borrow_mut()
+                    .sse_write(start, Instant::now(), delta_kinds(event));
+            }
             Ok(())
         };
         let mut trace_sink = |record: &Json| -> std::result::Result<(), ServeError> {
@@ -2023,21 +2083,44 @@ fn run_job(
         let result =
             session.complete(&job.request, response_id.as_bytes(), &mut target, &mut sink)?;
         let mut connection = connection.borrow_mut();
+        let write_start = timing.as_ref().map(|_| Instant::now());
         if streaming.get() {
             connection.send_sse_data(
                 b"[DONE]",
                 deadline.min(Instant::now() + Duration::from_secs(5)),
             )?;
             connection.finish_sse(deadline.min(Instant::now() + Duration::from_secs(5)))?;
+            if let (Some(timing), Some(start)) = (timing.as_ref(), write_start) {
+                timing
+                    .borrow_mut()
+                    .sse_write(start, Instant::now(), DeltaKinds::default());
+            }
         } else {
             connection.send_json(
                 200,
                 &result.dump_limited(8 * 1024 * 1024)?,
                 deadline.min(Instant::now() + Duration::from_secs(5)),
             )?;
+            if let (Some(timing), Some(start)) = (timing.as_ref(), write_start) {
+                timing.borrow_mut().json_write(start, Instant::now());
+            }
         }
         Ok(())
     })();
+    let print_timing = |session: &ServeSession, outcome: Outcome| {
+        if let Some(timing) = timing.as_ref()
+            && emits_record(telemetry_stdout, outcome)
+        {
+            let id = timed_id.borrow();
+            let record = timing.borrow().record(
+                id.as_deref().map(str::as_bytes),
+                outcome,
+                session.phase_stamps(),
+                Instant::now(),
+            );
+            drop(print_line(&record));
+        }
+    };
     if outcome.is_ok() {
         let last_resp = worker.last_response();
         if match last_resp.find("event") {
@@ -2048,15 +2131,30 @@ fn run_job(
                 drop(state_guard.write_telemetry_trace(last_resp));
             }
             if telemetry_stdout {
-                drop(print_line(last_resp));
+                drop(print_line(&telemetry_record(last_resp)));
             }
         }
     }
     let Err(error) = outcome else {
+        print_timing(session, Outcome::Ok);
         return;
     };
+    // Classified before the abort drain, in the order the status below is chosen, and only when the record is on.
+    let failure = timing.as_ref().map(|_| {
+        Outcome::of_failure(
+            Instant::now() >= deadline,
+            connection.borrow_mut().disconnected()
+                || shutdown.load(Ordering::SeqCst)
+                || tokspur_sys::stop_requested(),
+            target_started.get(),
+        )
+    });
     if target_started.get() {
-        drop(worker.abort_mtp_generation(Instant::now() + worker.options().drain_timeout));
+        let drain_start = Instant::now();
+        drop(worker.abort_mtp_generation(drain_start + worker.options().drain_timeout));
+        if let Some(timing) = timing.as_ref() {
+            timing.borrow_mut().abort_drain(drain_start, Instant::now());
+        }
         session.invalidate();
     }
     available.store(worker.alive(), Ordering::SeqCst);
@@ -2092,6 +2190,10 @@ fn run_job(
         if sent.is_err() {
             // Broken clients cannot waive worker draining/cleanup.
         }
+    }
+    drop(connection);
+    if let Some(failure) = failure {
+        print_timing(session, failure);
     }
 }
 
@@ -2172,6 +2274,9 @@ impl Serving<'_> {
         }
         if let Some(pid) = self.guardian_pid {
             ready.push((b"guardian_pid".to_vec(), Json::integer(u64::from(pid))));
+        }
+        if self.telemetry_stdout {
+            ready.push((b"native_ready".to_vec(), self.ready_value.clone()));
         }
         let copy = |ready: &mut Vec<(Vec<u8>, Json)>, names: &[&str]| -> Result<()> {
             for name in names {
@@ -2448,6 +2553,7 @@ impl Serving<'_> {
         *slot = Some(Job {
             connection,
             request: input,
+            arrival,
             deadline: arrival + Duration::from_secs(u64::from(self.request_seconds)),
         });
         self.condition.notify_one();
@@ -2927,6 +3033,60 @@ mod tests {
     }
 
     #[test]
+    fn pack_startup_message_uses_loaded_identity_for_custom_pack_paths() {
+        let mut args = vec![
+            "tokspur-server".into(),
+            "--allow-full-model".into(),
+            "true".into(),
+            "--tokenizer".into(),
+            "/tmp/tokenizer".into(),
+            "--template".into(),
+            "/tmp/template".into(),
+            "--state-dir".into(),
+            "/tmp/state".into(),
+        ];
+        let raw_requested_pack = options(&args).unwrap().worker.derived_pack.is_some();
+        args.extend([
+            OsString::from("--derived-pack"),
+            OsString::from("/private/secret/renamed-v3.gguf"),
+        ]);
+        let custom_requested_pack = options(&args).unwrap().worker.derived_pack.is_some();
+        let ready = |data: &[u8]| tokspur_json::parse_json(data).unwrap();
+        let v2 = ready(
+            br#"{"event":"ready","derived_pack_schema":2,"derived_pack_recipe":"tokspur-pack-v2"}"#,
+        );
+        let v3 = ready(
+            br#"{"event":"ready","derived_pack_schema":3,"derived_pack_recipe":"tokspur-pack-v3"}"#,
+        );
+        let raw = ready(br#"{"event":"ready"}"#);
+        assert_eq!(
+            pack_startup_message(&v2, custom_requested_pack),
+            b"tokspur: loaded Pack v2 (tokspur-pack-v2)\n"
+        );
+        assert_eq!(
+            pack_startup_message(&v3, custom_requested_pack),
+            b"tokspur: loaded Pack v3 (tokspur-pack-v3)\n"
+        );
+        assert_eq!(
+            pack_startup_message(&raw, raw_requested_pack),
+            b"tokspur: loaded raw GGUF weights\n"
+        );
+        let unavailable = b"tokspur: weight pack identity unavailable\n";
+        assert_eq!(pack_startup_message(&raw, true), unavailable);
+        assert_eq!(pack_startup_message(&v3, false), unavailable);
+        for contradictory in [
+            r#"{"derived_pack_schema":3}"#,
+            r#"{"derived_pack_schema":2,"derived_pack_recipe":"tokspur-pack-v3"}"#,
+            r#"{"derived_pack_schema":2,"derived_pack_recipe":"secret\ntext"}"#,
+        ] {
+            assert_eq!(
+                pack_startup_message(&ready(contradictory.as_bytes()), true),
+                unavailable
+            );
+        }
+    }
+
+    #[test]
     fn ready_line_emits_tool_enum_validation_and_policy_in_cpp_order() {
         let listener = Listener::new(0, 1).unwrap();
         let ready_value = Json::Null;
@@ -2948,6 +3108,7 @@ mod tests {
             let serving = Serving {
                 listener: &listener,
                 ready_value: &ready_value,
+                telemetry_stdout: false,
                 worker_pid: None,
                 guardian_pid: None,
                 alias: "tokspur",
@@ -3001,6 +3162,68 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn ready_line_preserves_complete_native_ready_only_with_telemetry() {
+        let listener = Listener::new(0, 1).unwrap();
+        let available = AtomicBool::new(true);
+        let pending = Mutex::new(None);
+        let condition = Condvar::new();
+        for mapping in [
+            "",
+            ",\"native_pack_shared_mapping\":true",
+            ",\"native_pack_shared_mapping\":null",
+        ] {
+            let fixture = format!(
+                r#"{{"event":"ready","derived_pack_schema":3,"derived_pack_recipe":"tokspur-pack-v3","imported_regions":17,"generated_marker":"native-ready-only","future":{{"values":[null,false,1.2300e+02,18446744073709551615],"text":"generated\\ntext"}}{mapping}}}"#
+            );
+            let native_ready = tokspur_json::parse_json(fixture.as_bytes()).unwrap();
+            let mut serving = Serving {
+                listener: &listener,
+                ready_value: &native_ready,
+                telemetry_stdout: false,
+                worker_pid: None,
+                guardian_pid: None,
+                alias: "tokspur",
+                stack_execution: "direct",
+                tool_enums: ToolEnumValidation::Strict,
+                tool_args: ToolArgValidation::Strict,
+                mtp_first_output_packet: None,
+                checkpoint_slots: 0,
+                checkpoint_budget: 0,
+                #[cfg(feature = "verify8")]
+                verify8: false,
+                #[cfg(feature = "branch8")]
+                branch8: false,
+                #[cfg(feature = "qsa-stage-v8")]
+                stage8_present: false,
+                #[cfg(feature = "fast-math")]
+                fast_channel: None,
+                authorization: "Bearer test",
+                request_seconds: 600,
+                available: &available,
+                pending: &pending,
+                condition: &condition,
+            };
+            let without_telemetry = serving.ready_line().unwrap();
+            assert!(without_telemetry.find("native_ready").unwrap().is_none());
+            assert!(
+                !String::from_utf8(without_telemetry.dump().unwrap())
+                    .unwrap()
+                    .contains("native-ready-only")
+            );
+
+            // Telemetry is controlled by its explicit flag, even without PID metadata.
+            serving.telemetry_stdout = true;
+            let with_telemetry = serving.ready_line().unwrap();
+            let nested = with_telemetry.find("native_ready").unwrap().unwrap();
+            assert_eq!(nested, &native_ready);
+            assert_eq!(nested.dump().unwrap(), fixture.as_bytes());
+            let mut remaining = with_telemetry.object().unwrap().to_vec();
+            remaining.retain(|(key, _)| key != b"native_ready");
+            assert_eq!(Json::Object(remaining), without_telemetry);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3026,13 +3249,17 @@ mod readiness_network_tests {
             assert!(tokspur_sys::install_stop_handlers());
             let _owner_lifetime = monitor_owner_stdin().unwrap();
             let listener = Listener::new(0, 8).unwrap();
-            let ready = Json::Object(Vec::new());
+            let ready = tokspur_json::parse_json(
+                br#"{"event":"ready","generated_marker":"native-ready-only","imported_regions":17}"#,
+            )
+            .unwrap();
             let available = AtomicBool::new(true);
             let pending = Mutex::new(None);
             let condition = Condvar::new();
             let serving = Serving {
                 listener: &listener,
                 ready_value: &ready,
+                telemetry_stdout: true,
                 worker_pid: None,
                 guardian_pid: None,
                 alias: "tokspur",
@@ -3102,6 +3329,9 @@ mod readiness_network_tests {
             let mut response = String::new();
             client.read_to_string(&mut response).unwrap();
             assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(!response.contains("native_ready"), "{response}");
+            assert!(!response.contains("native-ready-only"), "{response}");
+            assert!(!response.contains("imported_regions"), "{response}");
         }
         let started = Instant::now();
         drop(child.0.stdin.take());

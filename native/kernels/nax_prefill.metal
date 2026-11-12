@@ -5947,19 +5947,31 @@ static inline void stage_a_4slices(device const float* input, ulong in_stride, u
     }
 }
 
-static inline void stage_a_m8_t64(device const float* input, ulong in_stride, uint tokens, uint k_col0,
-    ushort tid, threadgroup bfloat* a_plane, thread uint& bad) {
+static inline float4 load_a_m8_t64(device const float* input, ulong in_stride, uint tokens, uint k_col0, ushort tid) {
+    const uint m = uint(tid) >> 3u;
+    const uint k4 = (uint(tid) & 7u) * 4u;
+    if (m < tokens) {
+        return float4(*reinterpret_cast<device const packed_float4*>(input + ulong(m) * in_stride + ulong(k_col0 + k4)));
+    }
+    return float4(0.0f);
+}
+
+static inline void store_a_m8_t64(float4 v, uint tokens, ushort tid, threadgroup bfloat* a_plane, thread uint& bad) {
     constexpr uint StageStride = 36u;
     const uint m = uint(tid) >> 3u;
     const uint k4 = (uint(tid) & 7u) * 4u;
     threadgroup bfloat4* dst = reinterpret_cast<threadgroup bfloat4*>(a_plane + m * StageStride + k4);
     if (m < tokens) {
-        const float4 v = float4(*reinterpret_cast<device const packed_float4*>(input + ulong(m) * in_stride + ulong(k_col0 + k4)));
         *dst = bfloat4(nax_detail::clean_bf16(v.x, bad), nax_detail::clean_bf16(v.y, bad),
                        nax_detail::clean_bf16(v.z, bad), nax_detail::clean_bf16(v.w, bad));
     } else {
         *dst = bfloat4(0);
     }
+}
+
+static inline void stage_a_m8_t64(device const float* input, ulong in_stride, uint tokens, uint k_col0,
+    ushort tid, threadgroup bfloat* a_plane, thread uint& bad) {
+    store_a_m8_t64(load_a_m8_t64(input, in_stride, tokens, k_col0, tid), tokens, tid, a_plane, bad);
 }
 
 static inline void load_q8_pair_m8(device const uchar* weights, uint rows, uint blocks, uint row_bytes,
@@ -6742,30 +6754,63 @@ kernel void nax_m8_dense_q8_t64(device const uchar* plane0 [[buffer(0)]], device
 
     const uint sg_col_in_tile = uint(sg) * 32u + uint(lane);
     if (step_begin < step_end) {
+#if TOKSPUR_PRIVATE_DENSE_M8_SINGLE_TILE
         nax_detail::Q8Tile64Ipt1 w_next{};
         if (sg_live) {
             w_next = nax_detail::load_q8_t64_ipt1(plane0, meta, G, group.x, step_begin, sg_col_in_tile);
         }
         for (uint s_rel = 0u; s_rel < steps_per_split; ++s_rel) {
             const uint step = step_begin + s_rel;
-            const uint cur_plane = TOKSPUR_PRIVATE_DENSE_M8_SINGLE_TILE ? 0u : (s_rel & 1u);
-            nax_m8_split_detail::stage_a_m8_t64(input, in_stride, a.tokens, step * 32u, tid, a_stage + cur_plane * APlane, bad);
+            nax_m8_split_detail::stage_a_m8_t64(input, in_stride, a.tokens, step * 32u, tid, a_stage, bad);
             if (sg_live) {
-                nax_detail::store_q8_t64_ipt1(w_next, b_stage[cur_plane] + uint(sg) * BPlane + uint(lane) * StageStride, bad);
+                nax_detail::store_q8_t64_ipt1(w_next, b_stage[0] + uint(sg) * BPlane + uint(lane) * StageStride, bad);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (s_rel + 1u < steps_per_split && sg_live) {
                 w_next = nax_detail::load_q8_t64_ipt1(plane0, meta, G, group.x, step + 1u, sg_col_in_tile);
             }
             if (sg_live) {
+                operation.run(a_s0, b_s0, acc);
+            }
+            // Both SGs finish consuming the shared A tile before any thread reuses the staging storage.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+#else
+        float4 a_next = nax_m8_split_detail::load_a_m8_t64(input, in_stride, a.tokens, step_begin * 32u, tid);
+        nax_detail::Q8Tile64Ipt1 w_next{};
+        if (sg_live) {
+            w_next = nax_detail::load_q8_t64_ipt1(plane0, meta, G, group.x, step_begin, sg_col_in_tile);
+        }
+        nax_m8_split_detail::store_a_m8_t64(a_next, a.tokens, tid, a_stage, bad);
+        if (sg_live) {
+            nax_detail::store_q8_t64_ipt1(w_next, b_stage[0] + uint(sg) * BPlane + uint(lane) * StageStride, bad);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint s_rel = 0u; s_rel < steps_per_split; ++s_rel) {
+            const uint step = step_begin + s_rel;
+            const uint cur_plane = s_rel & 1u;
+            const bool has_next = (s_rel + 1u) < steps_per_split;
+            if (has_next) {
+                a_next = nax_m8_split_detail::load_a_m8_t64(input, in_stride, a.tokens, (step + 1u) * 32u, tid);
+                if (sg_live) {
+                    w_next = nax_detail::load_q8_t64_ipt1(plane0, meta, G, group.x, step + 1u, sg_col_in_tile);
+                }
+            }
+            if (sg_live) {
                 if (cur_plane == 0u) operation.run(a_s0, b_s0, acc);
                 else operation.run(a_s1, b_s1, acc);
             }
-#if TOKSPUR_PRIVATE_DENSE_M8_SINGLE_TILE
-            // Both SGs finish consuming the shared A tile before any thread reuses the staging storage.
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-#endif
+            if (has_next) {
+                const uint next_plane = cur_plane ^ 1u;
+                nax_m8_split_detail::store_a_m8_t64(a_next, a.tokens, tid, a_stage + next_plane * APlane, bad);
+                if (sg_live) {
+                    nax_detail::store_q8_t64_ipt1(w_next, b_stage[next_plane] + uint(sg) * BPlane + uint(lane) * StageStride, bad);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
+#endif
     }
 
     const uint mode = a.maximum_tasks;
@@ -6890,18 +6935,28 @@ kernel void nax_m8_dense_q8_swiglu_t64(device const uchar* gate_plane0 [[buffer(
     uint bad = 0u;
 
     if (step_begin < step_end) {
+        float4 a_next = nax_m8_split_detail::load_a_m8_t64(input, in_stride, a.tokens, step_begin * 32u, tid);
         nax_detail::Q8Tile64Ipt1 w_next = nax_detail::load_q8_t64_ipt1(sg_p0, sg_meta, G, t64_tile, step_begin, src_col_in_tile);
+        nax_m8_split_detail::store_a_m8_t64(a_next, a.tokens, tid, a_stage, bad);
+        nax_detail::store_q8_t64_ipt1(w_next, b_stage[0] + uint(sg) * BPlane + uint(lane) * StageStride, bad);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         for (uint s_rel = 0u; s_rel < steps_per_split; ++s_rel) {
             const uint step = step_begin + s_rel;
             const uint cur_plane = s_rel & 1u;
-            nax_m8_split_detail::stage_a_m8_t64(input, in_stride, a.tokens, step * 32u, tid, a_stage + cur_plane * APlane, bad);
-            nax_detail::store_q8_t64_ipt1(w_next, b_stage[cur_plane] + uint(sg) * BPlane + uint(lane) * StageStride, bad);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (s_rel + 1u < steps_per_split) {
+            const bool has_next = (s_rel + 1u) < steps_per_split;
+            if (has_next) {
+                a_next = nax_m8_split_detail::load_a_m8_t64(input, in_stride, a.tokens, (step + 1u) * 32u, tid);
                 w_next = nax_detail::load_q8_t64_ipt1(sg_p0, sg_meta, G, t64_tile, step + 1u, src_col_in_tile);
             }
             if (cur_plane == 0u) operation.run(a_s0, b_s0, acc);
             else operation.run(a_s1, b_s1, acc);
+            if (has_next) {
+                const uint next_plane = cur_plane ^ 1u;
+                nax_m8_split_detail::store_a_m8_t64(a_next, a.tokens, tid, a_stage + next_plane * APlane, bad);
+                nax_detail::store_q8_t64_ipt1(w_next, b_stage[next_plane] + uint(sg) * BPlane + uint(lane) * StageStride, bad);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
     }
 

@@ -436,8 +436,6 @@ kernel void planar_moe_build_union_m8(device const uint* indices [[buffer(0)]],
         return;
     }
 
-    threadgroup uint tg_exp[128];
-    threadgroup uint tg_cnt[128];
     device uint* u_experts = meta + 8u;
     device uint* u_counts = meta + 136u;
     device uint* u_tokens = meta + 264u;
@@ -445,44 +443,58 @@ kernel void planar_moe_build_union_m8(device const uint* indices [[buffer(0)]],
 
     const uint m_cap = (a.tokens <= 4u) ? 4u : 8u;
     uint U = 0u;
-    for (uint flat = 0u; flat < total; ++flat) {
-        const uint e = indices[flat];
-        const uint tok = flat / a.selected;
-        int found = -1;
-        for (uint base = 0u; base < U; base += 32u) {
-            const uint u = base + uint(lane);
-            const bool match = (u < U) && (tg_exp[u] == e) && (tg_cnt[u] < m_cap);
-            const uint best = simd_min(match ? u : 0xffffffffu);
-            if (best != 0xffffffffu) {
-                found = int(best);
-                break;
-            }
-        }
-        if (found >= 0) {
-            if (!lane) {
-                const uint slot = uint(found);
-                const uint k = tg_cnt[slot];
-                tg_cnt[slot] = k + 1u;
-                u_tokens[slot * 8u + k] = tok;
-                u_routes[slot * 8u + k] = flat;
-            }
-        } else {
-            if (!lane) {
-                tg_exp[U] = e;
-                tg_cnt[U] = 1u;
-            }
-            if (lane < 8u) {
-                u_tokens[U * 8u + lane] = tok;
-                u_routes[U * 8u + lane] = flat;
-            }
-            ++U;
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+    // One mask per expert per 32 routes. Only the experts present in this
+    // batch are read. Atomic clears may coincide when several lanes share one.
+    threadgroup atomic_uint occurrences[512][4];
+    const uint blocks = (total + 31u) / 32u;
+    const uint lane_bit = 1u << lane;
+    for (uint flat = lane; flat < total; flat += 32u) {
+        const uint expert = indices[flat];
+        for (uint block = 0; block < blocks; ++block)
+            atomic_store_explicit(&occurrences[expert][block], 0u, memory_order_relaxed);
     }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint flat = lane; flat < total; flat += 32u)
+        atomic_fetch_or_explicit(&occurrences[indices[flat]][flat / 32u], lane_bit, memory_order_relaxed);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint u = lane; u < U; u += 32u) {
-        u_experts[u] = tg_exp[u];
-        u_counts[u] = tg_cnt[u];
+    for (uint block = 0; block < blocks; ++block) {
+        const uint flat = 32u * block + lane;
+        const bool live = flat < total;
+        const uint expert = live ? indices[flat] : 0u;
+        uint rank = 0;
+        if (live) {
+            for (uint before = 0; before < block; ++before)
+                rank += popcount(atomic_load_explicit(&occurrences[expert][before], memory_order_relaxed));
+            const uint peers = atomic_load_explicit(&occurrences[expert][block], memory_order_relaxed);
+            rank += popcount(peers & (lane_bit - 1u));
+        }
+        // The first occurrence and every m_cap-th repeat each start a new
+        // record. Compact leaders in flat-route order, including overflow records.
+        const uint leader = uint(live && rank % m_cap == 0u);
+        const uint record = U + simd_prefix_exclusive_sum(leader);
+        U += simd_sum(leader);
+        if (!leader) continue;
+
+        uint count = 0;
+        for (uint b = block; b < blocks && count < m_cap; ++b) {
+            uint mask = atomic_load_explicit(&occurrences[expert][b], memory_order_relaxed);
+            if (b == block) mask &= ~(lane_bit - 1u);
+            while (mask && count < m_cap) {
+                const uint source = b * 32u + ctz(mask);
+                u_tokens[record * 8u + count] = source / a.selected;
+                u_routes[record * 8u + count] = source;
+                ++count;
+                mask &= mask - 1u;
+            }
+        }
+        u_experts[record] = expert;
+        u_counts[record] = count;
+        // Preserve the original metadata in inactive slots, too.
+        for (uint k = count; k < 8u; ++k) {
+            u_tokens[record * 8u + k] = flat / a.selected;
+            u_routes[record * 8u + k] = flat;
+        }
     }
     if (!lane) {
         meta[0] = (a.hidden + 4u * planar_union_gate_rows - 1u) / (4u * planar_union_gate_rows);
@@ -755,7 +767,7 @@ static inline void planar_moe_gate_up_swiglu_union_impl(
     const ulong in_stride_f32 = a.input_stride_bytes / sizeof(float);
 
     uint bad = 0u;
-    if (n == 1u) {
+    if (MCap == 1u || n == 1u) {
         float sum_g0[kRows] = {0.0f};
         float sum_u0[kRows] = {0.0f};
         const uint tok0 = tok_meta[0];
@@ -895,15 +907,8 @@ static inline void planar_moe_gate_up_swiglu_union_impl(
     }
 
     if (sg_live) {
-        uint tok_ids[MCap];
-        uint flat_ids[MCap];
         float sum_g[MCap][kRows] = {{0.0f}};
         float sum_u[MCap][kRows] = {{0.0f}};
-        #pragma unroll
-        for (ushort m = 0; m < MCap; ++m) {
-            tok_ids[m] = (m < n) ? tok_meta[m] : 0u;
-            flat_ids[m] = (m < n) ? flat_meta[m] : 0u;
-        }
         if (planar_encoding == 12u || planar_encoding == 13u) {
             const ushort ix = lane >> 4u;
             const ushort sub16 = lane & 15u;
@@ -966,8 +971,8 @@ static inline void planar_moe_gate_up_swiglu_union_impl(
                     const uint col_base0 = (sb0 + uint(ix)) * 256u + uint(pair) * 64u + uint(ir) * 8u;
                     #pragma unroll
                     for (ushort m = 0; m < MCap; ++m) {
-                        if (m < n) {
-                            device const float* x_src = input + ulong(tok_ids[m]) * in_stride_f32 + col_base0;
+                        if (m < ushort(n)) {
+                            device const float* x_src = input + ulong(tok_meta[m]) * in_stride_f32 + col_base0;
                             const float4 x0_lo = float4(*reinterpret_cast<device const packed_float4*>(x_src));
                             const float4 x0_hi = float4(*reinterpret_cast<device const packed_float4*>(x_src + 4u));
                             const float4 x1_lo = float4(*reinterpret_cast<device const packed_float4*>(x_src + 32u));
@@ -1014,8 +1019,8 @@ static inline void planar_moe_gate_up_swiglu_union_impl(
                 }
                 #pragma unroll
                 for (ushort m = 0; m < MCap; ++m) {
-                    if (m < n) {
-                        device const float* x_src = input + ulong(tok_ids[m]) * in_stride_f32;
+                    if (m < ushort(n)) {
+                        device const float* x_src = input + ulong(tok_meta[m]) * in_stride_f32;
                         const float4 x4 = float4(reinterpret_cast<device const packed_float4*>(x_src + k_blk * 32u)[lane]);
                         bad |= nonfinite_vec4(x4);
                         #pragma unroll
@@ -1046,8 +1051,8 @@ static inline void planar_moe_gate_up_swiglu_union_impl(
                 }
                 #pragma unroll
                 for (ushort m = 0; m < MCap; ++m) {
-                    if (m < n) {
-                        device const float* x_src = input + ulong(tok_ids[m]) * in_stride_f32;
+                    if (m < ushort(n)) {
+                        device const float* x_src = input + ulong(tok_meta[m]) * in_stride_f32;
                         const float xv = x_src[k_blk * 32u + lane];
                         bad |= nonfinite_bit(xv);
                         #pragma unroll
@@ -1063,9 +1068,9 @@ static inline void planar_moe_gate_up_swiglu_union_impl(
         }
         #pragma unroll
         for (ushort m = 0; m < MCap; ++m) {
-            if (m < n) {
+            if (m < ushort(n)) {
                 device float* out = reinterpret_cast<device float*>(
-                    reinterpret_cast<device uchar*>(expert_hidden) + ulong(flat_ids[m]) * a.output_stride_bytes);
+                    reinterpret_cast<device uchar*>(expert_hidden) + ulong(flat_meta[m]) * a.output_stride_bytes);
                 #pragma unroll
                 for (ushort r = 0; r < kRows; ++r) {
                     const float g_tot = simd_sum(sum_g[m][r]);
@@ -1094,7 +1099,8 @@ static inline void planar_moe_down_union_impl(
     uint2 group,
     ushort sg,
     ushort lane,
-    ushort tid
+    ushort tid,
+    threadgroup float (*sx)[256]
 ) {
     if ((planar_encoding != 7u && planar_encoding != 8u) ||
         !a.tokens || a.tokens > MaxTokens || !a.selected || a.selected > 16u || !a.experts || a.experts > 512u ||
@@ -1131,7 +1137,7 @@ static inline void planar_moe_down_union_impl(
     const ulong in_stride_f32 = a.input_stride_bytes / sizeof(float);
 
     uint bad = 0u;
-    if (n == 1u) {
+    if (MCap == 1u || n == 1u) {
         float sums0[kRows] = {0.0f};
         const uint flat0 = flat_meta[0];
         if (sg_live) {
@@ -1281,198 +1287,219 @@ static inline void planar_moe_down_union_impl(
         return;
     }
 
-    if (sg_live) {
-        uint flat_ids[MCap];
-        float sums[MCap][kRows] = {{0.0f}};
-        #pragma unroll
-        for (ushort m = 0; m < MCap; ++m) {
-            flat_ids[m] = (m < n) ? flat_meta[m] : 0u;
-        }
-        uint k_blk = 0u;
-        if (planar_encoding == 7u) {
-            const ushort ib8 = lane >> 2u;
-            const ushort l4 = lane & 3u;
-            const ushort j_base = l4 * 4u;
-            for (; k_blk + 8u <= blocks_per_row; k_blk += 8u) {
+    float sums[MCap][kRows] = {{0.0f}};
+    uint k_blk = 0u;
+    if (planar_encoding == 7u) {
+        const ushort ib8 = lane >> 2u;
+        const ushort l4 = lane & 3u;
+        const ushort j_base = l4 * 4u;
+        const uint sx_off8 = uint(ib8) * 32u + uint(j_base);
+        const uint col2 = uint(tid) * 2u;
+        for (; k_blk + 8u <= blocks_per_row; k_blk += 8u) {
+            for (ushort m = 0; m < ushort(n); ++m) {
+                device const float* x_src = expert_hidden + ulong(flat_meta[m]) * in_stride_f32 + k_blk * 32u + col2;
+                const float2 xv2 = float2(*reinterpret_cast<device const packed_float2*>(x_src));
+                bad |= nonfinite_vec2(xv2);
+                *reinterpret_cast<threadgroup float2*>(&sx[m][col2]) = xv2;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg_live) {
                 const uint b_cur = k_blk + uint(ib8);
-                float4 w_lo[kRows], w_hi[kRows];
                 #pragma unroll
                 for (ushort r = 0; r < kRows; ++r) {
-                    const uint prow = min(first_row + uint(r), a.rows - 1u);
-                    const ulong blk_base = ulong(prow) * blocks_per_row + k_blk;
-                    const ulong blk_lane = ulong(prow) * blocks_per_row + b_cur;
+                    if (r < active_rows) {
+                        const uint prow = first_row + uint(r);
+                        const ulong blk_base = ulong(prow) * blocks_per_row + k_blk;
+                        const ulong blk_lane = ulong(prow) * blocks_per_row + b_cur;
 
-                    const half2 dm = reinterpret_cast<device const half2*>(down_exp + a.dm_offset)[blk_lane];
-                    float d = float(dm.x), mv = float(dm.y);
-                    if (nonfinite_half_bit(dm.x) || nonfinite_half_bit(dm.y)) {
-                        bad |= 1u; d = 0.0f; mv = 0.0f;
-                    }
-                    const uint q4b = reinterpret_cast<device const uint*>(down_exp + a.qs_offset + blk_base * 16ul)[lane];
-                    const uint qh = reinterpret_cast<device const uint*>(down_exp + a.qh_offset)[blk_lane];
-                    const uint qh_lo = qh >> j_base;
-                    const uint qh_hi = qh >> (16u + j_base);
-                    const float4 q_lo(float((q4b & 15u) | ((qh_lo & 1u) << 4u)),
-                                      float(((q4b >> 8u) & 15u) | (((qh_lo >> 1u) & 1u) << 4u)),
-                                      float(((q4b >> 16u) & 15u) | (((qh_lo >> 2u) & 1u) << 4u)),
-                                      float(((q4b >> 24u) & 15u) | (((qh_lo >> 3u) & 1u) << 4u)));
-                    const float4 q_hi(float(((q4b >> 4u) & 15u) | ((qh_hi & 1u) << 4u)),
-                                      float(((q4b >> 12u) & 15u) | (((qh_hi >> 1u) & 1u) << 4u)),
-                                      float(((q4b >> 20u) & 15u) | (((qh_hi >> 2u) & 1u) << 4u)),
-                                      float(((q4b >> 28u) & 15u) | (((qh_hi >> 3u) & 1u) << 4u)));
-                    w_lo[r] = d * q_lo + mv;
-                    w_hi[r] = d * q_hi + mv;
-                }
-                const uint x_col = (k_blk + uint(ib8)) * 32u + uint(j_base);
-                #pragma unroll
-                for (ushort m = 0; m < MCap; ++m) {
-                    if (m < n) {
-                        device const float* x_src = expert_hidden + ulong(flat_ids[m]) * in_stride_f32;
-                        const float4 x_lo = float4(*reinterpret_cast<device const packed_float4*>(x_src + x_col));
-                        const float4 x_hi = float4(*reinterpret_cast<device const packed_float4*>(x_src + x_col + 16u));
-                        bad |= nonfinite_vec4(x_lo) | nonfinite_vec4(x_hi);
-                        #pragma unroll
-                        for (ushort r = 0; r < kRows; ++r) {
-                            if (r < active_rows) sums[m][r] += dot(w_lo[r], x_lo) + dot(w_hi[r], x_hi);
+                        const half2 dm = reinterpret_cast<device const half2*>(down_exp + a.dm_offset)[blk_lane];
+                        float d = float(dm.x), mv = float(dm.y);
+                        if (nonfinite_half_bit(dm.x) || nonfinite_half_bit(dm.y)) {
+                            bad |= 1u; d = 0.0f; mv = 0.0f;
                         }
-                    }
-                }
-            }
-            const ushort ib4 = lane >> 3u;
-            const ushort l8 = lane & 7u;
-            for (; k_blk + 4u <= blocks_per_row; k_blk += 4u) {
-                const uint b_cur = k_blk + uint(ib4);
-                float4 w4[kRows];
-                #pragma unroll
-                for (ushort r = 0; r < kRows; ++r) {
-                    const uint prow = min(first_row + uint(r), a.rows - 1u);
-                    const ulong blk_base = ulong(prow) * blocks_per_row + k_blk;
-                    const ulong blk_lane = ulong(prow) * blocks_per_row + b_cur;
+                        const uint q4b = reinterpret_cast<device const uint*>(down_exp + a.qs_offset + blk_base * 16ul)[lane];
+                        const uint qh = reinterpret_cast<device const uint*>(down_exp + a.qh_offset)[blk_lane];
+                        const uint qh_lo = qh >> j_base;
+                        const uint qh_hi = qh >> (16u + j_base);
+                        const float4 q_lo(float((q4b & 15u) | ((qh_lo & 1u) << 4u)),
+                                          float(((q4b >> 8u) & 15u) | (((qh_lo >> 1u) & 1u) << 4u)),
+                                          float(((q4b >> 16u) & 15u) | (((qh_lo >> 2u) & 1u) << 4u)),
+                                          float(((q4b >> 24u) & 15u) | (((qh_lo >> 3u) & 1u) << 4u)));
+                        const float4 q_hi(float(((q4b >> 4u) & 15u) | ((qh_hi & 1u) << 4u)),
+                                          float(((q4b >> 12u) & 15u) | (((qh_hi >> 1u) & 1u) << 4u)),
+                                          float(((q4b >> 20u) & 15u) | (((qh_hi >> 2u) & 1u) << 4u)),
+                                          float(((q4b >> 28u) & 15u) | (((qh_hi >> 3u) & 1u) << 4u)));
+                        const float4 wl = d * q_lo + mv;
+                        const float4 wh = d * q_hi + mv;
 
-                    const half2 dm = reinterpret_cast<device const half2*>(down_exp + a.dm_offset)[blk_lane];
-                    float d = float(dm.x), mv = float(dm.y);
-                    if (nonfinite_half_bit(dm.x) || nonfinite_half_bit(dm.y)) {
-                        bad |= 1u; d = 0.0f; mv = 0.0f;
-                    }
-                    const ushort q2 = reinterpret_cast<device const ushort*>(down_exp + a.qs_offset + blk_base * 16ul)[lane];
-                    const uint qh = reinterpret_cast<device const uint*>(down_exp + a.qh_offset)[blk_lane];
-                    const ushort j0 = l8 * 2u;
-                    const ushort j1 = j0 + 1u;
-                    const uint q_idx0 = (uint(q2 & 0x000fu)) | (((qh >> j0) & 1u) << 4u);
-                    const uint q_idx1 = (uint((q2 >> 8u) & 0x000fu)) | (((qh >> j1) & 1u) << 4u);
-                    const uint q_idx2 = (uint((q2 >> 4u) & 0x000fu)) | (((qh >> (16u + j0)) & 1u) << 4u);
-                    const uint q_idx3 = (uint((q2 >> 12u) & 0x000fu)) | (((qh >> (16u + j1)) & 1u) << 4u);
-                    w4[r] = float4(d * float(q_idx0) + mv,
-                                   d * float(q_idx1) + mv,
-                                   d * float(q_idx2) + mv,
-                                   d * float(q_idx3) + mv);
-                }
-                const uint x_blk = (k_blk + uint(ib4)) * 32u;
-                #pragma unroll
-                for (ushort m = 0; m < MCap; ++m) {
-                    if (m < n) {
-                        device const float* x_src = expert_hidden + ulong(flat_ids[m]) * in_stride_f32;
-                        const float2 x01 = float2(reinterpret_cast<device const packed_float2*>(x_src + x_blk)[l8]);
-                        const float2 x23 = float2(reinterpret_cast<device const packed_float2*>(x_src + x_blk + 16u)[l8]);
-                        bad |= nonfinite_vec2(x01) | nonfinite_vec2(x23);
-                        const float4 x4(x01.x, x01.y, x23.x, x23.y);
                         #pragma unroll
-                        for (ushort r = 0; r < kRows; ++r) {
-                            if (r < active_rows) sums[m][r] += dot(w4[r], x4);
+                        for (ushort m = 0; m < MCap; ++m) {
+                            if (m < ushort(n)) {
+                                const float4 x_lo = *reinterpret_cast<threadgroup const float4*>(&sx[m][sx_off8]);
+                                const float4 x_hi = *reinterpret_cast<threadgroup const float4*>(&sx[m][sx_off8 + 16u]);
+                                sums[m][r] += dot(wl, x_lo) + dot(wh, x_hi);
+                            }
                         }
                     }
                 }
             }
-            const uint shift_tail = 4u * (uint(lane) / 16u);
-            const uint j_tail = uint(lane) % 16u;
-            for (; k_blk < blocks_per_row; ++k_blk) {
-                float w1[kRows];
-                #pragma unroll
-                for (ushort r = 0; r < kRows; ++r) {
-                    const uint prow = min(first_row + uint(r), a.rows - 1u);
-                    const ulong blk = ulong(prow) * blocks_per_row + k_blk;
-                    const half2 dm = reinterpret_cast<device const half2*>(down_exp + a.dm_offset)[blk];
-                    float d = float(dm.x), mv = float(dm.y);
-                    if (nonfinite_half_bit(dm.x) || nonfinite_half_bit(dm.y)) {
-                        bad |= 1u; d = 0.0f; mv = 0.0f;
-                    }
-                    const uchar qb = (down_exp + a.qs_offset + blk * 16ul)[j_tail];
-                    const uint qh = reinterpret_cast<device const uint*>(down_exp + a.qh_offset)[blk];
-                    const uint q = ((uint(qb) >> shift_tail) & 15u) | (((qh >> lane) & 1u) << 4u);
-                    w1[r] = d * float(q) + mv;
-                }
-                #pragma unroll
-                for (ushort m = 0; m < MCap; ++m) {
-                    if (m < n) {
-                        device const float* x_src = expert_hidden + ulong(flat_ids[m]) * in_stride_f32;
-                        const float xv = x_src[k_blk * 32u + lane];
-                        bad |= nonfinite_bit(xv);
-                        #pragma unroll
-                        for (ushort r = 0; r < kRows; ++r) {
-                            if (r < active_rows) sums[m][r] += w1[r] * xv;
-                        }
-                    }
-                }
-            }
-        } else {
-            const ushort ib4 = lane >> 3u;
-            for (; k_blk + 4u <= blocks_per_row; k_blk += 4u) {
-                const uint b_cur = k_blk + uint(ib4);
-                float4 w4[kRows];
-                #pragma unroll
-                for (ushort r = 0; r < kRows; ++r) {
-                    const uint prow = min(first_row + uint(r), a.rows - 1u);
-                    const ulong blk_base = ulong(prow) * blocks_per_row + k_blk;
-                    const ulong blk_lane = ulong(prow) * blocks_per_row + b_cur;
-                    const half dh = reinterpret_cast<device const half*>(down_exp + a.dm_offset)[blk_lane];
-                    float d = float(dh);
-                    if (nonfinite_half_bit(dh)) { bad |= 1u; d = 0.0f; }
-                    const char4 q4 = reinterpret_cast<device const char4*>(down_exp + a.qs_offset + blk_base * 32ul)[lane];
-                    w4[r] = float4(q4) * d;
-                }
-                #pragma unroll
-                for (ushort m = 0; m < MCap; ++m) {
-                    if (m < n) {
-                        device const float* x_src = expert_hidden + ulong(flat_ids[m]) * in_stride_f32;
-                        const float4 x4 = float4(reinterpret_cast<device const packed_float4*>(x_src + k_blk * 32u)[lane]);
-                        bad |= nonfinite_vec4(x4);
-                        #pragma unroll
-                        for (ushort r = 0; r < kRows; ++r) {
-                            if (r < active_rows) sums[m][r] += dot(w4[r], x4);
-                        }
-                    }
-                }
-            }
-            for (; k_blk < blocks_per_row; ++k_blk) {
-                float w1[kRows];
-                #pragma unroll
-                for (ushort r = 0; r < kRows; ++r) {
-                    const uint prow = min(first_row + uint(r), a.rows - 1u);
-                    const ulong blk = ulong(prow) * blocks_per_row + k_blk;
-                    const half dh = reinterpret_cast<device const half*>(down_exp + a.dm_offset)[blk];
-                    float d = float(dh);
-                    if (nonfinite_half_bit(dh)) { bad |= 1u; d = 0.0f; }
-                    const char qc = reinterpret_cast<device const char*>(down_exp + a.qs_offset + blk * 32ul)[lane];
-                    w1[r] = float(qc) * d;
-                }
-                #pragma unroll
-                for (ushort m = 0; m < MCap; ++m) {
-                    if (m < n) {
-                        device const float* x_src = expert_hidden + ulong(flat_ids[m]) * in_stride_f32;
-                        const float xv = x_src[k_blk * 32u + lane];
-                        bad |= nonfinite_bit(xv);
-                        #pragma unroll
-                        for (ushort r = 0; r < kRows; ++r) {
-                            if (r < active_rows) sums[m][r] += w1[r] * xv;
-                        }
-                    }
-                }
-            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        const ushort ib4 = lane >> 3u;
+        const ushort l8 = lane & 7u;
+        const uint sx_off4 = uint(ib4) * 32u + uint(l8) * 2u;
+        for (; k_blk + 4u <= blocks_per_row; k_blk += 4u) {
+            for (ushort m = 0; m < ushort(n); ++m) {
+                const float xv = expert_hidden[ulong(flat_meta[m]) * in_stride_f32 + k_blk * 32u + uint(tid)];
+                bad |= nonfinite_bit(xv);
+                sx[m][tid] = xv;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg_live) {
+                const uint b_cur = k_blk + uint(ib4);
+                const ushort j0 = l8 * 2u;
+                const ushort j1 = j0 + 1u;
+                #pragma unroll
+                for (ushort r = 0; r < kRows; ++r) {
+                    if (r < active_rows) {
+                        const uint prow = first_row + uint(r);
+                        const ulong blk_base = ulong(prow) * blocks_per_row + k_blk;
+                        const ulong blk_lane = ulong(prow) * blocks_per_row + b_cur;
+
+                        const half2 dm = reinterpret_cast<device const half2*>(down_exp + a.dm_offset)[blk_lane];
+                        float d = float(dm.x), mv = float(dm.y);
+                        if (nonfinite_half_bit(dm.x) || nonfinite_half_bit(dm.y)) {
+                            bad |= 1u; d = 0.0f; mv = 0.0f;
+                        }
+                        const ushort q2 = reinterpret_cast<device const ushort*>(down_exp + a.qs_offset + blk_base * 16ul)[lane];
+                        const uint qh = reinterpret_cast<device const uint*>(down_exp + a.qh_offset)[blk_lane];
+                        const uint q_idx0 = (uint(q2 & 0x000fu)) | (((qh >> j0) & 1u) << 4u);
+                        const uint q_idx1 = (uint((q2 >> 8u) & 0x000fu)) | (((qh >> j1) & 1u) << 4u);
+                        const uint q_idx2 = (uint((q2 >> 4u) & 0x000fu)) | (((qh >> (16u + j0)) & 1u) << 4u);
+                        const uint q_idx3 = (uint((q2 >> 12u) & 0x000fu)) | (((qh >> (16u + j1)) & 1u) << 4u);
+                        const float4 w4(d * float(q_idx0) + mv,
+                                        d * float(q_idx1) + mv,
+                                        d * float(q_idx2) + mv,
+                                        d * float(q_idx3) + mv);
+
+                        #pragma unroll
+                        for (ushort m = 0; m < MCap; ++m) {
+                            if (m < ushort(n)) {
+                                const float2 x01 = *reinterpret_cast<threadgroup const float2*>(&sx[m][sx_off4]);
+                                const float2 x23 = *reinterpret_cast<threadgroup const float2*>(&sx[m][sx_off4 + 16u]);
+                                sums[m][r] += dot(w4, float4(x01.x, x01.y, x23.x, x23.y));
+                            }
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const uint shift_tail = 4u * (uint(lane) / 16u);
+        const uint j_tail = uint(lane) % 16u;
+        for (; k_blk < blocks_per_row; ++k_blk) {
+            if (tid < 32u) {
+                for (ushort m = 0; m < ushort(n); ++m) {
+                    const float xv = expert_hidden[ulong(flat_meta[m]) * in_stride_f32 + k_blk * 32u + uint(tid)];
+                    bad |= nonfinite_bit(xv);
+                    sx[m][tid] = xv;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg_live) {
+                #pragma unroll
+                for (ushort r = 0; r < kRows; ++r) {
+                    if (r < active_rows) {
+                        const uint prow = first_row + uint(r);
+                        const ulong blk = ulong(prow) * blocks_per_row + k_blk;
+                        const half2 dm = reinterpret_cast<device const half2*>(down_exp + a.dm_offset)[blk];
+                        float d = float(dm.x), mv = float(dm.y);
+                        if (nonfinite_half_bit(dm.x) || nonfinite_half_bit(dm.y)) {
+                            bad |= 1u; d = 0.0f; mv = 0.0f;
+                        }
+                        const uchar qb = (down_exp + a.qs_offset + blk * 16ul)[j_tail];
+                        const uint qh = reinterpret_cast<device const uint*>(down_exp + a.qh_offset)[blk];
+                        const uint q = ((uint(qb) >> shift_tail) & 15u) | (((qh >> lane) & 1u) << 4u);
+                        const float w1 = d * float(q) + mv;
+                        #pragma unroll
+                        for (ushort m = 0; m < MCap; ++m) {
+                            if (m < ushort(n)) sums[m][r] += w1 * sx[m][lane];
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    } else {
+        const ushort ib4 = lane >> 3u;
+        for (; k_blk + 4u <= blocks_per_row; k_blk += 4u) {
+            for (ushort m = 0; m < ushort(n); ++m) {
+                const float xv = expert_hidden[ulong(flat_meta[m]) * in_stride_f32 + k_blk * 32u + uint(tid)];
+                bad |= nonfinite_bit(xv);
+                sx[m][tid] = xv;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg_live) {
+                const uint b_cur = k_blk + uint(ib4);
+                #pragma unroll
+                for (ushort r = 0; r < kRows; ++r) {
+                    if (r < active_rows) {
+                        const uint prow = first_row + uint(r);
+                        const ulong blk_base = ulong(prow) * blocks_per_row + k_blk;
+                        const ulong blk_lane = ulong(prow) * blocks_per_row + b_cur;
+                        const half dh = reinterpret_cast<device const half*>(down_exp + a.dm_offset)[blk_lane];
+                        float d = float(dh);
+                        if (nonfinite_half_bit(dh)) { bad |= 1u; d = 0.0f; }
+                        const char4 q4 = reinterpret_cast<device const char4*>(down_exp + a.qs_offset + blk_base * 32ul)[lane];
+                        const float4 w4 = float4(q4) * d;
+                        #pragma unroll
+                        for (ushort m = 0; m < MCap; ++m) {
+                            if (m < ushort(n)) {
+                                const float4 x4 = reinterpret_cast<threadgroup const float4*>(&sx[m][0])[lane];
+                                sums[m][r] += dot(w4, x4);
+                            }
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (; k_blk < blocks_per_row; ++k_blk) {
+            if (tid < 32u) {
+                for (ushort m = 0; m < ushort(n); ++m) {
+                    const float xv = expert_hidden[ulong(flat_meta[m]) * in_stride_f32 + k_blk * 32u + uint(tid)];
+                    bad |= nonfinite_bit(xv);
+                    sx[m][tid] = xv;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg_live) {
+                #pragma unroll
+                for (ushort r = 0; r < kRows; ++r) {
+                    if (r < active_rows) {
+                        const uint prow = first_row + uint(r);
+                        const ulong blk = ulong(prow) * blocks_per_row + k_blk;
+                        const half dh = reinterpret_cast<device const half*>(down_exp + a.dm_offset)[blk];
+                        float d = float(dh);
+                        if (nonfinite_half_bit(dh)) { bad |= 1u; d = 0.0f; }
+                        const char qc = reinterpret_cast<device const char*>(down_exp + a.qs_offset + blk * 32ul)[lane];
+                        const float w1 = float(qc) * d;
+                        #pragma unroll
+                        for (ushort m = 0; m < MCap; ++m) {
+                            if (m < ushort(n)) sums[m][r] += w1 * sx[m][lane];
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    if (sg_live) {
         #pragma unroll
         for (ushort m = 0; m < MCap; ++m) {
-            if (m < n) {
+            if (m < ushort(n)) {
                 device float* out = reinterpret_cast<device float*>(
-                    reinterpret_cast<device uchar*>(expert_down) + ulong(flat_ids[m]) * a.output_stride_bytes);
+                    reinterpret_cast<device uchar*>(expert_down) + ulong(flat_meta[m]) * a.output_stride_bytes);
                 #pragma unroll
                 for (ushort r = 0; r < kRows; ++r) {
                     const float tot = simd_sum(sums[m][r]);
@@ -1501,7 +1528,10 @@ kernel void planar_moe_gate_up_swiglu_m4(device const uchar* pair_lo [[buffer(0)
                                          ushort lane [[thread_index_in_simdgroup]],
                                          ushort tid [[thread_index_in_threadgroup]]) {
     const uint n_est = (a.tokens >= 1u && a.tokens <= 4u && a.use_union == 1u && group.y < meta[6]) ? meta[136u + group.y] : 4u;
-    if (n_est == 2u) {
+    if (n_est == 1u) {
+        planar_v3_detail::planar_moe_gate_up_swiglu_union_impl<1, 4>(
+            pair_lo, pair_hi, input, expert_hidden, meta, a, error, group, sg, lane, tid);
+    } else if (n_est == 2u) {
         planar_v3_detail::planar_moe_gate_up_swiglu_union_impl<2, 4>(
             pair_lo, pair_hi, input, expert_hidden, meta, a, error, group, sg, lane, tid);
     } else {
@@ -1522,7 +1552,10 @@ kernel void planar_moe_gate_up_swiglu_m8(device const uchar* pair_lo [[buffer(0)
                                          ushort lane [[thread_index_in_simdgroup]],
                                          ushort tid [[thread_index_in_threadgroup]]) {
     const uint n_est = (a.tokens >= 1u && a.tokens <= 8u && a.use_union == 1u && group.y < meta[6]) ? meta[136u + group.y] : 8u;
-    if (n_est == 2u) {
+    if (n_est == 1u) {
+        planar_v3_detail::planar_moe_gate_up_swiglu_union_impl<1, 8>(
+            pair_lo, pair_hi, input, expert_hidden, meta, a, error, group, sg, lane, tid);
+    } else if (n_est == 2u) {
         planar_v3_detail::planar_moe_gate_up_swiglu_union_impl<2, 8>(
             pair_lo, pair_hi, input, expert_hidden, meta, a, error, group, sg, lane, tid);
     } else if (n_est >= 3u && n_est <= 4u) {
@@ -1728,13 +1761,17 @@ kernel void planar_moe_down_m4(device const uchar* down_weights [[buffer(0)]],
                                ushort sg [[simdgroup_index_in_threadgroup]],
                                ushort lane [[thread_index_in_simdgroup]],
                                ushort tid [[thread_index_in_threadgroup]]) {
+    alignas(16) threadgroup float sx[4][256];
     const uint n_est = (a.tokens >= 1u && a.tokens <= 4u && a.use_union == 1u && group.y < meta[6]) ? meta[136u + group.y] : 4u;
-    if (n_est == 2u) {
+    if (n_est == 1u) {
+        planar_v3_detail::planar_moe_down_union_impl<1, 4>(
+            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
+    } else if (n_est == 2u) {
         planar_v3_detail::planar_moe_down_union_impl<2, 4>(
-            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid);
+            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
     } else {
         planar_v3_detail::planar_moe_down_union_impl<4, 4>(
-            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid);
+            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
     }
 }
 
@@ -1748,16 +1785,20 @@ kernel void planar_moe_down_m8(device const uchar* down_weights [[buffer(0)]],
                                ushort sg [[simdgroup_index_in_threadgroup]],
                                ushort lane [[thread_index_in_simdgroup]],
                                ushort tid [[thread_index_in_threadgroup]]) {
+    alignas(16) threadgroup float sx[8][256];
     const uint n_est = (a.tokens >= 1u && a.tokens <= 8u && a.use_union == 1u && group.y < meta[6]) ? meta[136u + group.y] : 8u;
-    if (n_est == 2u) {
+    if (n_est == 1u) {
+        planar_v3_detail::planar_moe_down_union_impl<1, 8>(
+            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
+    } else if (n_est == 2u) {
         planar_v3_detail::planar_moe_down_union_impl<2, 8>(
-            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid);
+            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
     } else if (n_est >= 3u && n_est <= 4u) {
         planar_v3_detail::planar_moe_down_union_impl<4, 8>(
-            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid);
+            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
     } else {
         planar_v3_detail::planar_moe_down_union_impl<8, 8>(
-            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid);
+            down_weights, expert_hidden, expert_down, meta, a, error, group, sg, lane, tid, sx);
     }
 }
 

@@ -178,6 +178,7 @@ impl Worker {
 
 fn session() -> ServeSession {
     let codec = ServeCodec {
+        control_ids: Vec::new(),
         render: Box::new(|request| {
             let messages = get(request, "messages").array().unwrap();
             Ok(RenderedChat {
@@ -476,6 +477,7 @@ fn first_output_packet_streams_early_then_switches_to_steady_state_64_packets() 
     put(&mut ready64, "native_mtp_output_packet", Json::integer(64));
 
     let make_codec = || ServeCodec {
+        control_ids: Vec::new(),
         render: Box::new(|request| {
             let messages = get(request, "messages").array().unwrap();
             Ok(RenderedChat {
@@ -651,4 +653,51 @@ fn first_output_packet_streams_early_then_switches_to_steady_state_64_packets() 
     let details = get(&response, "tokspur_private");
     assert_eq!(number(details, "native_mtp_first_output_packet"), 8);
     assert_eq!(number(details, "maximum_generation_width"), 64);
+}
+
+#[test]
+fn phase_stamps_are_taken_in_order_only_when_enabled() {
+    let mut session = session();
+    let cancelled = Cell::new(false);
+    let mut worker = Worker::new([Counts::Restored(0)]);
+    let (response, _, _) = complete(&mut session, &mut worker, "cold", true, &cancelled);
+    response.unwrap();
+    let off = *session.phase_stamps();
+    assert!(off.request_start.is_none() && off.prefill_start.is_none());
+    assert!(off.first_packet_done.is_none() && off.generation_end.is_none());
+    assert_eq!(off.output_packets, 0);
+
+    session.set_phase_stamps(true);
+    worker.inputs.extend([Counts::Restored(0)]);
+    let (response, _, _) = complete(&mut session, &mut worker, "fresh", true, &cancelled);
+    response.unwrap();
+    let on = *session.phase_stamps();
+    let order = [
+        on.request_start.unwrap(),
+        on.prefill_start.unwrap(),
+        on.generation_start.unwrap(),
+        on.first_packet_done.unwrap(),
+        on.generation_end.unwrap(),
+    ];
+    assert!(order.windows(2).all(|pair| pair[0] <= pair[1]), "{on:?}");
+    assert_eq!((on.output_packets, on.first_packet_tokens), (1, 1));
+    assert_eq!((on.max_packet_tokens, on.completion_tokens), (1, 1));
+
+    // A refusal before admission keeps only its own start, not the previous request's phases.
+    let refused = session.complete(
+        &Json::new_object([("model", Json::from("tokspur"))]),
+        b"refused",
+        &mut |_, _| unreachable!("a refused request starts no worker command"),
+        &mut ServeSink {
+            chunk: None,
+            cancelled: &mut || false,
+            new_seed: &mut || 44,
+            prefix_trace: None,
+        },
+    );
+    assert!(refused.is_err());
+    let after = *session.phase_stamps();
+    assert!(after.request_start.unwrap() >= on.generation_end.unwrap());
+    assert!(after.prefill_start.is_none() && after.first_packet_done.is_none());
+    assert_eq!(after.output_packets, 0);
 }

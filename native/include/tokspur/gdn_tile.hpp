@@ -5,6 +5,11 @@
 #include <vector>
 
 namespace tokspur {
+#if defined(TOKSPUR_PRIVATE_GDN_COOPERATIVE4) && TOKSPUR_PRIVATE_GDN_COOPERATIVE4
+inline constexpr bool gdn_cooperative4_enabled = true;
+#else
+inline constexpr bool gdn_cooperative4_enabled = false;
+#endif
 // Explicit component experiment. Capacity is 2/4/8/16/32; steps is 1..capacity.
 // Buffers are capacity-sized, but unprocessed rows are never read/written.
 // k=0 rollback means retain the accepted base without a dispatch.

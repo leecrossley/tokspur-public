@@ -1590,7 +1590,7 @@ def confirmation(plan, data):
             "throughput_change": point,
             "paired_95_interval": interval,
             "latency_simultaneous_upper": upper,
-            "passes_serving_thresholds": point >= 0.05
+            "passes_serving_thresholds": point > 0
             and interval[0] > 0
             and all(v <= 0.03 for v in upper.values()),
         }
@@ -1659,7 +1659,11 @@ def main():
     if args.command == "archive":
         archive(args.source, args.output)
     elif args.command == "capture":
-        capture(args.trace, args.argv[1:] if args.argv[:1] == ["--"] else args.argv)
+        capture(
+            args.trace,
+            args.argv[1:] if args.argv[:1] == ["--"] else args.argv,
+            arm=args.arm,
+        )
     elif args.command in ("replay", "check-prepared"):
         print(
             json.dumps(

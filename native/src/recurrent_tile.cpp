@@ -151,7 +151,8 @@ void encode_recurrent_layer_tile(MetalGraph& g, const RecurrentWeights& w, const
     , const MoeManyScratch* grouped_ffn, bool reuse_residual_rows512
 #endif
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
-    , const VerifyNaxMoeScratch* verify_nax_moe
+    , const VerifyNaxMoeScratch* verify_nax_moe,
+    bool input_prenormalized, GpuView next_rms_gains, float next_rms_epsilon
 #endif
     ) {
     try {
@@ -180,14 +181,24 @@ void encode_recurrent_layer_tile(MetalGraph& g, const RecurrentWeights& w, const
 #endif
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
         if (g.verify_nax_active() && verify_nax_moe && tile.steps >= 2 && tile.steps <= 8) {
+            if (next_rms_gains.owner != 0) g.validate_disjoint(std::array{next_rms_gains}, writes);
             std::vector<GpuView> protected_reads(reads.begin(), reads.end());
             protected_reads.insert(protected_reads.end(), writes.begin(), writes.end());
             g.validate_disjoint(protected_reads, verify_nax_moe->views());
-            encode_verify_nax_residual_read(g, w.attention_read, s.residual, input, shape.residual, tile.steps, policy.rms_epsilon);
+            if (input_prenormalized) {
+                encode_verify_nax_residual_read_prenorm(g, w.attention_read, s.residual, shape.residual, tile.steps);
+            } else {
+                encode_verify_nax_residual_read(g, w.attention_read, s.residual, input, shape.residual, tile.steps, policy.rms_epsilon);
+            }
             encode_gdn_core_tile(g, w.attention, s.gdn, accepted, candidate, s.residual.input, s.attention_output, shape.gdn, policy, tile);
             encode_verify_nax_residual_write_read(g, w.ffn_read, s.residual, input, s.attention_output, s.residual.scales, s.intermediate_streams, shape.residual, tile.steps, policy.rms_epsilon);
             encode_verify_nax_moe(g, w.ffn, s.moe, *verify_nax_moe, s.residual.input, s.ffn_output, shape.moe, mode, normalize, tile.steps);
-            encode_verify_nax_residual_write(g, s.intermediate_streams, s.ffn_output, s.residual.scales, output, shape.residual, tile.steps);
+            if (next_rms_gains.owner != 0) {
+                encode_verify_nax_residual_write_rms(g, s.intermediate_streams, s.ffn_output, s.residual.scales,
+                    next_rms_gains, output, s.residual.normalized, shape.residual, tile.steps, next_rms_epsilon);
+            } else {
+                encode_verify_nax_residual_write(g, s.intermediate_streams, s.ffn_output, s.residual.scales, output, shape.residual, tile.steps);
+            }
             return;
         }
 #endif
