@@ -2711,6 +2711,12 @@ StackSampledVerificationResult TextStack::verify_sampled_bounded(std::span<const
 #ifdef TOKSPUR_PRIVATE_NATIVE_MTP
                 if (p.dflash_tap) p.encode_dflash_tap_layer(i, i % 2 ? v.streams : v.second, p.dflash_tap->verify_gpu, steps);
 #endif
+#ifdef TOKSPUR_PRIVATE_VERIFY_EARLY_COMMIT
+                // The GPU starts on these layers while the host encodes the remaining ones. Same dispatches, in the
+                // same order; only the physical command boundary moves.
+                if (use_verify_nax && i + 1 == size_t(TOKSPUR_PRIVATE_VERIFY_EARLY_COMMIT) && i + 1 < p.weights.layers.size())
+                    static_cast<void>(p.g.commit_partial());
+#endif
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
                 // Wide correctness captures are not timing evidence. Keep each
                 // recorded batch bounded without changing the serving schedule.

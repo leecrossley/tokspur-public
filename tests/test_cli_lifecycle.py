@@ -260,7 +260,7 @@ def test_serve_refuses_when_derived_pack_missing(harness):
     (harness.root / ".tokspur/derived/tokspur-pack-v2.asa.gguf").unlink()
     with pytest.raises(
         FileNotFoundError,
-        match=r"Lossless derived weight pack not found.*tokspur-pack-v2\.asa\.gguf",
+        match=r"Lossless derived weight pack not found.*tokspur-pack-v3\.asa\.gguf",
     ):
         cli.serve()
     harness.stop_during_wait = False
@@ -707,12 +707,23 @@ def test_dflash2_verify_rows_refuses_invalid_mode_before_launch(harness):
 
 
 @pytest.mark.parametrize("speed_preset", [False, True])
-def test_m8_and_adaptive_verify_rows_remain_opt_in(harness, speed_preset):
+def test_m8_and_adaptive_verify_rows_remain_opt_in_for_mtp_and_non_preset(
+    harness, tmp_path, speed_preset
+):
     harness.stop_during_wait = False
     with pytest.raises(SystemExit):
         cli.serve(speed_preset=speed_preset)
     assert "--native-verify-nax-m8" not in harness.last_command
     assert "--native-dflash2-verify-rows" not in harness.last_command
+
+    if not speed_preset:
+        dflash2_dir = tmp_path / "dflash2-optin"
+        dflash2_dir.mkdir()
+        with pytest.raises(SystemExit):
+            cli.serve(drafter="dflash2", dflash2_dir=dflash2_dir, speed_preset=False)
+        assert "--native-verify-nax-m8" not in harness.last_command
+        assert "--native-dflash2-verify-rows" not in harness.last_command
+        assert "--native-prepared-validation" not in harness.last_command
 
 
 def test_mtp_depth_speed_preset_and_dflash2_precision_forwarding(harness, tmp_path):
@@ -724,6 +735,8 @@ def test_mtp_depth_speed_preset_and_dflash2_precision_forwarding(harness, tmp_pa
         "tokspur-pack-v2.asa.gguf"
     )
     assert command[command.index("--native-mtp-depth") + 1] == "3"
+    assert command[command.index("--native-mtp-output-packet") + 1] == "64"
+    assert command[command.index("--native-mtp-first-output-packet") + 1] == "8"
     assert command[command.index("--native-prefill-dense") + 1] == "nax"
     assert command[command.index("--native-prefill-grouped") + 1] == "nax"
     assert "--native-prefill-router-fast" not in command
@@ -735,6 +748,7 @@ def test_mtp_depth_speed_preset_and_dflash2_precision_forwarding(harness, tmp_pa
     assert command[command.index("--native-host-logit-views") + 1] == "on"
     assert command[command.index("--native-logit-topk") + 1] == "on"
     assert command[command.index("--native-ple-async-gather") + 1] == "on"
+    assert command[command.index("--native-prepared-validation") + 1] == "on"
     assert command[command.index("--tool-enum-validation") + 1] == "executor"
     assert command[command.index("--tool-arg-validation") + 1] == "executor"
     assert "--native-mtp-fast-round" not in command
@@ -750,7 +764,7 @@ def test_mtp_depth_speed_preset_and_dflash2_precision_forwarding(harness, tmp_pa
         cli.serve()
     assert harness.last_command[
         harness.last_command.index("--derived-pack") + 1
-    ].endswith("tokspur-pack-v2.asa.gguf")
+    ].endswith("tokspur-pack-v3.asa.gguf")
 
     with pytest.raises(SystemExit):
         cli.serve(speed_preset=True, native_mtp_fast_round="on")
@@ -780,7 +794,41 @@ def test_mtp_depth_speed_preset_and_dflash2_precision_forwarding(harness, tmp_pa
         cli.serve(
             drafter="dflash2",
             dflash2_dir=dflash2_dir,
+            speed_preset=True,
+        )
+    df_default_cmd = harness.last_command
+    assert (
+        df_default_cmd[df_default_cmd.index("--native-dflash2-precision") + 1] == "q8_0"
+    )
+    assert (
+        df_default_cmd[df_default_cmd.index("--native-dflash2-max-drafts") + 1] == "7"
+    )
+    assert (
+        df_default_cmd[df_default_cmd.index("--native-dflash2-vocab-slice") + 1]
+        == "32768"
+    )
+    assert (
+        df_default_cmd[df_default_cmd.index("--native-dflash2-defer-context") + 1]
+        == "on"
+    )
+    assert (
+        df_default_cmd[df_default_cmd.index("--native-dflash2-verify-rows") + 1]
+        == "auto"
+    )
+    assert df_default_cmd[df_default_cmd.index("--native-verify-nax-m8") + 1] == "on"
+    assert (
+        df_default_cmd[df_default_cmd.index("--native-prepared-validation") + 1] == "on"
+    )
+
+    with pytest.raises(SystemExit):
+        cli.serve(
+            drafter="dflash2",
+            dflash2_dir=dflash2_dir,
             dflash2_precision="bf16",
+            dflash2_max_drafts=4,
+            native_dflash2_verify_rows="all",
+            native_prepared_validation="off",
+            verify_nax=False,
             speed_preset=True,
         )
     df_command = harness.last_command
@@ -788,6 +836,11 @@ def test_mtp_depth_speed_preset_and_dflash2_precision_forwarding(harness, tmp_pa
     assert df_command[df_command.index("--native-dflash2-max-drafts") + 1] == "4"
     assert df_command[df_command.index("--native-dflash2-vocab-slice") + 1] == "32768"
     assert df_command[df_command.index("--native-dflash2-defer-context") + 1] == "on"
+    assert df_command[df_command.index("--native-dflash2-verify-rows") + 1] == "all"
+    assert "--native-verify-nax" not in df_command
+    assert "--native-verify-nax-m8" not in df_command
+    assert "--native-verify-hc-gdn-fused" not in df_command
+    assert "--native-prepared-validation" not in df_command
 
     with pytest.raises(SystemExit):
         cli.serve(verify_nax=True, native_verify_nax="off")

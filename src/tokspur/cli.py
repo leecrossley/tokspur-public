@@ -140,6 +140,12 @@ def default_derived_pack_path(
             v3_path = derived_dir / v3_name
             if v3_path.is_file():
                 return v3_path.resolve()
+        # With neither format installed, name the default format (v3) in the refusal.
+        if not any(
+            (derived_dir / name).is_file()
+            for name in ("tokspur-pack-v2.asa.gguf", "tokspur-pack-v2.gguf")
+        ):
+            return (derived_dir / "tokspur-pack-v3.asa.gguf").resolve()
     asa_name = "tokspur-pack-v3.asa.gguf" if pack_v3 else "tokspur-pack-v2.asa.gguf"
     legacy_name = "tokspur-pack-v3.gguf" if pack_v3 else "tokspur-pack-v2.gguf"
     asa_path = derived_dir / asa_name
@@ -157,7 +163,7 @@ def serve(
     derived_pack: Path | str | None = None,
     gdn_prefill_only: bool = False,
     derived_pack_trust_mode: str = "full",
-    output_packet: int = 8,
+    output_packet: int | None = None,
     first_output_packet: int | None = None,
     prefill_dense: str | None = None,
     prefill_grouped: str | None = None,
@@ -178,6 +184,7 @@ def serve(
     native_verify_hc_gdn_fused: str | None = None,
     native_dflash2_defer_context: str | None = None,
     native_dflash2_verify_rows: str | None = None,
+    native_prepared_validation: str | None = None,
     native_verify_nax: str | None = None,
     drafter: str = "mtp",
     dflash2_dir: Path | str | None = None,
@@ -214,6 +221,7 @@ def serve(
         ("native_prefill_router_fast", native_prefill_router_fast),
         ("native_verify_hc_gdn_fused", native_verify_hc_gdn_fused),
         ("native_dflash2_defer_context", native_dflash2_defer_context),
+        ("native_prepared_validation", native_prepared_validation),
         ("native_verify_nax", native_verify_nax),
     ):
         if value not in (None, "off", "on"):
@@ -226,6 +234,8 @@ def serve(
         raise ValueError(
             "--native-prefill-router-fast requires the removed router-window implementation"
         )
+    if output_packet is None:
+        output_packet = 64 if speed_preset else 8
     if prefill_dense is None:
         prefill_dense = "nax" if speed_preset else "f32-staged"
     if prefill_grouped is None:
@@ -238,9 +248,7 @@ def serve(
         verify_nax_enabled = bool(speed_preset)
     verify_nax_enabled = verify_nax_enabled or verify_nax_m8
     if speed_preset:
-        if native_verify_hc_gdn_fused is None and (
-            verify_nax_enabled or drafter == "dflash2"
-        ):
+        if native_verify_hc_gdn_fused is None and verify_nax_enabled:
             native_verify_hc_gdn_fused = "on"
         if native_host_logit_views is None:
             native_host_logit_views = "on"
@@ -248,17 +256,25 @@ def serve(
             native_logit_topk = "on"
         if native_ple_async_gather is None:
             native_ple_async_gather = "on"
+        if native_prepared_validation is None:
+            native_prepared_validation = "on"
         if drafter == "mtp":
             if mtp_depth is None:
                 mtp_depth = 3
             mtp_draft_slice = True
         elif drafter == "dflash2":
+            if verify_nax_enabled:
+                verify_nax_m8 = True
+            if dflash2_precision is None:
+                dflash2_precision = "q8_0"
             if native_dflash2_defer_context is None:
                 native_dflash2_defer_context = "on"
             if dflash2_max_drafts is None:
-                dflash2_max_drafts = 4
+                dflash2_max_drafts = 7
             if dflash2_vocab_slice is None:
                 dflash2_vocab_slice = 32768
+            if native_dflash2_verify_rows is None:
+                native_dflash2_verify_rows = "auto"
         if output_packet == 64 and first_output_packet is None:
             first_output_packet = 8
     if tool_enum_validation is None:
@@ -493,9 +509,7 @@ def serve(
             dp = Path(derived_pack)
             pack_file = dp if dp.is_absolute() else (Path.cwd() / dp).resolve()
         else:
-            pack_file = default_derived_pack_path(
-                ROOT, pack_v3=pack_v3, prefer_v3=speed_preset
-            )
+            pack_file = default_derived_pack_path(ROOT, pack_v3=pack_v3, prefer_v3=True)
         shards = [asset["path"] for asset in target_info.get("assets", [])]
 
         if not allow_raw_gguf:
@@ -629,6 +643,11 @@ def serve(
             *(
                 ["--native-dflash2-verify-rows", native_dflash2_verify_rows]
                 if native_dflash2_verify_rows is not None
+                else []
+            ),
+            *(
+                ["--native-prepared-validation", "on"]
+                if native_prepared_validation == "on"
                 else []
             ),
             *(
@@ -916,7 +935,7 @@ def main() -> None:
         "--pack-v3",
         action="store_true",
         default=False,
-        help="Opt-in to planar derived pack v3 (tokspur-pack-v3.asa.gguf)",
+        help="Require planar derived pack v3 (the default when installed; v2 is the fallback)",
     )
     s.add_argument(
         "--derived-pack",
@@ -939,7 +958,7 @@ def main() -> None:
     s.add_argument(
         "--output-packet",
         type=int,
-        default=8,
+        default=None,
         choices=[8, 64],
         help="MTP output packet size (8 or 64)",
     )

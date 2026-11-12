@@ -290,7 +290,7 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
 name = "tokspur-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokspur-gguf",
  "tokspur-json",
@@ -301,14 +301,14 @@ dependencies = [
 
 [[package]]
 name = "tokspur-dispatch-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokspur-json",
 ]
 
 [[package]]
 name = "tokspur-fuzz"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arbitrary",
  "cc",
@@ -323,21 +323,21 @@ dependencies = [
 
 [[package]]
 name = "tokspur-gguf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokspur-testkit",
 ]
 
 [[package]]
 name = "tokspur-json"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokspur-testkit",
 ]
 
 [[package]]
 name = "tokspur-pack"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokspur-gguf",
  "tokspur-json",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "tokspur-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "shuttle",
  "tokspur-cli",
@@ -361,15 +361,15 @@ dependencies = [
 
 [[package]]
 name = "tokspur-sys"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "tokspur-testkit"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "tokspur-text"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokspur-json",
  "tokspur-sys",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "tokspur-wire"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tokspur-json",
  "tokspur-sys",

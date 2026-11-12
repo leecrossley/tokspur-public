@@ -1210,6 +1210,12 @@ pub(crate) fn resolve_derived_pack_path(
                 return candidate;
             }
         }
+        // With neither format installed, name the default format (v3) in the refusal.
+        let v2 = default_derived_pack_path(tokspur_base, false);
+        if !v2.is_file() {
+            return tokspur_base.join("derived/tokspur-pack-v3.asa.gguf");
+        }
+        return v2;
     }
     default_derived_pack_path(tokspur_base, pack_v3)
 }
@@ -1294,7 +1300,7 @@ pub fn serve_foreground(layout: &RuntimeLayout, opts: &ServeOptions) -> Result<i
                 source,
             })?
             .join(custom),
-        None => resolve_derived_pack_path(&tokspur_base, opts.pack_v3, opts.speed_preset),
+        None => resolve_derived_pack_path(&tokspur_base, opts.pack_v3, true),
     };
     if !opts.raw_gguf && !pack_file.is_file() {
         return Err(CliError::Validation(format!(

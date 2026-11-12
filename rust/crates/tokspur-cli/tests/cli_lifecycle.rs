@@ -1124,12 +1124,9 @@ fn pack_format_controls_verified_native_dispatch_and_budget_failures() {
     .unwrap();
     fixture.refresh_build_manifest();
 
-    // V2's static plan remains available before adoption; both spellings enter the same implementation.
-    for args in [
-        vec!["pack", "plan", "--json"],
-        vec!["pack", "plan", "--format", "v2", "--json"],
-    ] {
-        let output = run(&args);
+    // V2's static plan remains available before adoption when it is named explicitly.
+    {
+        let output = run(&["pack", "plan", "--format", "v2", "--json"]);
         assert!(
             output.status.success(),
             "{}",
@@ -1141,6 +1138,8 @@ fn pack_format_controls_verified_native_dispatch_and_budget_failures() {
             b"tokspur-pack-v2"
         );
     }
+    // V3 is the default and needs adopted sources; both spellings enter the same implementation.
+    assert!(!run(&["pack", "plan"]).status.success());
     assert!(!run(&["pack", "plan", "--format", "v3"]).status.success());
     assert!(
         Command::new(&cli)

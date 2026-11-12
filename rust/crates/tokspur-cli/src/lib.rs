@@ -246,7 +246,7 @@ usage: tokspur [--state-root <abs-path>] serve [options]
 
 options:
   --raw-gguf                                  Explicit opt-in to raw GGUF instead of derived pack
-  --pack-v3                                   Opt-in to planar derived pack v3 (tokspur-pack-v3.asa.gguf)
+  --pack-v3                                   Require planar derived pack v3 (the default when installed; v2 is the fallback)
   --derived-pack <file>                       Explicit derived pack GGUF file path
   --gdn-prefill-only                          Retired GDN prefill experiment
   --derived-pack-trust-mode {full,local-seal} Derived pack verification trust mode (default: full)
@@ -315,7 +315,7 @@ const PACK_PLAN_HELP_TEXT: &str = "\
 usage: tokspur [--state-root <abs-path>] pack plan [--format v2|v3] [--target-dir <dir>] [--reserve-gb <gb>] [--chunk-mib <mib>] [--json] [--check]
 
 options:
-  --format <v2|v3>   Pack layout (default: v2); v3 plans use adopted shards and the MTP sidecar
+  --format <v2|v3>   Pack layout (default: v3); v3 plans use adopted shards and the MTP sidecar
   --target-dir <dir> Directory whose volume free space is checked against reserve
   --reserve-gb <gb>  Required free disk reserve in GiB (default: 50.0)
   --chunk-mib <mib>  V3 streaming chunk size in MiB (1..64, default: 16)
@@ -328,7 +328,7 @@ const PACK_BUILD_HELP_TEXT: &str = "\
 usage: tokspur [--state-root <abs-path>] pack build [--format v2|v3] [--output <file>] [--reserve-gb <gb>] [--chunk-mib <mib>]
 
 options:
-  --format <v2|v3>   Pack layout (default: v2)
+  --format <v2|v3>   Pack layout (default: v3)
   --output <file>    Destination file (default: derived/tokspur-pack-<format>.asa.gguf); v3 requires a .gguf suffix
   --reserve-gb <gb>  Required free disk reserve in GiB (default: 50.0)
   --chunk-mib <mib>  Streaming copy chunk size in MiB (v2 default: 4; v3: 1..64, default: 16)
@@ -525,6 +525,7 @@ where
             let mut prefill_dense_explicit = false;
             let mut prefill_grouped_explicit = false;
             let mut verify_nax_explicit = false;
+            let mut prepared_validation_explicit = false;
             let mut output_packet_explicit = false;
             let mut tool_enum_explicit = false;
             let mut tool_arg_explicit = false;
@@ -744,6 +745,7 @@ where
                             ));
                         }
                         opts.prepared_validation = val == "on";
+                        prepared_validation_explicit = true;
                     }
                     "--worker-burst-pacing" => {
                         let val = take_val(flag, inline_val, &mut i, "requires off or on")?;
@@ -1072,6 +1074,9 @@ where
                 if opts.ple_async_gather.is_none() {
                     opts.ple_async_gather = Some(true);
                 }
+                if !prepared_validation_explicit && opts.verify_cost_profile.is_none() {
+                    opts.prepared_validation = true;
+                }
                 if !tool_enum_explicit {
                     opts.tool_enum_validation = "executor".to_owned();
                 }
@@ -1084,14 +1089,23 @@ where
                     }
                     opts.mtp_draft_slice = true;
                 } else if opts.drafter == "dflash2" {
+                    if opts.verify_nax {
+                        opts.verify_nax_m8 = true;
+                    }
+                    if opts.dflash2_precision.is_none() {
+                        opts.dflash2_precision = Some("q8_0".to_owned());
+                    }
                     if opts.dflash2_defer_context.is_none() {
                         opts.dflash2_defer_context = Some(true);
                     }
                     if opts.dflash2_max_drafts.is_none() {
-                        opts.dflash2_max_drafts = Some(4);
+                        opts.dflash2_max_drafts = Some(7);
                     }
                     if opts.dflash2_vocab_slice.is_none() {
                         opts.dflash2_vocab_slice = Some(32_768);
+                    }
+                    if opts.dflash2_verify_rows.is_none() {
+                        opts.dflash2_verify_rows = Some("auto".to_owned());
                     }
                 }
                 if !output_packet_explicit {
@@ -1120,7 +1134,7 @@ where
                 "plan" => {
                     let mut target_dir = None;
                     let mut chunk_mib = None;
-                    let mut format = PackFormat::V2;
+                    let mut format = PackFormat::V3;
                     let mut reserve_gb = 50.0f64;
                     let mut json = false;
                     let mut check = false;
@@ -1181,7 +1195,7 @@ where
                 }
                 "build" => {
                     let mut output = None;
-                    let mut format = PackFormat::V2;
+                    let mut format = PackFormat::V3;
                     let mut reserve_gb = 50.0f64;
                     let mut chunk_mib = None;
                     let mut i = 0;
@@ -1595,15 +1609,15 @@ mod tests {
     }
 
     #[test]
-    fn pack_v2_is_the_default_and_format_is_explicit() {
+    fn pack_v3_is_the_default_and_format_is_explicit() {
         for action in ["plan", "build"] {
             let implicit = parse_args(["pack", action]).unwrap();
             assert_eq!(
-                parse_args(["pack", action, "--format", "v2"]).unwrap(),
+                parse_args(["pack", action, "--format", "v3"]).unwrap(),
                 implicit
             );
             assert_ne!(
-                parse_args(["pack", action, "--format", "v3"]).unwrap(),
+                parse_args(["pack", action, "--format", "v2"]).unwrap(),
                 implicit
             );
             assert!(parse_args(["pack", action, "--format"]).is_err());
@@ -2303,6 +2317,7 @@ mod tests {
         assert_eq!(preset.host_logit_views, Some(true));
         assert_eq!(preset.logit_topk, Some(true));
         assert_eq!(preset.ple_async_gather, Some(true));
+        assert!(preset.prepared_validation);
         assert_eq!(preset.tool_enum_validation, "executor");
         assert_eq!(preset.tool_arg_validation, "executor");
         assert_eq!(preset.mtp_depth, Some(3));
@@ -2355,11 +2370,50 @@ mod tests {
         else {
             panic!("expected Serve");
         };
+        assert!(preset_df.verify_nax);
+        assert!(preset_df.verify_nax_m8);
+        assert!(preset_df.prepared_validation);
+        assert_eq!(preset_df.dflash2_precision.as_deref(), Some("q8_0"));
         assert_eq!(preset_df.dflash2_defer_context, Some(true));
-        assert_eq!(preset_df.dflash2_max_drafts, Some(4));
+        assert_eq!(preset_df.dflash2_max_drafts, Some(7));
         assert_eq!(preset_df.dflash2_vocab_slice, Some(32_768));
+        assert_eq!(preset_df.dflash2_verify_rows.as_deref(), Some("auto"));
         assert_eq!(preset_df.output_packet, 64);
         assert_eq!(preset_df.first_output_packet, Some(8));
+
+        for preset_first in [false, true] {
+            let mut args = vec![
+                "serve",
+                "--drafter",
+                "dflash2",
+                "--dflash2-dir",
+                "/tmp/dflash2",
+            ];
+            let overrides = [
+                "--dflash2-precision",
+                "bf16",
+                "--dflash2-max-drafts",
+                "4",
+                "--native-dflash2-verify-rows",
+                "all",
+                "--native-prepared-validation",
+                "off",
+            ];
+            if preset_first {
+                args.push("--speed-preset");
+                args.extend(overrides);
+            } else {
+                args.extend(overrides);
+                args.push("--speed-preset");
+            }
+            let Command::Serve(df_override) = parse_args(args).unwrap().command else {
+                panic!("expected Serve");
+            };
+            assert_eq!(df_override.dflash2_precision.as_deref(), Some("bf16"));
+            assert_eq!(df_override.dflash2_max_drafts, Some(4));
+            assert_eq!(df_override.dflash2_verify_rows.as_deref(), Some("all"));
+            assert!(!df_override.prepared_validation);
+        }
 
         let Command::Serve(preset64) =
             parse_args(["serve", "--speed-preset", "--output-packet", "64"])
@@ -2580,6 +2634,10 @@ mod tests {
         }
 
         let v2_asa = derived.join("tokspur-pack-v2.asa.gguf");
+        assert_eq!(
+            serve::resolve_derived_pack_path(&dir, false, true),
+            derived.join("tokspur-pack-v3.asa.gguf")
+        );
         fs::write(&v2_asa, b"v2").unwrap();
         assert_eq!(serve::resolve_derived_pack_path(&dir, false, true), v2_asa);
 

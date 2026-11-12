@@ -712,6 +712,10 @@ public:
     void begin_indirect_compatible();
     void abort(); // Discards an unsubmitted batch; not rollback after execution.
     [[nodiscard]] BatchResult submit(); // Waits once, checks completion/error flag.
+    // Commits the dispatches encoded so far without waiting and continues the same logical batch in a new
+    // physical command buffer, so the GPU starts while the host encodes the rest. Returns false and changes
+    // nothing for an empty, recorded, profiled or diagnostic batch. submit() and abort() wait for every part.
+    bool commit_partial();
 
     // Explicit static-command experiment. Recording performs no GPU execution;
     // normal owned composite encoders supply all bindings and copied constants.

@@ -331,6 +331,8 @@ struct MetalGraph::Impl {
     id<MTLBuffer> error_flag;
     id<MTLCommandBuffer> command;
     id<MTLComputeCommandEncoder> encoder;
+    // Earlier physical commands of the active logical batch, committed by commit_partial() and not yet waited on.
+    std::vector<id<MTLCommandBuffer>> partial_commands;
 #if defined(TOKSPUR_PRIVATE_PIPELINE_LOOKUP) && TOKSPUR_PRIVATE_PIPELINE_LOOKUP
     std::unordered_map<PipelineKey, id<MTLComputePipelineState>, PipelineKeyHash, PipelineKeyEqual> pipelines;
 #else
@@ -3764,9 +3766,59 @@ void MetalGraph::abort() {
     if (p.encoder) [p.encoder endEncoding];
     p.encoder = nil;
     p.command = nil;
+    // Partial commands are already running and cannot be discarded. Wait, so the caller's recovery never races them.
+    for (id<MTLCommandBuffer> partial : p.partial_commands) [partial waitUntilCompleted];
+    p.partial_commands.clear();
     p.dispatches = 0;
     p.compatible_pipelines = false; p.capture_executes = 0;
     p.marks.clear(); p.profile = {};
+}
+bool MetalGraph::commit_partial() {
+    @autoreleasepool {
+    auto& p = *impl_; p.active();
+    // Only a plain direct batch is split. Captures, profiles and diagnostic cuts keep their own physical schedule.
+    if (p.recording || p.compatible_pipelines || p.encoder == nil || !p.dispatches ||
+        p.profile_mode != ProfileMode::disabled || p.planar_union_profile_enabled) return false;
+#ifdef TOKSPUR_PRIVATE_OPERATOR_CHECKPOINTS
+    if (p.operator_sink) return false;
+#endif
+#ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC
+    if (p.carrier_diagnostic.active()) return false;
+#endif
+#ifdef TOKSPUR_PRIVATE_MTP_DISPATCH_PROFILE
+    if (p.mtp_profile.active) return false;
+#endif
+#ifdef TOKSPUR_PRIVATE_TASK4_PROFILE
+    if (p.task4_sink && p.task4_active) return false;
+#endif
+#ifdef TOKSPUR_PRIVATE_DISPATCH_GRAPH
+    if (p.trace) return false;
+#endif
+    // Everything that can fail happens before the commit, so a refusal leaves the batch whole for abort().
+    p.partial_commands.reserve(p.partial_commands.size() + 1);
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+    const auto next_command_count = checked_add(p.lifetime_command_count, 1);
+#endif
+    id<MTLCommandBuffer> next = [p.queue commandBuffer];
+    if (!next) throw FormatError("cannot create owned graph command buffer");
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+    id<MTLComputeCommandEncoder> next_encoder = p.concurrent ? [next computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] : [next computeCommandEncoder];
+#else
+    id<MTLComputeCommandEncoder> next_encoder = [next computeCommandEncoder];
+#endif
+    if (!next_encoder) throw FormatError("cannot create owned graph encoder");
+    [p.encoder endEncoding];
+    [p.command commit];
+    p.partial_commands.push_back(p.command);
+    p.command = next; p.encoder = next_encoder;
+#ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
+    // One queue runs its commands in commit order, so nothing encoded before this point is still pending for the
+    // next dispatch. Dispatches and barriers stay accumulated until the owner's submit.
+    p.reset_spans();
+    p.lifetime_command_count = next_command_count;
+#endif
+    return true;
+    }
 }
 BatchResult MetalGraph::submit() {
     @autoreleasepool {
@@ -3901,6 +3953,15 @@ BatchResult MetalGraph::submit() {
     if (trace_phases) phase_points[5] = Clock::now();
 #endif
     { TOKSPUR_CARRIER_PHASE(waiting); [command waitUntilCompleted]; }
+    // Parts committed by commit_partial() ran first on the same queue. Their GPU time is added to the last part's,
+    // so the batch reports GPU execution rather than a span that would hide a gap between parts.
+    auto partials = std::move(p.partial_commands); p.partial_commands.clear();
+    double partial_gpu_seconds = 0;
+    for (id<MTLCommandBuffer> partial : partials) {
+        [partial waitUntilCompleted];
+        require(partial.status == MTLCommandBufferStatusCompleted, "GPU graph command failed");
+        partial_gpu_seconds += partial.GPUEndTime - partial.GPUStartTime;
+    }
     require(command.status == MTLCommandBufferStatusCompleted, "GPU graph command failed");
 #ifdef TOKSPUR_PRIVATE_TASK4_PROFILE
     const auto task4_wait_end = task4_diagnostic ? Clock::now() : Clock::time_point{};
@@ -3919,9 +3980,9 @@ BatchResult MetalGraph::submit() {
     require(err_val == 0, "GPU graph produced nonfinite values or invalid gates");
 #ifdef TOKSPUR_PRIVATE_BATCH_PHASE_CLOCK
     const auto wall_end = Clock::now();
-    const BatchResult result{p.dispatches, std::chrono::duration<double, std::milli>(wall_end - p.started).count(), (command.GPUEndTime - command.GPUStartTime) * 1000, p.capture_executes};
+    const BatchResult result{p.dispatches, std::chrono::duration<double, std::milli>(wall_end - p.started).count(), (partial_gpu_seconds + command.GPUEndTime - command.GPUStartTime) * 1000, p.capture_executes};
 #else
-    const BatchResult result{p.dispatches, std::chrono::duration<double, std::milli>(Clock::now() - p.started).count(), (command.GPUEndTime - command.GPUStartTime) * 1000, p.capture_executes};
+    const BatchResult result{p.dispatches, std::chrono::duration<double, std::milli>(Clock::now() - p.started).count(), (partial_gpu_seconds + command.GPUEndTime - command.GPUStartTime) * 1000, p.capture_executes};
 #endif
     p.collect_profile();
 #ifdef TOKSPUR_PRIVATE_CARRIER_DIAGNOSTIC

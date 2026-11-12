@@ -5509,6 +5509,10 @@ int target_cli(int argc, char** argv) {
 #ifdef TOKSPUR_PRIVATE_GROUPED_MM_F32
             fields.emplace_back("native_gdn_cooperative4", Json(gdn_cooperative4_enabled));
             fields.emplace_back("native_verify_gdn_row_batch", Json(verify_gdn_row_batch));
+#ifdef TOKSPUR_PRIVATE_VERIFY_EARLY_COMMIT
+            // The build's selection only: a batch that is not a plain NAX verification still uses one command buffer.
+            fields.emplace_back("native_verify_early_commit", Json::integer(TOKSPUR_PRIVATE_VERIFY_EARLY_COMMIT));
+#endif
             if (native_verify_nax.has_value()) {
                 fields.emplace_back("native_verify_nax", Json(gpu.verify_nax()));
             }

@@ -30,6 +30,18 @@ override METALFLAGS += -DTOKSPUR_PRIVATE_VERIFY_NARROW_ROWS=1
 else ifneq ($(VERIFY_NARROW_ROWS),0)
 $(error VERIFY_NARROW_ROWS must be 0 or 1)
 endif
+# Commit this many target layers of a NAX verification batch before the rest is encoded (0 uses one command buffer).
+VERIFY_EARLY_COMMIT ?= 2
+ifeq ($(VERIFY_EARLY_COMMIT),0)
+else ifeq ($(VERIFY_EARLY_COMMIT),2)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_VERIFY_EARLY_COMMIT=2
+else ifeq ($(VERIFY_EARLY_COMMIT),4)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_VERIFY_EARLY_COMMIT=4
+else ifeq ($(VERIFY_EARLY_COMMIT),8)
+override CXXFLAGS += -DTOKSPUR_PRIVATE_VERIFY_EARLY_COMMIT=8
+else
+$(error VERIFY_EARLY_COMMIT must be 0 (one command buffer), 2, 4 or 8)
+endif
 PARALLEL_PLANAR_UNION ?= 0
 ifeq ($(PARALLEL_PLANAR_UNION),1)
 override METALFLAGS += -DTOKSPUR_PRIVATE_PARALLEL_PLANAR_UNION=1
@@ -38,9 +50,9 @@ $(error PARALLEL_PLANAR_UNION must be 0 or 1)
 endif
 M5_CPU_CANDIDATES ?= 0
 Q8_IMPORT_ISOLATION ?= 0
-PACK_SHARED_MAPPING ?= 0
-# Opt-in bounded original-source reads and clean-page hints during v2/v3 authentication.
-PACK_AUTH_RECLAIM ?= 0
+PACK_SHARED_MAPPING ?= 1
+# Bounded original-source reads and clean-page hints during v2/v3 authentication.
+PACK_AUTH_RECLAIM ?= 1
 CACHE_PRESSURE_RECLAIM ?= 0
 MEMORY_PLAN_REPORT ?= 0
 SHARED_PREFIX_EVICTION_COUNTERS ?= 0

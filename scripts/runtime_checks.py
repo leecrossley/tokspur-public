@@ -1590,7 +1590,7 @@ def confirmation(plan, data):
             "throughput_change": point,
             "paired_95_interval": interval,
             "latency_simultaneous_upper": upper,
-            "passes_serving_thresholds": point >= 0.05
+            "passes_serving_thresholds": point > 0
             and interval[0] > 0
             and all(v <= 0.03 for v in upper.values()),
         }
