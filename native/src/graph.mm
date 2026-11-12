@@ -3812,8 +3812,7 @@ bool MetalGraph::commit_partial() {
     p.partial_commands.push_back(p.command);
     p.command = next; p.encoder = next_encoder;
 #ifdef TOKSPUR_PRIVATE_CONCURRENT_DISPATCH
-    // One queue runs its commands in commit order, so nothing encoded before this point is still pending for the
-    // next dispatch. Dispatches and barriers stay accumulated until the owner's submit.
+    // One queue runs its commands in commit order, so nothing encoded before this point is still pending for the next dispatch. Dispatches and barriers stay accumulated until the owner's submit.
     p.reset_spans();
     p.lifetime_command_count = next_command_count;
 #endif
@@ -3953,8 +3952,7 @@ BatchResult MetalGraph::submit() {
     if (trace_phases) phase_points[5] = Clock::now();
 #endif
     { TOKSPUR_CARRIER_PHASE(waiting); [command waitUntilCompleted]; }
-    // Parts committed by commit_partial() ran first on the same queue. Their GPU time is added to the last part's,
-    // so the batch reports GPU execution rather than a span that would hide a gap between parts.
+    // Parts committed by commit_partial() ran first on the same queue. Their GPU time is added to the last part's, so the batch reports GPU execution rather than a span that would hide a gap between parts.
     auto partials = std::move(p.partial_commands); p.partial_commands.clear();
     double partial_gpu_seconds = 0;
     for (id<MTLCommandBuffer> partial : partials) {
